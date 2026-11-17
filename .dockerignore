@@ -1,0 +1,12 @@
+.env
+data/
+state.json
+state.json.tmp
+snapshots/
+downloads/
+tests/
+.git
+__pycache__/
+*.pyc
+*.log
+.DS_Store

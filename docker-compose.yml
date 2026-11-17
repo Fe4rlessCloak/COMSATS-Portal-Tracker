@@ -1,0 +1,10 @@
+services:
+  tracker:
+    build: .
+    container_name: comsats-portal-tracker
+    restart: unless-stopped
+    environment:
+      - STATE_FILE=/app/data/state.json
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
