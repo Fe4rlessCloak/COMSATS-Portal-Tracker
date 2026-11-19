@@ -6,6 +6,8 @@ state.json.bak*
 state.json.lock
 heartbeat.json*
 .session_alerted
+.anomaly_alerted
+last_anomaly*
 snapshots/
 downloads/
 *.log

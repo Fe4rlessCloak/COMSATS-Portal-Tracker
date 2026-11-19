@@ -1,0 +1,142 @@
+# COMSATS Portal Tracker — Architecture & Fallbacks
+
+A simple, high-level guide to how the tracker works, why things are built the way they are, and what safety fallbacks protect your data and uptime. Intended for both humans and future agent sessions.
+
+---
+
+## 1. File Map
+
+Zero external packages — **Python 3.9+ standard library only** (`urllib`, `html.parser`, `fcntl`, `threading`, `json`).
+
+| File | Role |
+| :--- | :--- |
+| `tracker.py` | Main daemon loop, `.env` watcher, state locking, backups, snapshot validation, diffing, watchdog timeouts, heartbeat & `--healthcheck` CLI. |
+| `sis_client.py` | HTTP client (`SisClient`) with `ASP.NET_SessionId` + authenticated `Set-Cookie` handling, login/expiry detection, page-marker validation, active-course verification, diagnostic HTML scrubbing, and HTML parsers. |
+| `notifiers.py` | Pluggable push backends (`ConsoleNotifier`, `NtfyNotifier`, `WebhookNotifier`, `DiscordNotifier`, `TelegramNotifier`) with threaded, timeout-bounded `dispatch_all`. |
+| `probe.py` | Standalone diagnostic CLI (respects `ENV_FILE`) to inspect raw portal HTML endpoints and test keep-alive timing. |
+| `Dockerfile` | `python:3.13-slim` container running `python3 -u tracker.py` with `HEALTHCHECK` calling `python3 tracker.py --healthcheck`. |
+| `docker-compose.yml` | Runs `comsats-portal-tracker` with `restart: unless-stopped`, directory-mounted config (`./:/app/config:ro`), and persistent `./data:/app/data`. |
+| `tests/test_tracker.py` | Offline unit tests (`python3 -m unittest discover -s tests -v`) covering parsers, diffing, real HTML snapshots, and every failure fallback. |
+
+---
+
+## 2. Main Loop & Two-Tier Polling Flow
+
+The COMSATS ASP.NET portal kills idle sessions after ~4–5 minutes. Because scraping every course every 2 minutes is unnecessarily heavy, `run_daemon` uses two cadences:
+
+1. **Keep-alive tick (`KEEPALIVE_INTERVAL`, default `120s`)**: sends a single `GET /Courses` request to refresh the sliding session cookie.
+2. **Full scan (`FETCH_INTERVAL`, default `480s`)**: scrapes every enrolled course, validates the snapshot, saves `state.json`, and notifies on changes.
+
+```text
+  startup (load_config, EnvWatcher, initial heartbeat)
+     │
+     ▼
+ ┌─▶ 1. Hot-reload check: EnvWatcher.check_changed() + load_config()
+ │      ├─ .env non-empty values override process_env
+ │      └─ New SIS_SESSION_ID? -> swap cookie in memory, clear expiry state, force immediate scan
+ │
+ │   2. Waiting on expired session? (expired_since set or empty SIS_SESSION_ID)
+ │      ├─ Write heartbeat status="waiting_for_session" (healthcheck fails)
+ │      ├─ Log rate-limited wait status
+ │      ├─ Elapsed >= SESSION_EXPIRED_TIMEOUT (300s)? -> write "exiting_session_expired" & exit(1)
+ │      └─ Sleep EXPIRED_POLL_INTERVAL (15s) ───────────────────────────────┐
+ │                                                                        │
+ │   3. Bounded tick via run_with_timeout(CYCLE_TIMEOUT = 120s):          │
+ │      ├─ client.get_courses()  (/Courses + courses marker check)        │
+ │      ├─ If due (>= FETCH_INTERVAL or first scan):                      │
+ │      │    run_cycle() under state_lock (state.json.lock):              │
+ │      │      load_state() -> scan_all_courses() -> validate_snapshot()  │
+ │      │      -> save_state() (with .bak rotation) -> diff_states()      │
+ │      │      -> dispatch_all() (bounded by NOTIFIER_TIMEOUT)            │
+ │      └─ Else: Keep-alive OK                                            │
+ │                                                                        │
+ │   4. Update heartbeat.json ("ok" / "anomaly")                          │
+ │      └─ Sleep KEEPALIVE_INTERVAL (refreshing heartbeat every 15s) ─────┘
+```
+
+---
+
+## 3. Portal Scraping & Known COMSATS Quirks
+
+Future sessions editing `sis_client.py` should keep these portal behaviors in mind:
+
+- **Stateful server-side course switching**:
+  `/MarksSummary/Index` and `/LearningResources/Index` do **not** take a course ID in the URL or query string. Instead, the portal stores the active course inside the server-side ASP.NET session when you call `/Courses/SetCourse/<course_id>`.
+  - **Consequence**: If `SetCourse` fails silently or the session glitches, `/MarksSummary/Index` and `/LearningResources/Index` return data for whichever course was previously active in the session (e.g., attributing everything to one course).
+  - **Safeguard**: Course pages do **not** echo the numeric `course_id`, so `parse_active_course()` reads `<div class="page_title_container">` (`<h3>` name and `<h5>Course Code : ...</h5>`) and `verify_active_course()` compares it against the expected `Course` on `select_course()`, `get_marks_summary()`, and `get_learning_resources()`, raising `CourseMismatchError` on mismatch.
+
+- **Real HTML traps in login detection**:
+  Verified against the saved pages in `snapshots/*.html`, authenticated portal pages **contain** strings that look like login markers if matched naively:
+  - Inline `<style>` has `body.sis-portal-body:not(.sis-login-page)`.
+  - Inline `<script>` has `var imageUrl = "/Login/GetBase64Image";`.
+  - Mobile nav includes `<form id="synopsisForm" action="https://ww5.comsats.edu.pk/efs/StudentLogin.aspx">` with a hidden `<input type="password">`.
+  - **Safeguard**: `detect_login_page()` strips `<script>`/`<style>` blocks before inspecting `<form>` tags and shell markers, ignores `id="synopsisForm"`, checks `<body class="...sis-login-page...">` specifically on `<body>`, checks `id="LoginSubmit"` / `id="CaptchaMount"`, checks meta-refresh and JS redirects, checks final redirect URLs (`is_login_url()`), and rejects any response missing authenticated shell markers (`has_authenticated_shell()`: `header.sis-portal-header`, `/Login/Sign_out`, `id="Sign_Out"`, `id="Dash_Board"`, or `.sis-welcome`).
+
+- **Pure parsers vs. client methods**:
+  `parse_courses`, `parse_marks_summary`, `parse_learning_resources`, and `parse_announcements` remain pure HTML-fragment parsers (used by unit tests). `SisClient.get_courses()`, `get_marks_summary()`, and `get_learning_resources()` additionally enforce `has_*_page_marker()` (`PortalParseError`) and `verify_active_course()` (`CourseMismatchError`).
+
+- **ASP.NET cookie reuse & `Set-Cookie` handling**:
+  If a session expires and the user logs back into `https://sis.comsats.edu.pk` in the **same browser** without clearing cookies, ASP.NET often re-authenticates the **exact same `ASP.NET_SessionId` value** rather than issuing a new string.
+  - When `run_daemon` is in the `waiting_for_session` state and detects any `.env` change (`EnvWatcher`), even if `SIS_SESSION_ID` is unchanged, it resets `SisClient`'s cookie jar and immediately re-tests the session rather than waiting for `SESSION_EXPIRED_TIMEOUT`.
+  - On authenticated responses (after `detect_login_page()` passes), `SisClient` adopts any non-login `Set-Cookie` additions/rotations (including auxiliary cookies and `ASP.NET_SessionId` rotations, logging cookie names only) and drops unauthenticated cookies on login redirects.
+
+---
+
+## 4. Fallbacks, Guardrails & Failure Recovery
+
+| Failure Mode | What Happens (Safeguard / Fallback) |
+| :--- | :--- |
+| **One course fails mid-scan** (`PortalHttpError`, `PortalParseError`, `CourseMismatchError`) | `scan_all_courses()` catches per-course errors, logs `[WARN]`, carries forward that course's entry from `previous_state`, continues scanning remaining courses, and sets `partial=True`. `validate_snapshot()` then refuses to overwrite `state.json` and triggers deduplicated `scan_anomaly` handling. |
+| **Session expires mid-scan** (`SessionExpiredError`) | `scan_all_courses()` stops making further course requests immediately, preserves already-fetched + carried-forward courses in `ScanResult`, and `run_cycle()` raises `SessionExpiredError` **without** touching `state.json`. |
+| **Degenerate / empty scan & anomaly alert spam** (0 courses, `>0 -> 0` marks, or `>50%` drop when baseline has `>=3` courses or `>=5` marks/resources) | `validate_snapshot()` rejects the snapshot and keeps `state.json` intact. `run_cycle()` persists the anomaly key/count in `data/.anomaly_alerted` (sending **one** `scan_anomaly` alert per unique anomaly reason until recovery), writes scrubbed diagnostics to `data/last_anomaly.json` and `data/last_anomaly_marks.html` (stripping `synopsisForm` / password inputs), and sends a `scan_recovered` alert once normal scans resume. Keep-alives preserve `"status": "anomaly"` in `heartbeat.json` until a full scan recovers. |
+| **Silent deletions on the portal** | `diff_states()` compares both directions (`new - old` and `old - new`), emitting `marks_removed`, `resource_removed`, `announcement_removed`, and `course_removed`. Legitimate small removals (e.g. `2 -> 1` marks) pass plausibility checks, update state, and notify. |
+| **Corrupt `state.json` or concurrent `--once` + daemon race** | `state_lock()` acquires an exclusive `fcntl.flock` on `data/state.json.lock` **before** `load_state()` so old state is always read prior to scanning. `save_state()` writes a PID/thread-scoped temp file, atomically rotates `state.json.bak`..`.bak.5`, and `os.replace`s `state.json`. If `state.json` is corrupt JSON, `load_state()` falls back to `state.json.bak`. |
+| **Session expiry & restart alert spam** | `run_daemon()` hashes the expired cookie into `data/.session_alerted` so it sends **one** `session_expired` notification (even across container restarts while still expired). It polls `.env` every `EXPIRED_POLL_INTERVAL` (`15s`) and exits with code `1` once `SESSION_EXPIRED_TIMEOUT` (`300s`) elapses so Docker's `restart: unless-stopped` recycles the container. Any `.env` save while waiting immediately re-tests the session, and any successful `get_courses()` clears `.session_alerted`. |
+| **`.env` edits with inode replacement or `env_file:` overrides** | `docker-compose.yml` mounts `./:/app/config:ro` (`ENV_FILE=/app/config/.env`) instead of a single-file `.env` mount, so atomic-save editors (`vim`, VS Code, `sed -i`) are visible immediately. `load_env_with_sources()` lets non-empty `.env` keys override `os.environ` (falling back to `os.environ` if `.env` leaves a key blank) and logs the winning source. `EnvWatcher` hashes and stats `.env` fresh by path on every iteration. |
+| **Hung HTTP request, DNS stall, or hung webhook** | `SisClient.get_html()` catches `URLError`, `TimeoutError`, `http.client.HTTPException`, and `OSError`, and supports cooperative `cancel_event`. `dispatch_all()` sends each non-console notifier in a daemon thread bounded by `NOTIFIER_TIMEOUT` (`20s` in `tracker.py`, `15s` per notifier default). The whole daemon tick runs inside `run_with_timeout(CYCLE_TIMEOUT = 120s)`; if a thread stays wedged past the 2s grace window (or times out 3 times in a row), `run_daemon` exits `1`. |
+| **Silent daemon stall / invisible hang** | `run_daemon` writes `data/heartbeat.json` on the main loop thread (during startup, scan progress, after ticks, and every `15s` while sleeping). Docker's `HEALTHCHECK` runs `python3 tracker.py --healthcheck` every `30s`, failing if `heartbeat.json` is missing, stale (`> max(KEEPALIVE_INTERVAL, 60)` or `HEALTHCHECK_MAX_AGE`), or in `waiting_for_session` / `exiting_session_expired` / `wedged_exiting`. |
+| **`--once` network/HTTP failure** | `main()` wraps `--once` in `run_with_timeout` and catches `SessionExpiredError`, `PortalHttpError`, `CycleTimeoutError`, `StateLockError`, and `ValueError`, printing a one-line `[ERROR]` message and exiting `1` cleanly. |
+
+---
+
+## 5. Runtime Files (`./data/`)
+
+All runtime files live under `./data/` (mounted to `/app/data` in Docker) and are gitignored:
+
+| File | Purpose |
+| :--- | :--- |
+| `data/state.json` | Current known courses, marks, resources, and optional announcements. |
+| `data/state.json.bak`, `.bak.2`..`.bak.N` | Rolling backups rotated before every `save_state()` overwrite. |
+| `data/state.json.lock` | `fcntl.flock` lock file serializing `load -> scan -> validate -> save -> diff/dispatch`. |
+| `data/heartbeat.json` | Main-loop liveness timestamp, PID, intervals, and status read by `--healthcheck`. |
+| `data/.session_alerted` | SHA-256 hash of the cookie that already triggered a `session_expired` notification. |
+| `data/.anomaly_alerted` | Active anomaly key, first/last seen timestamps, and rejected scan count for deduplication + recovery alerts. |
+| `data/last_anomaly.json` | Latest rejected scan summary (counts, `Set-Cookie` names observed, failed courses, plain-text page preview). |
+| `data/last_anomaly_marks.html` | Credential-scrubbed `MarksSummary` HTML captured from the latest rejected 0-mark scan. |
+
+---
+
+## 6. Key Reliability Settings (`.env`)
+
+| Variable | Default | Meaning |
+| :--- | :--- | :--- |
+| `KEEPALIVE_INTERVAL` | `120` (min `15`) | Seconds between lightweight `GET /Courses` keep-alive pings. |
+| `FETCH_INTERVAL` | `480` (min `30`) | Seconds between full multi-course scrapes. |
+| `CYCLE_TIMEOUT` | `120` (min `5`) | Hard per-tick deadline (seconds) before flagging a cycle as timed out / wedged. |
+| `SESSION_EXPIRED_TIMEOUT` | `300` (min `0`) | Seconds to poll `.env` after expiry before exiting `1` for restart (`0` = immediate exit). |
+| `EXPIRED_POLL_INTERVAL` | `15` (min `1`) | Seconds between `.env` checks while waiting on an expired session. |
+| `NOTIFIER_TIMEOUT` | `20` (min `1`) | Join timeout (seconds) per notification dispatch in `tracker.py` (notifier HTTP timeout defaults to `15s`, min `2s`). |
+| `MAX_STATE_BACKUPS` | `5` (min `1`) | Number of rolling `state.json.bak*` files to keep. |
+| `HEALTHCHECK_MAX_AGE` | `0` (auto) | Max allowed heartbeat age in seconds (`0` = `max(KEEPALIVE_INTERVAL, 60)`). |
+
+---
+
+## 7. Notes for Future Sessions
+
+- **Run the test suite before and after any change**:
+  ```bash
+  python3 -m unittest discover -s tests -v
+  ```
+- **Keep it zero-dependency**: stick to Python standard library modules only (`Dockerfile` does not run `pip install`).
+- **Verify HTML changes against real snapshots**: `snapshots/*.html` (gitignored, present locally) contains real captured portal pages; run `detect_login_page()`, `has_authenticated_shell()`, and `parse_active_course()` against them whenever modifying HTML parsing or login detection.
+- **Container updates**: changes to `Dockerfile`, `docker-compose.yml`, or Python source require `docker compose up -d --build` on the host; `.env` updates alone do not.

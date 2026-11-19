@@ -8,6 +8,7 @@ non-hardcoded MVC routes discovered from /Courses.
 
 from __future__ import annotations
 
+import html as html_lib
 import http.client
 import re
 import threading
@@ -17,7 +18,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_BASE_URL = "https://sis.comsats.edu.pk"
 DEFAULT_USER_AGENT = (
@@ -859,6 +860,134 @@ def has_resources_page_marker(html: str) -> bool:
     return bool(re.search(r"\b(?:sis-lr|sis-lr-table|sis-lr-count)\b", stripped, re.IGNORECASE))
 
 
+_SYNOPSIS_FORM_RE = re.compile(
+    r"""<form\b[^>]*\bid\s*=\s*(?:"synopsisform"|'synopsisform'|synopsisform\b)[^>]*>.*?</form>""",
+    re.IGNORECASE | re.DOTALL,
+)
+_PASSWORD_INPUT_RE = re.compile(
+    r"""<input\b[^>]*\btype\s*=\s*(?:"password"|'password'|password\b)[^>]*>""",
+    re.IGNORECASE,
+)
+_CONTENT_AREA_RE = re.compile(
+    r"""<div\b[^>]*\bclass\s*=\s*["'][^"']*\bcontent_area\b[^"']*["'][^>]*>""",
+    re.IGNORECASE,
+)
+
+
+def scrub_diagnostic_html(html: str, max_chars: int = 65536) -> str:
+    """Strip portal header/credential forms and return bounded diagnostic content HTML."""
+    if not html:
+        return ""
+    cleaned = _SYNOPSIS_FORM_RE.sub("", html)
+    cleaned = _PASSWORD_INPUT_RE.sub("<!-- password input redacted -->", cleaned)
+
+    content_match = _CONTENT_AREA_RE.search(cleaned)
+    if content_match:
+        cleaned = cleaned[content_match.start() :]
+    else:
+        header_end = re.search(r"</header>", cleaned, re.IGNORECASE)
+        if header_end:
+            cleaned = cleaned[header_end.end() :]
+
+    footer_start = re.search(r"<footer\b", cleaned, re.IGNORECASE)
+    if footer_start:
+        cleaned = cleaned[: footer_start.start()]
+
+    cleaned = cleaned.strip()
+    if max_chars > 0 and len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars]
+    return cleaned
+
+
+def extract_diagnostic_text(html: str, max_chars: int = 500) -> str:
+    """Return a compact, credential-free plain-text snippet of portal content HTML."""
+    scrubbed = scrub_diagnostic_html(html)
+    if not scrubbed:
+        return ""
+    text_only = _strip_script_and_style(scrubbed)
+    text_only = re.sub(r"<!--.*?-->", " ", text_only, flags=re.DOTALL)
+    text_only = re.sub(r"<[^>]+>", " ", text_only)
+    collapsed = " ".join(html_lib.unescape(text_only).split())
+    if max_chars > 0 and len(collapsed) > max_chars:
+        if max_chars <= 3:
+            return collapsed[:max_chars]
+        return collapsed[: max_chars - 3].rstrip() + "..."
+    return collapsed
+
+
+def _get_set_cookie_headers(headers: Any) -> List[str]:
+    """Safely extract all Set-Cookie header strings from HTTPMessage, dict, or None."""
+    if headers is None:
+        return []
+    if hasattr(headers, "get_all"):
+        vals = headers.get_all("Set-Cookie")
+        return [str(v) for v in vals if v] if vals else []
+    results: List[str] = []
+    if hasattr(headers, "items"):
+        for k, v in headers.items():
+            if str(k).lower() == "set-cookie" and v:
+                if isinstance(v, (list, tuple)):
+                    results.extend(str(item) for item in v if item)
+                else:
+                    results.append(str(v))
+        return results
+    if hasattr(headers, "get"):
+        val = headers.get("Set-Cookie") or headers.get("set-cookie")
+        if isinstance(val, (list, tuple)):
+            return [str(item) for item in val if item]
+        if val:
+            return [str(val)]
+    return []
+
+
+def _parse_set_cookie(header_val: str) -> Optional[Tuple[str, str, bool]]:
+    """Parse a Set-Cookie header into (name, value, expired)."""
+    parts = [p.strip() for p in header_val.split(";")]
+    if not parts or "=" not in parts[0]:
+        return None
+    name, val = parts[0].split("=", 1)
+    name = name.strip()
+    val = val.strip()
+    if not name:
+        return None
+
+    expired = val == ""
+    for attr in parts[1:]:
+        if "=" not in attr:
+            continue
+        ak, av = attr.split("=", 1)
+        ak = ak.strip().lower()
+        av = av.strip()
+        if ak == "max-age":
+            try:
+                if int(av) <= 0:
+                    expired = True
+            except ValueError:
+                pass
+        elif ak == "expires":
+            if any(int(y) < 2000 for y in re.findall(r"\b(\d{4})\b", av)):
+                expired = True
+    return name, val, expired
+
+
+def _canonical_cookie_name(name: str) -> str:
+    return "ASP.NET_SessionId" if name.lower() == "asp.net_sessionid" else name
+
+
+def _stage_set_cookies(
+    headers: Any, pending: Dict[str, Tuple[str, bool]], seen_names: List[str]
+) -> None:
+    for raw_hdr in _get_set_cookie_headers(headers):
+        parsed = _parse_set_cookie(raw_hdr)
+        if parsed is None:
+            continue
+        raw_name, val, expired = parsed
+        name = _canonical_cookie_name(raw_name)
+        pending[name] = (val, expired)
+        if name not in seen_names:
+            seen_names.append(name)
+
+
 class SisClient:
     """HTTP client for authenticated COMSATS Student Portal requests."""
 
@@ -871,6 +1000,8 @@ class SisClient:
         timeout: int = 20,
         cancel_event: Optional[threading.Event] = None,
     ) -> None:
+        self._session_id = ""
+        self._cookies: Dict[str, str] = {}
         self.session_id = session_id
         self.base_url = base_url.rstrip("/")
         self.user_agent = user_agent or DEFAULT_USER_AGENT
@@ -879,6 +1010,62 @@ class SisClient:
         self.cancel_event = cancel_event
         self._opener = urllib.request.build_opener(_NoRedirect())
         self._last_request_ts = 0.0
+        self.last_marks_html: str = ""
+        self.last_resources_html: str = ""
+        self.last_set_cookie_names: List[str] = []
+        self.last_response_info: Dict[str, Any] = {}
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @session_id.setter
+    def session_id(self, value: str) -> None:
+        self._session_id = value
+        self._cookies = {"ASP.NET_SessionId": value} if value else {}
+
+    def _build_cookie_header(self, pending: Optional[Dict[str, Tuple[str, bool]]] = None) -> str:
+        merged = dict(self._cookies)
+        if self._session_id and "ASP.NET_SessionId" not in merged:
+            merged["ASP.NET_SessionId"] = self._session_id
+        if pending:
+            for name, (val, expired) in pending.items():
+                if expired:
+                    if name != "ASP.NET_SessionId":
+                        merged.pop(name, None)
+                else:
+                    merged[name] = val
+        return "; ".join(f"{k}={v}" for k, v in merged.items() if v != "")
+
+    def _commit_cookies(self, pending: Dict[str, Tuple[str, bool]]) -> None:
+        if not pending:
+            return
+        changes: List[str] = []
+        for name, (val, expired) in pending.items():
+            if name == "ASP.NET_SessionId":
+                if expired or not val:
+                    print(
+                        "[WARN] Portal attempted to clear ASP.NET_SessionId on an authenticated "
+                        "response; preserving current session ID."
+                    )
+                    continue
+                if self._cookies.get(name) != val:
+                    self._cookies[name] = val
+                    self._session_id = val
+                    changes.append(f"{name} (rotated)")
+            else:
+                if expired:
+                    if name in self._cookies:
+                        del self._cookies[name]
+                        changes.append(f"{name} (cleared)")
+                elif name not in self._cookies:
+                    self._cookies[name] = val
+                    changes.append(f"{name} (added)")
+                elif self._cookies[name] != val:
+                    self._cookies[name] = val
+                    changes.append(f"{name} (updated)")
+        if changes:
+            print(f"[INFO] Portal Set-Cookie update: {', '.join(changes)}")
 
     def _throttle(self) -> None:
         if self.cancel_event and self.cancel_event.is_set():
@@ -898,26 +1085,48 @@ class SisClient:
     def get_html(self, path: str) -> str:
         """Fetch an authenticated portal page, raising SessionExpiredError if redirected to Login."""
         url = path if path.startswith("http") else f"{self.base_url}{path}"
+        pending: Dict[str, Tuple[str, bool]] = {}
+        seen_names: List[str] = []
         for _ in range(4):
             self._throttle()
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": self.user_agent,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Referer": f"{self.base_url}/",
-                    "Cookie": f"ASP.NET_SessionId={self.session_id}",
-                },
-                method="GET",
-            )
+            req_headers = {
+                "User-Agent": self.user_agent,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": f"{self.base_url}/",
+            }
+            cookie_hdr = self._build_cookie_header(pending)
+            if cookie_hdr:
+                req_headers["Cookie"] = cookie_hdr
+            req = urllib.request.Request(url, headers=req_headers, method="GET")
             try:
                 with self._opener.open(req, timeout=self.timeout) as resp:
                     self._last_request_ts = time.monotonic()
                     final_url = resp.geturl() or url
                     body = resp.read().decode("utf-8", errors="replace")
+                    resp_headers = getattr(resp, "headers", None)
+                    resp_status = getattr(resp, "status", 200)
                     login_reason = detect_login_page(body, final_url=final_url)
                     if login_reason:
+                        diag_names = list(seen_names)
+                        _stage_set_cookies(resp_headers, {}, diag_names)
+                        self.last_set_cookie_names = diag_names
+                        self.last_response_info = {
+                            "url": url,
+                            "final_url": final_url,
+                            "status": resp_status,
+                            "set_cookie_names": list(diag_names),
+                        }
                         raise SessionExpiredError(login_reason)
+
+                    _stage_set_cookies(resp_headers, pending, seen_names)
+                    self._commit_cookies(pending)
+                    self.last_set_cookie_names = list(seen_names)
+                    self.last_response_info = {
+                        "url": url,
+                        "final_url": final_url,
+                        "status": resp_status,
+                        "set_cookie_names": list(seen_names),
+                    }
                     return body
             except urllib.error.HTTPError as e:
                 self._last_request_ts = time.monotonic()
@@ -925,8 +1134,18 @@ class SisClient:
                 if e.code in (301, 302, 303, 307, 308):
                     next_url = urllib.parse.urljoin(url, loc) if loc else ""
                     if loc and (is_login_url(next_url) or "login" in loc.lower()):
+                        diag_names = list(seen_names)
+                        _stage_set_cookies(e.headers, {}, diag_names)
+                        self.last_set_cookie_names = diag_names
+                        self.last_response_info = {
+                            "url": url,
+                            "final_url": next_url or url,
+                            "status": e.code,
+                            "set_cookie_names": list(diag_names),
+                        }
                         raise SessionExpiredError(f"Redirected to login ({loc}).") from e
                     if loc:
+                        _stage_set_cookies(e.headers, pending, seen_names)
                         url = next_url
                         continue
                 raise PortalHttpError(f"HTTP {e.code} fetching {url}") from e
@@ -953,6 +1172,7 @@ class SisClient:
 
     def get_marks_summary(self, expected_course: Optional[Course] = None) -> List[MarkItem]:
         html = self.get_html("/MarksSummary/Index")
+        self.last_marks_html = html
         if not has_marks_page_marker(html):
             raise PortalParseError("MarksSummary response missing expected marks markup.")
         if expected_course is not None:
@@ -961,6 +1181,7 @@ class SisClient:
 
     def get_learning_resources(self, expected_course: Optional[Course] = None) -> List[ResourceItem]:
         html = self.get_html("/LearningResources/Index")
+        self.last_resources_html = html
         if not has_resources_page_marker(html):
             raise PortalParseError("LearningResources response missing expected resources markup.")
         if expected_course is not None:

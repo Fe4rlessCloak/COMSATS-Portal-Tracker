@@ -45,7 +45,9 @@ from sis_client import (
     ResourceItem,
     SessionExpiredError,
     SisClient,
+    extract_diagnostic_text,
     parse_announcements,
+    scrub_diagnostic_html,
 )
 
 T = TypeVar("T")
@@ -92,6 +94,9 @@ class ScanResult:
     failed_courses: List[str] = field(default_factory=list)
     session_expired: bool = False
     session_expired_error: Optional[str] = None
+    sample_marks_html: str = ""
+    sample_marks_course: str = ""
+    set_cookie_names: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -363,6 +368,15 @@ def scan_all_courses(
     prev_courses = (previous_state or {}).get("courses", {})
     partial = False
     failed_courses: List[str] = []
+    seen_cookie_names: List[str] = []
+    sample_marks_html = ""
+    sample_marks_course = ""
+    sample_from_prior_marks = False
+
+    def _collect_cookies() -> None:
+        for name in getattr(client, "last_set_cookie_names", None) or ():
+            if name not in seen_cookie_names:
+                seen_cookie_names.append(name)
 
     def _carry_forward(course_obj: Course) -> None:
         if course_obj.course_id in prev_courses:
@@ -381,8 +395,20 @@ def scan_all_courses(
 
         try:
             ann_html = client.select_course(course.course_id, expected_course=course)
+            _collect_cookies()
             marks = client.get_marks_summary(expected_course=course)
+            _collect_cookies()
+            if len(marks) == 0:
+                marks_html = getattr(client, "last_marks_html", "") or ""
+                if marks_html:
+                    prev_had_marks = bool(prev_courses.get(course.course_id, {}).get("marks"))
+                    if not sample_marks_html or (prev_had_marks and not sample_from_prior_marks):
+                        sample_marks_html = marks_html
+                        sample_marks_course = course.label
+                        sample_from_prior_marks = prev_had_marks
+
             resources = client.get_learning_resources(expected_course=course)
+            _collect_cookies()
 
             course_entry: Dict[str, Any] = {
                 "code": course.code,
@@ -399,6 +425,7 @@ def scan_all_courses(
             if on_progress is not None:
                 on_progress()
         except SessionExpiredError as exc:
+            _collect_cookies()
             _carry_forward(course)
             for rem in courses[idx + 1 :]:
                 _carry_forward(rem)
@@ -408,14 +435,25 @@ def scan_all_courses(
                 failed_courses=failed_courses + [course.label],
                 session_expired=True,
                 session_expired_error=str(exc),
+                sample_marks_html=sample_marks_html,
+                sample_marks_course=sample_marks_course,
+                set_cookie_names=seen_cookie_names,
             )
         except (PortalHttpError, ValueError) as exc:
+            _collect_cookies()
             print(f"[WARN] Failed scanning {course.label} ({course.course_id}): {exc}")
             partial = True
             failed_courses.append(course.label)
             _carry_forward(course)
 
-    return ScanResult(state=snapshot, partial=partial, failed_courses=failed_courses)
+    return ScanResult(
+        state=snapshot,
+        partial=partial,
+        failed_courses=failed_courses,
+        sample_marks_html=sample_marks_html,
+        sample_marks_course=sample_marks_course,
+        set_cookie_names=seen_cookie_names,
+    )
 
 
 def validate_snapshot(old_state: Optional[Dict[str, Any]], scan_result: ScanResult) -> Optional[str]:
@@ -694,26 +732,126 @@ def run_cycle(
 
         anomaly = validate_snapshot(old_state, scan_result)
         if anomaly is not None:
-            print(f"[WARN] Rejected snapshot ({anomaly}) — preserving existing baseline.")
+            new_c, new_m, new_r = summarize_totals(scan_result.state)
+            old_c, old_m, old_r = (
+                summarize_totals(old_state) if old_state is not None else (0, 0, 0)
+            )
+            now_iso = datetime.now(timezone.utc).isoformat()
+            anomaly_key = anomaly.strip()
+            prev_anom = _load_anomaly_state(state_path)
+            if prev_anom is not None and str(prev_anom.get("key") or "") == anomaly_key:
+                occurrence = int(prev_anom.get("count") or 1) + 1
+                first_seen = str(prev_anom.get("first_seen") or now_iso)
+                should_notify = False
+            else:
+                occurrence = 1
+                first_seen = now_iso
+                should_notify = notify_anomaly
+
+            if not dry_run:
+                _save_anomaly_state(
+                    state_path,
+                    {
+                        "key": anomaly_key,
+                        "reason": anomaly,
+                        "first_seen": first_seen,
+                        "last_seen": now_iso,
+                        "count": occurrence,
+                        "scanned": {"courses": new_c, "marks": new_m, "resources": new_r},
+                    },
+                )
+                _write_anomaly_diagnostics(
+                    state_path,
+                    anomaly,
+                    old_state,
+                    scan_result,
+                    occurrence,
+                )
+
+            preview = extract_diagnostic_text(scan_result.sample_marks_html, max_chars=240)
+            dedup_note = (
+                " (duplicate alert suppressed)"
+                if (not should_notify and notify_anomaly)
+                else ""
+            )
+            print(
+                f"[WARN] Rejected snapshot ({anomaly}; scanned={new_c}c/{new_m}m/{new_r}r; "
+                f"occurrence #{occurrence}){dedup_note} — preserving existing baseline."
+            )
+            if preview:
+                course_label = scan_result.sample_marks_course or "MarksSummary"
+                print(f"[INFO] Anomaly page preview ({course_label}): {preview}")
+
+            msg_lines = [
+                anomaly,
+                (
+                    f"Scanned: {new_c} courses, {new_m} marks, {new_r} resources "
+                    f"(baseline: {old_c} courses, {old_m} marks, {old_r} resources)."
+                ),
+            ]
+            if scan_result.set_cookie_names:
+                msg_lines.append(
+                    f"Set-Cookie names observed: {', '.join(scan_result.set_cookie_names)}"
+                )
+            if preview:
+                msg_lines.append(f"Page preview: {preview}")
+            msg_lines.append(
+                "Existing baseline was NOT overwritten. "
+                "Further identical alerts are suppressed until recovery."
+            )
             anomaly_note = Notification(
                 event="scan_anomaly",
                 title="Portal scan anomaly (state preserved)",
-                message=f"{anomaly}\nExisting baseline was NOT overwritten.",
+                message="\n".join(msg_lines),
                 priority="high",
                 tags=("warning",),
                 url=f"{base_url}/Courses",
-                data={"reason": anomaly, "failed_courses": scan_result.failed_courses},
+                data={
+                    "reason": anomaly,
+                    "occurrence": occurrence,
+                    "failed_courses": scan_result.failed_courses,
+                    "scanned": {"courses": new_c, "marks": new_m, "resources": new_r},
+                    "baseline": {"courses": old_c, "marks": old_m, "resources": old_r},
+                    "set_cookie_names": list(scan_result.set_cookie_names),
+                },
             )
-            if notify_anomaly:
+            if should_notify:
                 dispatch_all(notifiers, anomaly_note, timeout=notifier_timeout)
-            return CycleResult(saved=False, anomaly=anomaly, notifications=[anomaly_note])
+                return CycleResult(saved=False, anomaly=anomaly, notifications=[anomaly_note])
+            return CycleResult(saved=False, anomaly=anomaly, notifications=[])
 
         new_state = scan_result.state
+        prev_anom = _load_anomaly_state(state_path)
+        c_count, m_count, r_count = summarize_totals(new_state)
+        recovery_note: Optional[Notification] = None
+        if prev_anom is not None:
+            prev_reason = str(prev_anom.get("reason") or "previous scan anomaly")
+            prev_count = int(prev_anom.get("count") or 1)
+            recovery_note = Notification(
+                event="scan_recovered",
+                title="Portal scan recovered",
+                message=(
+                    f"Normal portal data returned after {prev_count} rejected scan(s) "
+                    f"({prev_reason}).\n"
+                    f"Current totals: {c_count} courses, {m_count} marks, {r_count} resources."
+                ),
+                priority="default",
+                tags=("white_check_mark",),
+                url=f"{base_url}/Courses",
+                data={
+                    "previous_reason": prev_reason,
+                    "rejected_scans": prev_count,
+                    "courses": c_count,
+                    "marks": m_count,
+                    "resources": r_count,
+                },
+            )
 
         if old_state is None:
-            c_count, m_count, r_count = summarize_totals(new_state)
             if not dry_run:
                 save_state(state_path, new_state, max_backups=max_backups)
+                if prev_anom is not None:
+                    _clear_anomaly_state(state_path)
             baseline_note = Notification(
                 event="baseline_saved",
                 title="COMSATS Portal Tracker started",
@@ -726,8 +864,13 @@ def run_cycle(
                 url=f"{base_url}/Courses",
                 data={"courses": c_count, "marks": m_count, "resources": r_count},
             )
+            sent_notes: List[Notification] = []
+            if recovery_note is not None and notify_anomaly:
+                dispatch_all(notifiers, recovery_note, timeout=notifier_timeout)
+                sent_notes.append(recovery_note)
             dispatch_all(notifiers, baseline_note, timeout=notifier_timeout)
-            return CycleResult(saved=not dry_run, notifications=[baseline_note])
+            sent_notes.append(baseline_note)
+            return CycleResult(saved=not dry_run, notifications=sent_notes)
 
         notifications = diff_states(
             old_state,
@@ -737,17 +880,23 @@ def run_cycle(
         )
         if not dry_run:
             save_state(state_path, new_state, max_backups=max_backups)
+            if prev_anom is not None:
+                _clear_anomaly_state(state_path)
 
-        if notifications:
-            for note in notifications:
+        all_notes: List[Notification] = []
+        if recovery_note is not None and notify_anomaly:
+            all_notes.append(recovery_note)
+        all_notes.extend(notifications)
+
+        if all_notes:
+            for note in all_notes:
                 dispatch_all(notifiers, note, timeout=notifier_timeout)
         else:
             now = datetime.now().strftime("%H:%M:%S")
-            c_count, m_count, r_count = summarize_totals(new_state)
             print(
                 f"[{now}] Scanned {c_count} courses ({m_count} marks, {r_count} resources) — no changes."
             )
-        return CycleResult(saved=not dry_run, notifications=notifications)
+        return CycleResult(saved=not dry_run, notifications=all_notes)
 
 
 def run_with_timeout(
@@ -897,6 +1046,75 @@ def _clear_session_alerted(state_path: Path) -> None:
         pass
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _anomaly_alert_path(state_path: Path) -> Path:
+    return state_path.with_name(".anomaly_alerted")
+
+
+def _load_anomaly_state(state_path: Path) -> Optional[Dict[str, Any]]:
+    return _read_json_dict(_anomaly_alert_path(state_path))
+
+
+def _save_anomaly_state(state_path: Path, payload: Dict[str, Any]) -> None:
+    try:
+        _atomic_write_text(
+            _anomaly_alert_path(state_path),
+            json.dumps(payload, indent=2, ensure_ascii=False),
+        )
+    except OSError as exc:
+        print(f"[WARN] Could not persist anomaly marker: {exc}")
+
+
+def _clear_anomaly_state(state_path: Path) -> None:
+    marker = _anomaly_alert_path(state_path)
+    try:
+        if marker.exists():
+            marker.unlink()
+    except OSError:
+        pass
+
+
+def _write_anomaly_diagnostics(
+    state_path: Path,
+    anomaly: str,
+    old_state: Optional[Dict[str, Any]],
+    scan_result: ScanResult,
+    occurrence: int,
+) -> None:
+    new_c, new_m, new_r = summarize_totals(scan_result.state)
+    old_c, old_m, old_r = (
+        summarize_totals(old_state) if old_state is not None else (0, 0, 0)
+    )
+    scrubbed_html = scrub_diagnostic_html(scan_result.sample_marks_html)
+    preview = extract_diagnostic_text(scan_result.sample_marks_html, max_chars=500)
+    diag_payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "reason": anomaly,
+        "occurrence": occurrence,
+        "scanned_totals": {"courses": new_c, "marks": new_m, "resources": new_r},
+        "baseline_totals": {"courses": old_c, "marks": old_m, "resources": old_r},
+        "failed_courses": list(scan_result.failed_courses),
+        "set_cookie_names": list(scan_result.set_cookie_names),
+        "sample_marks_course": scan_result.sample_marks_course,
+        "sample_marks_preview": preview,
+    }
+    try:
+        _atomic_write_text(
+            state_path.with_name("last_anomaly.json"),
+            json.dumps(diag_payload, indent=2, ensure_ascii=False),
+        )
+        if scrubbed_html:
+            _atomic_write_text(state_path.with_name("last_anomaly_marks.html"), scrubbed_html)
+    except OSError as exc:
+        print(f"[WARN] Could not write anomaly diagnostics: {exc}")
+
+
 def run_daemon(
     env_path: Path,
     state_path: Path,
@@ -932,6 +1150,7 @@ def run_daemon(
     last_status = "starting"
     last_detail = ""
     active_session_id = cfg.session_id
+    active_anomaly: Optional[str] = None
 
     print(
         f"Starting tracker (keep-alive={cfg.keepalive_interval}s, "
@@ -964,6 +1183,7 @@ def run_daemon(
                 expired_since = None
                 last_expired_log = 0.0
                 last_fetch = 0.0
+                active_anomaly = None
                 _clear_session_alerted(state_path)
                 now_str = datetime.now().strftime("%H:%M:%S")
                 if env_changed:
@@ -977,11 +1197,25 @@ def run_daemon(
                         f"(source={session_src}) — resuming."
                     )
             elif env_changed:
+                client.user_agent = fresh_cfg.user_agent
+                client.base_url = fresh_cfg.base_url
+                client.request_delay = max(0.0, fresh_cfg.request_delay)
                 now_str = datetime.now().strftime("%H:%M:%S")
-                print(
-                    f"[{now_str}] [INFO] Detected .env change ({change_desc}; "
-                    f"SIS_SESSION_ID unchanged; source={session_src})."
-                )
+                if expired_since is not None and fresh_cfg.session_id:
+                    client.session_id = fresh_cfg.session_id
+                    expired_since = None
+                    last_expired_log = 0.0
+                    last_fetch = 0.0
+                    active_anomaly = None
+                    print(
+                        f"[{now_str}] [INFO] Detected .env change ({change_desc}; "
+                        f"SIS_SESSION_ID unchanged; source={session_src}) — re-testing session."
+                    )
+                else:
+                    print(
+                        f"[{now_str}] [INFO] Detected .env change ({change_desc}; "
+                        f"SIS_SESSION_ID unchanged; source={session_src})."
+                    )
 
             cfg = fresh_cfg
             notifiers = build_notifiers(cfg.raw)
@@ -1054,7 +1288,7 @@ def run_daemon(
             _touch_scan_heartbeat()
 
             def _do_tick() -> None:
-                nonlocal last_fetch, last_ok_ts, last_status, last_detail
+                nonlocal last_fetch, last_ok_ts, last_status, last_detail, active_anomaly
                 courses = client.get_courses()
                 if cancel_event.is_set():
                     return
@@ -1077,9 +1311,11 @@ def run_daemon(
                     )
                     last_fetch = time.monotonic()
                     if result.anomaly:
+                        active_anomaly = result.anomaly
                         last_status = "anomaly"
                         last_detail = result.anomaly
                     else:
+                        active_anomaly = None
                         _clear_session_alerted(state_path)
                         last_ok_ts = time.time()
                         last_status = "ok"
@@ -1087,8 +1323,12 @@ def run_daemon(
                 else:
                     _clear_session_alerted(state_path)
                     last_ok_ts = time.time()
-                    last_status = "ok"
-                    last_detail = f"{len(courses)} courses"
+                    if active_anomaly:
+                        last_status = "anomaly"
+                        last_detail = f"{active_anomaly} (keep-alive OK: {len(courses)} courses)"
+                    else:
+                        last_status = "ok"
+                        last_detail = f"{len(courses)} courses"
                     print(f"[{now_str}] Keep-alive OK ({len(courses)} courses).")
 
             run_with_timeout(_do_tick, timeout=cfg.cycle_timeout, cancel_event=cancel_event)

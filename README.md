@@ -20,6 +20,8 @@ It keeps your short-lived `ASP.NET_SessionId` session alive via sliding expirati
 4. **Hot-reload `.env` & Watchdog**: If the server recycles sessions overnight, the tracker sends **one** `"SIS session expired"` alert, polls `.env` for a new `SIS_SESSION_ID` (detecting both in-place edits and atomic inode-replacing saves), and exits non-zero after `SESSION_EXPIRED_TIMEOUT` (default `300s`) so Docker/systemd can restart cleanly. A per-cycle deadline (`CYCLE_TIMEOUT`) and heartbeat (`--healthcheck`) catch stalled network or notifier calls.
 5. **State Protection**: Snapshots are validated before saving (rejecting partial scans or sudden drops such as `>0` marks falling to `0`), protected with `state.json.lock`, and backed up in rolling `state.json.bak*` files.
 
+For a simple breakdown of the polling flow, fallbacks, runtime files, and COMSATS portal quirks, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ---
 
 ## Requirements
@@ -138,7 +140,7 @@ If `WEBHOOK_URL` is configured, `tracker.py` sends an HTTP `POST` with `Content-
 }
 ```
 
-Events: `baseline_saved`, `marks_updated`, `marks_removed`, `resource_added`, `resource_removed`, `announcement_added`, `announcement_removed`, `course_removed`, `scan_anomaly`, `session_expired`, `test`.
+Events: `baseline_saved`, `marks_updated`, `marks_removed`, `resource_added`, `resource_removed`, `announcement_added`, `announcement_removed`, `course_removed`, `scan_anomaly`, `scan_recovered`, `session_expired`, `test`.
 
 ---
 
