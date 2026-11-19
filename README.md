@@ -17,7 +17,8 @@ It keeps your short-lived `ASP.NET_SessionId` session alive via sliding expirati
    - **Generic JSON Webhook** (Home Assistant, n8n, Slack, custom HTTP servers)
    - **Discord Webhook**
    - **Telegram Bot**
-4. **Hot-reload `.env`**: If the server recycles sessions overnight, the tracker sends **one** `"SIS session expired"` alert and automatically resumes as soon as you save a fresh `SIS_SESSION_ID` in `.env` — no restart needed.
+4. **Hot-reload `.env` & Watchdog**: If the server recycles sessions overnight, the tracker sends **one** `"SIS session expired"` alert, polls `.env` for a new `SIS_SESSION_ID` (detecting both in-place edits and atomic inode-replacing saves), and exits non-zero after `SESSION_EXPIRED_TIMEOUT` (default `300s`) so Docker/systemd can restart cleanly. A per-cycle deadline (`CYCLE_TIMEOUT`) and heartbeat (`--healthcheck`) catch stalled network or notifier calls.
+5. **State Protection**: Snapshots are validated before saving (rejecting partial scans or sudden drops such as `>0` marks falling to `0`), protected with `state.json.lock`, and backed up in rolling `state.json.bak*` files.
 
 ---
 
@@ -65,7 +66,7 @@ It keeps your short-lived `ASP.NET_SessionId` session alive via sliding expirati
 
 ## Running 24/7 with Docker Compose (Recommended for Mini-PC)
 
-Make sure `.env` exists **before** starting Docker Compose so `./.env` mounts as a file rather than a directory:
+Create `.env` from `.env.example`, then build and start the container:
 
 ```bash
 cp .env.example .env
@@ -77,10 +78,11 @@ Useful commands:
 ```bash
 docker compose logs -f                 # watch live keep-alive & scan logs
 docker compose run --rm tracker python3 -u tracker.py --test-notify
-docker compose restart                 # reload after replacing .env
+docker compose ps                      # inspect container healthcheck status
+docker compose up -d --build           # rebuild after pulling updates
 ```
 
-State is persisted in `./data/state.json` (gitignored). Updating `SIS_SESSION_ID` in-place in `.env` (e.g., via `nano`) is also hot-reloaded automatically by the running container.
+State is persisted in `./data/state.json` (with rolling `state.json.bak*` backups and `heartbeat.json`, all gitignored). The Compose file mounts the project directory read-only at `/app/config` (`ENV_FILE=/app/config/.env`) so updating `SIS_SESSION_ID` in `.env` — even with editors that replace the file inode — is detected and hot-reloaded automatically by the running container. The `Dockerfile` also defines a `HEALTHCHECK` backed by `python3 tracker.py --healthcheck`.
 
 ---
 
@@ -136,7 +138,7 @@ If `WEBHOOK_URL` is configured, `tracker.py` sends an HTTP `POST` with `Content-
 }
 ```
 
-Events: `baseline_saved`, `marks_updated`, `resource_added`, `announcement_added`, `session_expired`, `test`.
+Events: `baseline_saved`, `marks_updated`, `marks_removed`, `resource_added`, `resource_removed`, `announcement_added`, `announcement_removed`, `course_removed`, `scan_anomaly`, `session_expired`, `test`.
 
 ---
 
@@ -146,6 +148,7 @@ Events: `baseline_saved`, `marks_updated`, `resource_added`, `announcement_added
 - `python3 tracker.py --once` — run a single scan and exit
 - `python3 tracker.py --dry-run` — scan without modifying `state.json`
 - `python3 tracker.py --test-notify` — verify your configured notifiers
+- `python3 tracker.py --healthcheck` — verify heartbeat freshness and status (used by Docker `HEALTHCHECK`)
 - `python3 probe.py` — diagnostic tool to inspect portal HTML endpoints
 
 ---

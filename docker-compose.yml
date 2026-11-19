@@ -4,7 +4,9 @@ services:
     container_name: comsats-portal-tracker
     restart: unless-stopped
     environment:
+      - ENV_FILE=/app/config/.env
       - STATE_FILE=/app/data/state.json
+      - HEARTBEAT_FILE=/app/data/heartbeat.json
     volumes:
-      - ./.env:/app/.env:ro
+      - ./:/app/config:ro
       - ./data:/app/data

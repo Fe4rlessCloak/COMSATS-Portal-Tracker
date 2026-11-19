@@ -12,12 +12,15 @@ Supports:
 
 from __future__ import annotations
 
+import http.client
 import json
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -59,7 +62,7 @@ class NtfyNotifier(BaseNotifier):
 
     name = "ntfy"
 
-    def __init__(self, topic_url: str, token: str = "", timeout: int = 15) -> None:
+    def __init__(self, topic_url: str, token: str = "", timeout: float = 15) -> None:
         self.topic_url = topic_url.strip()
         self.token = token.strip()
         self.timeout = timeout
@@ -93,7 +96,7 @@ class WebhookNotifier(BaseNotifier):
 
     name = "webhook"
 
-    def __init__(self, webhook_url: str, timeout: int = 15) -> None:
+    def __init__(self, webhook_url: str, timeout: float = 15) -> None:
         self.webhook_url = webhook_url.strip()
         self.timeout = timeout
 
@@ -127,7 +130,7 @@ class DiscordNotifier(BaseNotifier):
 
     name = "discord"
 
-    def __init__(self, webhook_url: str, timeout: int = 15) -> None:
+    def __init__(self, webhook_url: str, timeout: float = 15) -> None:
         self.webhook_url = webhook_url.strip()
         self.timeout = timeout
 
@@ -155,7 +158,7 @@ class TelegramNotifier(BaseNotifier):
 
     name = "telegram"
 
-    def __init__(self, bot_token: str, chat_id: str, timeout: int = 15) -> None:
+    def __init__(self, bot_token: str, chat_id: str, timeout: float = 15) -> None:
         self.bot_token = bot_token.strip()
         self.chat_id = chat_id.strip()
         self.timeout = timeout
@@ -181,34 +184,94 @@ class TelegramNotifier(BaseNotifier):
             resp.read()
 
 
+def _parse_notifier_timeout(config: Dict[str, str], default: float = 15.0) -> float:
+    raw = config.get("NOTIFIER_TIMEOUT", "").strip()
+    if not raw:
+        return default
+    try:
+        return max(2.0, float(raw))
+    except ValueError:
+        return default
+
+
 def build_notifiers(config: Dict[str, str]) -> List[BaseNotifier]:
     """Instantiate all configured notifiers (ConsoleNotifier is always first)."""
     notifiers: List[BaseNotifier] = [ConsoleNotifier()]
+    timeout = _parse_notifier_timeout(config)
 
     ntfy_url = config.get("NTFY_URL", "").strip()
     if ntfy_url:
-        notifiers.append(NtfyNotifier(ntfy_url, config.get("NTFY_TOKEN", "")))
+        notifiers.append(NtfyNotifier(ntfy_url, config.get("NTFY_TOKEN", ""), timeout=timeout))
 
     webhook_url = config.get("WEBHOOK_URL", "").strip()
     if webhook_url:
-        notifiers.append(WebhookNotifier(webhook_url))
+        notifiers.append(WebhookNotifier(webhook_url, timeout=timeout))
 
     discord_url = config.get("DISCORD_WEBHOOK_URL", "").strip()
     if discord_url:
-        notifiers.append(DiscordNotifier(discord_url))
+        notifiers.append(DiscordNotifier(discord_url, timeout=timeout))
 
     tg_token = config.get("TELEGRAM_BOT_TOKEN", "").strip()
     tg_chat = config.get("TELEGRAM_CHAT_ID", "").strip()
     if tg_token and tg_chat:
-        notifiers.append(TelegramNotifier(tg_token, tg_chat))
+        notifiers.append(TelegramNotifier(tg_token, tg_chat, timeout=timeout))
 
     return notifiers
 
 
-def dispatch_all(notifiers: Sequence[BaseNotifier], note: Notification) -> None:
-    """Send a notification through every backend without letting one failure stop others."""
+def dispatch_all(
+    notifiers: Sequence[BaseNotifier],
+    note: Notification,
+    timeout: Optional[float] = None,
+) -> None:
+    """Send a notification through every backend without letting one failure or stall block."""
+    async_notifiers: List[BaseNotifier] = []
     for notifier in notifiers:
+        if isinstance(notifier, ConsoleNotifier):
+            try:
+                notifier.send(note)
+            except Exception as exc:
+                print(f"[WARN] Notifier '{notifier.name}' failed: {exc}")
+        else:
+            async_notifiers.append(notifier)
+
+    if not async_notifiers:
+        return
+
+    def _send_one(n: BaseNotifier) -> None:
         try:
-            notifier.send(note)
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
-            print(f"[WARN] Notifier '{notifier.name}' failed: {exc}")
+            n.send(note)
+        except (
+            urllib.error.URLError,
+            urllib.error.HTTPError,
+            http.client.HTTPException,
+            TimeoutError,
+            OSError,
+            ValueError,
+            Exception,
+        ) as exc:
+            print(f"[WARN] Notifier '{n.name}' failed: {exc}")
+
+    workers: List[Tuple[BaseNotifier, threading.Thread, float, float]] = []
+    start = time.monotonic()
+    for notifier in async_notifiers:
+        per_timeout = (
+            max(0.1, float(timeout))
+            if timeout is not None
+            else float(getattr(notifier, "timeout", 15)) + 5.0
+        )
+        deadline = start + per_timeout
+        t = threading.Thread(
+            target=_send_one,
+            args=(notifier,),
+            name=f"notify-{notifier.name}",
+            daemon=True,
+        )
+        t.start()
+        workers.append((notifier, t, per_timeout, deadline))
+
+    for notifier, t, per_timeout, deadline in workers:
+        remaining = max(0.0, deadline - time.monotonic())
+        t.join(timeout=remaining)
+        if t.is_alive():
+            print(f"[WARN] Notifier '{notifier.name}' timed out after {per_timeout:.1f}s")

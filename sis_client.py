@@ -8,7 +8,9 @@ non-hardcoded MVC routes discovered from /Courses.
 
 from __future__ import annotations
 
+import http.client
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -30,6 +32,20 @@ class SessionExpiredError(RuntimeError):
 
 class PortalHttpError(RuntimeError):
     """Raised on unexpected HTTP/network errors."""
+
+
+class PortalParseError(PortalHttpError):
+    """Raised when an authenticated portal page is missing expected page markup."""
+
+
+class CourseMismatchError(PortalHttpError):
+    """Raised when the active course header does not match the requested course."""
+
+
+@dataclass(frozen=True)
+class ActiveCourseInfo:
+    code: str
+    name: str
 
 
 @dataclass(frozen=True)
@@ -586,6 +602,86 @@ class _AnnouncementsParser(HTMLParser):
             self._body_buf.append(data)
 
 
+class _ActiveCourseParser(HTMLParser):
+    """Parses active course code and name from .page_title_container."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.found_container = False
+        self.name = ""
+        self.code = ""
+        self._skip_depth = 0
+        self._in_container = False
+        self._container_depth = 0
+        self._in_h3 = False
+        self._in_h5 = False
+        self._buf: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs_list: List[Tuple[str, Optional[str]]]) -> None:
+        t = tag.lower()
+        attrs = _attr_dict(attrs_list)
+
+        if t in ("script", "style"):
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+
+        if t == "div":
+            if self._in_container:
+                self._container_depth += 1
+            elif _has_class(attrs, "page_title_container"):
+                self._in_container = True
+                self._container_depth = 1
+                self.found_container = True
+            return
+
+        if not self._in_container:
+            return
+
+        if t == "h3":
+            self._in_h3 = True
+            self._buf = []
+        elif t == "h5":
+            self._in_h5 = True
+            self._buf = []
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t in ("script", "style") and self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if self._skip_depth:
+            return
+
+        if t == "div" and self._in_container:
+            self._container_depth -= 1
+            if self._container_depth <= 0:
+                self._in_container = False
+            return
+
+        if not self._in_container:
+            return
+
+        if t == "h3" and self._in_h3:
+            text = _clean_text(self._buf)
+            if text and not self.name:
+                self.name = text
+            self._in_h3 = False
+        elif t == "h5" and self._in_h5:
+            text = _clean_text(self._buf)
+            m = re.search(r"Course\s*Code\s*:\s*([A-Za-z0-9_-]+)", text, re.IGNORECASE)
+            if m and not self.code:
+                self.code = m.group(1).strip()
+            self._in_h5 = False
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth or not self._in_container:
+            return
+        if self._in_h3 or self._in_h5:
+            self._buf.append(data)
+
+
 def parse_courses(html: str) -> List[Course]:
     p = _CoursesParser()
     p.feed(html)
@@ -610,6 +706,159 @@ def parse_announcements(html: str) -> List[AnnouncementItem]:
     return p.items
 
 
+def parse_active_course(html: str) -> Optional[ActiveCourseInfo]:
+    p = _ActiveCourseParser()
+    p.feed(html)
+    if p.found_container and (p.code or p.name):
+        return ActiveCourseInfo(code=p.code, name=p.name)
+    return None
+
+
+def _norm_course_code(val: str) -> str:
+    return re.sub(r"\s+", "", val).upper()
+
+
+def _norm_course_name(val: str) -> str:
+    return " ".join(val.split()).lower()
+
+
+def verify_active_course(html: str, course: Course) -> None:
+    """Verify the active course header in HTML matches the requested Course."""
+    active = parse_active_course(html)
+    if active is None:
+        raise CourseMismatchError(
+            f"Missing active course header while expecting {course.code or course.course_id} ({course.course_id})."
+        )
+    expected_code = course.code.strip()
+    if expected_code:
+        if not active.code or _norm_course_code(active.code) != _norm_course_code(expected_code):
+            raise CourseMismatchError(
+                f"Active course mismatch: expected {expected_code} ({course.course_id}), "
+                f"got {active.code or active.name!r}."
+            )
+    elif course.name.strip():
+        if not active.name or _norm_course_name(active.name) != _norm_course_name(course.name):
+            raise CourseMismatchError(
+                f"Active course mismatch: expected {course.name!r} ({course.course_id}), "
+                f"got {active.name or active.code!r}."
+            )
+
+
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_ATTR_RE = re.compile(
+    r"""([A-Za-z_:][A-Za-z0-9_.:-]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?"""
+)
+
+
+def _strip_script_and_style(html: str) -> str:
+    return _SCRIPT_STYLE_RE.sub("", html)
+
+
+def _parse_tag_attrs(attr_str: str) -> Dict[str, str]:
+    attrs: Dict[str, str] = {}
+    for m in _ATTR_RE.finditer(attr_str):
+        key = m.group(1).lower()
+        val = m.group(2) if m.group(2) is not None else (m.group(3) if m.group(3) is not None else (m.group(4) or ""))
+        attrs[key] = val
+    return attrs
+
+
+def is_login_url(url: str) -> bool:
+    """Return True if a URL points to a portal login route."""
+    parsed = urllib.parse.urlparse(url.strip())
+    path = (parsed.path or "").lower()
+    query = (parsed.query or "").lower()
+    if path == "/login" or path.startswith("/login/") or "/account/login" in path:
+        return True
+    if path in ("", "/") and "returnurl=" in query:
+        return True
+    return False
+
+
+def has_authenticated_shell(html: str) -> bool:
+    """Check for authenticated portal shell markers outside script/style blocks."""
+    stripped = _strip_script_and_style(html)
+    lowered = stripped.lower()
+    if re.search(r"<header\b[^>]*\bsis-portal-header\b", stripped, re.IGNORECASE):
+        return True
+    if "/login/sign_out" in lowered:
+        return True
+    if 'id="sign_out"' in lowered or "id='sign_out'" in lowered:
+        return True
+    if 'id="dash_board"' in lowered or "id='dash_board'" in lowered:
+        return True
+    if re.search(r"""class\s*=\s*["'][^"']*\bsis-welcome\b""", stripped, re.IGNORECASE):
+        return True
+    return False
+
+
+def detect_login_page(html: str, final_url: str = "") -> Optional[str]:
+    """Return a reason string if the response looks like a login/unauthenticated page, else None."""
+    if final_url and is_login_url(final_url):
+        return f"Final URL is login page ({final_url})."
+
+    if re.search(r"""id\s*=\s*["'](?:LoginSubmit|CaptchaMount)["']""", html, re.IGNORECASE):
+        return "Portal returned the login page."
+
+    if re.search(r"""<body\b[^>]*\bclass\s*=\s*["'][^"']*\bsis-login-page\b""", html, re.IGNORECASE):
+        return "Portal returned a login page body."
+
+    for m in re.finditer(r"<meta\b([^>]*)>", html, re.IGNORECASE):
+        attrs = _parse_tag_attrs(m.group(1))
+        if attrs.get("http-equiv", "").strip().lower() == "refresh":
+            content = attrs.get("content", "")
+            url_match = re.search(r"""url\s*=\s*['"]?([^'";\s>]+)""", content, re.IGNORECASE)
+            if url_match:
+                target = urllib.parse.urljoin("https://portal/", url_match.group(1).strip())
+                if is_login_url(target):
+                    return f"Meta refresh redirects to login ({url_match.group(1).strip()})."
+
+    if re.search(
+        r"""(?:window\.)?location(?:\.href)?\s*=\s*['"][^'"]*(?:/login(?:/index)?|/account/login)(?:['"?#])|location\.(?:replace|assign)\(\s*['"][^'"]*(?:/login(?:/index)?|/account/login)(?:['"?#])""",
+        html,
+        re.IGNORECASE,
+    ):
+        return "JavaScript redirects to login page."
+
+    stripped = _strip_script_and_style(html)
+    for m in re.finditer(r"<form\b([^>]*)>", stripped, re.IGNORECASE):
+        attrs = _parse_tag_attrs(m.group(1))
+        if attrs.get("id", "").strip().lower() == "synopsisform":
+            continue
+        action = attrs.get("action", "").strip()
+        if action:
+            parsed = urllib.parse.urlparse(action)
+            norm_path = "/" + parsed.path.lstrip("/") if parsed.path else ""
+            if re.match(r"^/(?:login(?:/index)?|account/login)$", norm_path, re.IGNORECASE):
+                return f"Portal rendered a login form (action={action})."
+
+    if not has_authenticated_shell(html):
+        return "Portal response is missing authenticated shell markers (possible login or error page)."
+
+    return None
+
+
+def has_courses_page_marker(html: str) -> bool:
+    stripped = _strip_script_and_style(html)
+    lowered = stripped.lower()
+    return (
+        "sis-dash-table" in lowered
+        or 'id="registeredcourses"' in lowered
+        or "id='registeredcourses'" in lowered
+        or bool(re.search(r"""class\s*=\s*["'][^"']*\bsis-dash\b""", stripped, re.IGNORECASE))
+    )
+
+
+def has_marks_page_marker(html: str) -> bool:
+    stripped = _strip_script_and_style(html)
+    return bool(re.search(r"\b(?:sis-marks-summary|sis-marks-table|sis-marks-empty)\b", stripped, re.IGNORECASE))
+
+
+def has_resources_page_marker(html: str) -> bool:
+    stripped = _strip_script_and_style(html)
+    return bool(re.search(r"\b(?:sis-lr|sis-lr-table|sis-lr-count)\b", stripped, re.IGNORECASE))
+
+
 class SisClient:
     """HTTP client for authenticated COMSATS Student Portal requests."""
 
@@ -620,21 +869,31 @@ class SisClient:
         user_agent: str = DEFAULT_USER_AGENT,
         request_delay: float = 0.6,
         timeout: int = 20,
+        cancel_event: Optional[threading.Event] = None,
     ) -> None:
         self.session_id = session_id
         self.base_url = base_url.rstrip("/")
         self.user_agent = user_agent or DEFAULT_USER_AGENT
         self.request_delay = max(0.0, request_delay)
         self.timeout = timeout
+        self.cancel_event = cancel_event
         self._opener = urllib.request.build_opener(_NoRedirect())
         self._last_request_ts = 0.0
 
     def _throttle(self) -> None:
+        if self.cancel_event and self.cancel_event.is_set():
+            raise PortalHttpError("Request cancelled.")
         if self.request_delay <= 0:
             return
         elapsed = time.monotonic() - self._last_request_ts
         if elapsed < self.request_delay:
-            time.sleep(self.request_delay - elapsed)
+            remaining = self.request_delay - elapsed
+            if self.cancel_event is not None:
+                self.cancel_event.wait(remaining)
+                if self.cancel_event.is_set():
+                    raise PortalHttpError("Request cancelled.")
+            else:
+                time.sleep(remaining)
 
     def get_html(self, path: str) -> str:
         """Fetch an authenticated portal page, raising SessionExpiredError if redirected to Login."""
@@ -654,37 +913,56 @@ class SisClient:
             try:
                 with self._opener.open(req, timeout=self.timeout) as resp:
                     self._last_request_ts = time.monotonic()
+                    final_url = resp.geturl() or url
                     body = resp.read().decode("utf-8", errors="replace")
-                    if 'id="LoginSubmit"' in body or 'id="CaptchaMount"' in body:
-                        raise SessionExpiredError("Portal returned the login page.")
+                    login_reason = detect_login_page(body, final_url=final_url)
+                    if login_reason:
+                        raise SessionExpiredError(login_reason)
                     return body
             except urllib.error.HTTPError as e:
                 self._last_request_ts = time.monotonic()
                 loc = e.headers.get("Location", "") if e.headers else ""
                 if e.code in (301, 302, 303, 307, 308):
-                    if "login" in loc.lower():
+                    next_url = urllib.parse.urljoin(url, loc) if loc else ""
+                    if loc and (is_login_url(next_url) or "login" in loc.lower()):
                         raise SessionExpiredError(f"Redirected to login ({loc}).") from e
                     if loc:
-                        url = urllib.parse.urljoin(url, loc)
+                        url = next_url
                         continue
                 raise PortalHttpError(f"HTTP {e.code} fetching {url}") from e
-            except urllib.error.URLError as e:
-                raise PortalHttpError(f"Network error fetching {url}: {e.reason}") from e
+            except (urllib.error.URLError, TimeoutError, http.client.HTTPException, OSError) as e:
+                raise PortalHttpError(f"Network error fetching {url}: {e}") from e
 
         raise PortalHttpError(f"Too many redirects fetching {path}")
 
     def get_courses(self) -> List[Course]:
         html = self.get_html("/Courses")
-        return parse_courses(html)
+        if not has_courses_page_marker(html):
+            raise PortalParseError("Dashboard response missing expected courses table markup.")
+        courses = parse_courses(html)
+        if not courses:
+            raise PortalParseError("Dashboard parsed 0 courses.")
+        return courses
 
-    def select_course(self, course_id: str) -> str:
+    def select_course(self, course_id: str, expected_course: Optional[Course] = None) -> str:
         """Switch active session course via /Courses/SetCourse/<id> (returns Announcements HTML)."""
-        return self.get_html(f"/Courses/SetCourse/{course_id}")
+        html = self.get_html(f"/Courses/SetCourse/{course_id}")
+        if expected_course is not None:
+            verify_active_course(html, expected_course)
+        return html
 
-    def get_marks_summary(self) -> List[MarkItem]:
+    def get_marks_summary(self, expected_course: Optional[Course] = None) -> List[MarkItem]:
         html = self.get_html("/MarksSummary/Index")
+        if not has_marks_page_marker(html):
+            raise PortalParseError("MarksSummary response missing expected marks markup.")
+        if expected_course is not None:
+            verify_active_course(html, expected_course)
         return parse_marks_summary(html)
 
-    def get_learning_resources(self) -> List[ResourceItem]:
+    def get_learning_resources(self, expected_course: Optional[Course] = None) -> List[ResourceItem]:
         html = self.get_html("/LearningResources/Index")
+        if not has_resources_page_marker(html):
+            raise PortalParseError("LearningResources response missing expected resources markup.")
+        if expected_course is not None:
+            verify_active_course(html, expected_course)
         return parse_learning_resources(html)
