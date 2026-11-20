@@ -17,10 +17,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
-import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import sys
@@ -31,6 +31,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows compatibility for importing parser helpers
+    fcntl = None  # type: ignore[assignment]
 
 from notifiers import BaseNotifier, Notification, build_notifiers, dispatch_all
 from sis_client import (
@@ -56,6 +61,7 @@ KNOWN_ENV_KEYS = (
     "SIS_SESSION_ID",
     "SIS_BASE_URL",
     "SIS_USER_AGENT",
+    "SIS_SEMESTER",
     "KEEPALIVE_INTERVAL",
     "FETCH_INTERVAL",
     "REQUEST_DELAY",
@@ -74,6 +80,11 @@ KNOWN_ENV_KEYS = (
     "HEALTHCHECK_MAX_AGE",
 )
 
+_EXPORT_PREFIX_RE = re.compile(r"^export[ \t]+")
+_INLINE_COMMENT_RE = re.compile(r"(?:^|\s+)#.*$")
+_SESSION_COOKIE_RE = re.compile(r"(?:^|;\s*)asp\.net_sessionid\s*=\s*([^;]*)", re.IGNORECASE)
+_SAFE_KEY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,40}$")
+
 
 class CycleTimeoutError(RuntimeError):
     """Raised when a polling/scan cycle exceeds its hard deadline."""
@@ -81,6 +92,10 @@ class CycleTimeoutError(RuntimeError):
     def __init__(self, message: str, wedged: bool = False) -> None:
         super().__init__(message)
         self.wedged = wedged
+
+
+class CycleCancelledError(RuntimeError):
+    """Raised when a running cycle is interrupted by a shutdown signal."""
 
 
 class StateLockError(RuntimeError):
@@ -132,6 +147,111 @@ class TrackerConfig:
     notifier_timeout: float = 20.0
     max_state_backups: int = 5
     healthcheck_max_age: int = 0
+    semester: str = ""
+
+
+def _decode_env_bytes(raw: bytes) -> str:
+    """Decode .env bytes supporting UTF-32/UTF-16/UTF-8 BOMs and cp1252 fallback."""
+    if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return raw.decode("utf-32", errors="replace")
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="replace")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
+def _parse_quoted_env_value(val: str, quote: str) -> Optional[str]:
+    """Parse a single- or double-quoted .env value, allowing trailing # comments."""
+    if quote == "'":
+        end_idx = val.find("'", 1)
+        if end_idx == -1:
+            return None
+        tail = val[end_idx + 1 :].lstrip()
+        if tail and not tail.startswith("#"):
+            return None
+        return val[1:end_idx]
+
+    escapes = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
+    chars: List[str] = []
+    i = 1
+    n = len(val)
+    while i < n:
+        ch = val[i]
+        if ch == "\\":
+            if i + 1 < n:
+                nxt = val[i + 1]
+                chars.append(escapes.get(nxt, "\\" + nxt))
+                i += 2
+                continue
+            chars.append("\\")
+            i += 1
+            continue
+        if ch == '"':
+            tail = val[i + 1 :].lstrip()
+            if tail and not tail.startswith("#"):
+                return None
+            return "".join(chars)
+        chars.append(ch)
+        i += 1
+    return None
+
+
+def _parse_env_value(raw_val: str) -> str:
+    """Parse a .env RHS value, handling quotes, escapes, and inline # comments."""
+    val = raw_val.strip()
+    if not val:
+        return ""
+    if val[0] in ('"', "'"):
+        parsed = _parse_quoted_env_value(val, val[0])
+        if parsed is not None:
+            return parsed
+    return _INLINE_COMMENT_RE.sub("", val).strip()
+
+
+def parse_env_text(text: str) -> Dict[str, str]:
+    """Parse .env text supporting BOMs, `export KEY=VAL`, quotes, and inline # comments."""
+    values: Dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip().lstrip("\ufeff").strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        raw_key, raw_val = line.split("=", 1)
+        key = raw_key.strip().lstrip("\ufeff").strip()
+        if _EXPORT_PREFIX_RE.match(key):
+            key = _EXPORT_PREFIX_RE.sub("", key, count=1).strip()
+        if not key:
+            continue
+        values[key] = _parse_env_value(raw_val)
+    return values
+
+
+def parse_env_file(env_path: Path) -> Dict[str, str]:
+    """Read and parse a .env file on disk; returns {} if missing or a directory."""
+    if not env_path.exists():
+        return {}
+    if env_path.is_dir():
+        print(f"[WARN] ENV_FILE points to a directory instead of a file: {env_path}")
+        return {}
+    return parse_env_text(_decode_env_bytes(env_path.read_bytes()))
+
+
+def normalize_session_id(raw_value: str) -> str:
+    """Normalize pasted ASP.NET_SessionId values (Cookie headers, cookie pairs, placeholders)."""
+    val = raw_value.strip().strip("\ufeff").strip()
+    if not val:
+        return ""
+    if val.lower().startswith("cookie:"):
+        val = val.split(":", 1)[1].strip()
+    cookie_match = _SESSION_COOKIE_RE.search(val)
+    if cookie_match:
+        val = cookie_match.group(1).strip()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+        val = val[1:-1].strip()
+    if val == "paste_your_ASP_NET_SessionId_here":
+        return ""
+    return val
 
 
 def load_env_with_sources(env_path: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
@@ -140,30 +260,23 @@ def load_env_with_sources(env_path: Path) -> Tuple[Dict[str, str], Dict[str, str
     sources: Dict[str, str] = {}
 
     for key in KNOWN_ENV_KEYS:
-        env_val = os.environ.get(key, "")
+        env_val = os.environ.get(key, "").strip()
         if env_val != "":
-            values[key] = env_val.strip()
+            values[key] = env_val
             sources[key] = "process_env"
 
-    if env_path.exists():
-        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            key = k.strip()
-            val = v.strip().strip('"').strip("'")
-            if val != "":
-                had_proc_env = key in os.environ and os.environ[key] != ""
-                values[key] = val
-                sources[key] = (
-                    f"env_file:{env_path} (overrides process_env)"
-                    if had_proc_env
-                    else f"env_file:{env_path}"
-                )
-            elif key not in values:
-                values[key] = ""
-                sources[key] = f"env_file:{env_path}"
+    for key, val in parse_env_file(env_path).items():
+        if val.strip() != "":
+            had_proc_env = bool(os.environ.get(key, "").strip())
+            values[key] = val
+            sources[key] = (
+                f"env_file:{env_path} (overrides process_env)"
+                if had_proc_env
+                else f"env_file:{env_path}"
+            )
+        elif key not in values:
+            values[key] = ""
+            sources[key] = f"env_file:{env_path}"
 
     return values, sources
 
@@ -250,25 +363,58 @@ def _parse_float(values: Dict[str, str], key: str, default: float, minimum: floa
         return default
 
 
+def _describe_missing_session_context(env_path: Path, values: Dict[str, str]) -> str:
+    """Return a secret-free diagnostic line explaining why SIS_SESSION_ID is missing."""
+    if not env_path.exists():
+        file_desc = f"env file does not exist: {env_path}"
+    elif env_path.is_dir():
+        file_desc = f"env path is a directory (not a file): {env_path}"
+    else:
+        try:
+            file_desc = f"env file {env_path} exists ({env_path.stat().st_size} bytes)"
+        except OSError:
+            file_desc = f"env file {env_path} exists (stat failed)"
+
+    if "SIS_SESSION_ID" not in values:
+        sid_state = "SIS_SESSION_ID key absent"
+    else:
+        raw_sid = values["SIS_SESSION_ID"].strip()
+        if raw_sid == "paste_your_ASP_NET_SessionId_here":
+            sid_state = "SIS_SESSION_ID still set to example placeholder"
+        elif not raw_sid:
+            sid_state = "SIS_SESSION_ID key present but empty"
+        else:
+            sid_state = "SIS_SESSION_ID present but empty after normalization"
+
+    parts = [file_desc, sid_state]
+    known_set = [k for k in KNOWN_ENV_KEYS if k != "SIS_SESSION_ID" and values.get(k, "").strip()]
+    if known_set:
+        parts.append(f"other configured keys: {', '.join(known_set)}")
+    unrecognized = [
+        k for k in values if k not in KNOWN_ENV_KEYS and _SAFE_KEY_NAME_RE.match(k)
+    ][:10]
+    if unrecognized:
+        parts.append(f"unrecognized keys: {', '.join(unrecognized)}")
+    return "; ".join(parts) + "."
+
+
 def load_config(env_path: Path, require_session: bool = True) -> TrackerConfig:
     values, sources = load_env_with_sources(env_path)
-    session_id = values.get("SIS_SESSION_ID", "").strip()
-    if session_id.startswith("ASP.NET_SessionId="):
-        session_id = session_id.split("=", 1)[1].strip()
-    if session_id == "paste_your_ASP_NET_SessionId_here":
-        session_id = ""
+    session_id = normalize_session_id(values.get("SIS_SESSION_ID", ""))
 
     if require_session and not session_id:
+        diag = _describe_missing_session_context(env_path, values)
         raise SystemExit(
             "Missing SIS_SESSION_ID.\n"
+            f"{diag}\n"
             f"Copy {env_path.parent / '.env.example'} to {env_path} and set SIS_SESSION_ID."
         )
 
     return TrackerConfig(
         raw=values,
         session_id=session_id,
-        base_url=(values.get("SIS_BASE_URL") or DEFAULT_BASE_URL).strip().rstrip("/"),
-        user_agent=(values.get("SIS_USER_AGENT") or DEFAULT_USER_AGENT).strip(),
+        base_url=(values.get("SIS_BASE_URL", "").strip() or DEFAULT_BASE_URL).rstrip("/"),
+        user_agent=values.get("SIS_USER_AGENT", "").strip() or DEFAULT_USER_AGENT,
         keepalive_interval=_parse_int(values, "KEEPALIVE_INTERVAL", 120, minimum=15),
         fetch_interval=_parse_int(values, "FETCH_INTERVAL", 480, minimum=30),
         request_delay=_parse_float(values, "REQUEST_DELAY", 0.6),
@@ -281,12 +427,15 @@ def load_config(env_path: Path, require_session: bool = True) -> TrackerConfig:
         notifier_timeout=_parse_float(values, "NOTIFIER_TIMEOUT", 20.0, minimum=1.0),
         max_state_backups=_parse_int(values, "MAX_STATE_BACKUPS", 5, minimum=1),
         healthcheck_max_age=_parse_int(values, "HEALTHCHECK_MAX_AGE", 0, minimum=0),
+        semester=values.get("SIS_SEMESTER", "").strip(),
     )
 
 
 @contextlib.contextmanager
 def state_lock(state_path: Path, timeout: float = 30.0) -> Iterator[None]:
     """Acquire an exclusive advisory lock around state load/scan/save cycles."""
+    if fcntl is None:
+        raise RuntimeError("state_lock requires POSIX fcntl")
     state_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = state_path.with_name(f"{state_path.name}.lock")
     fh = lock_path.open("a+", encoding="utf-8")
@@ -319,6 +468,26 @@ def _read_json_dict(path: Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _state_backup_paths(state_path: Path) -> List[Path]:
+    """Return existing backup paths ordered from newest (.bak) to oldest (.bak.N)."""
+    paths: List[Path] = []
+    primary_bak = state_path.with_name(f"{state_path.name}.bak")
+    if primary_bak.exists():
+        paths.append(primary_bak)
+    numbered_re = re.compile(rf"^{re.escape(state_path.name)}\.bak\.(\d+)$")
+    numbered: List[Tuple[int, Path]] = []
+    try:
+        for candidate in state_path.parent.iterdir():
+            m = numbered_re.match(candidate.name)
+            if m:
+                numbered.append((int(m.group(1)), candidate))
+    except OSError:
+        pass
+    numbered.sort(key=lambda pair: pair[0])
+    paths.extend(path for _, path in numbered)
+    return paths
+
+
 def load_state(state_path: Path) -> Optional[Dict[str, Any]]:
     if not state_path.exists():
         return None
@@ -326,8 +495,7 @@ def load_state(state_path: Path) -> Optional[Dict[str, Any]]:
     if data is not None:
         return data
 
-    bak_path = state_path.with_name(f"{state_path.name}.bak")
-    if bak_path.exists():
+    for bak_path in _state_backup_paths(state_path):
         bak_data = _read_json_dict(bak_path)
         if bak_data is not None:
             print(f"[WARN] Corrupt state file {state_path}; recovered baseline from {bak_path}.")
@@ -339,20 +507,35 @@ def save_state(state_path: Path, state: Dict[str, Any], max_backups: int = 5) ->
     state_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = f".{os.getpid()}.{threading.get_ident()}"
     tmp_path = state_path.with_name(f"{state_path.name}.tmp{suffix}")
-    tmp_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    bak_tmp = state_path.with_name(f"{state_path.name}.bak.tmp{suffix}")
+    try:
+        tmp_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    if state_path.exists() and max_backups >= 1:
-        for idx in range(max_backups, 1, -1):
-            src_name = f"{state_path.name}.bak" if idx == 2 else f"{state_path.name}.bak.{idx - 1}"
-            src = state_path.with_name(src_name)
-            dst = state_path.with_name(f"{state_path.name}.bak.{idx}")
-            if src.exists():
-                os.replace(src, dst)
-        bak_tmp = state_path.with_name(f"{state_path.name}.bak.tmp{suffix}")
-        shutil.copy2(state_path, bak_tmp)
-        os.replace(bak_tmp, state_path.with_name(f"{state_path.name}.bak"))
+        if state_path.exists() and max_backups >= 1:
+            if _read_json_dict(state_path) is not None:
+                for idx in range(max_backups, 1, -1):
+                    src_name = (
+                        f"{state_path.name}.bak" if idx == 2 else f"{state_path.name}.bak.{idx - 1}"
+                    )
+                    src = state_path.with_name(src_name)
+                    dst = state_path.with_name(f"{state_path.name}.bak.{idx}")
+                    if src.exists():
+                        os.replace(src, dst)
+                shutil.copy2(state_path, bak_tmp)
+                os.replace(bak_tmp, state_path.with_name(f"{state_path.name}.bak"))
+            else:
+                print(
+                    f"[WARN] Skipping backup rotation of corrupt {state_path}; "
+                    "preserving existing backups."
+                )
 
-    os.replace(tmp_path, state_path)
+        os.replace(tmp_path, state_path)
+    except BaseException:
+        for leftover in (tmp_path, bak_tmp):
+            with contextlib.suppress(OSError):
+                if leftover.exists():
+                    leftover.unlink()
+        raise
 
 
 def scan_all_courses(
@@ -362,9 +545,15 @@ def scan_all_courses(
     previous_state: Optional[Dict[str, Any]] = None,
     cancel_event: Optional[threading.Event] = None,
     on_progress: Optional[Callable[[], None]] = None,
+    semester: Optional[str] = None,
 ) -> ScanResult:
     """Iterate through all courses and capture current marks, resources, and optional announcements."""
     snapshot: Dict[str, Any] = {"courses": {}}
+    effective_semester = (semester or "").strip() or (
+        getattr(client, "last_semester", "") or ""
+    ).strip()
+    if effective_semester:
+        snapshot["semester"] = effective_semester
     prev_courses = (previous_state or {}).get("courses", {})
     partial = False
     failed_courses: List[str] = []
@@ -456,7 +645,36 @@ def scan_all_courses(
     )
 
 
-def validate_snapshot(old_state: Optional[Dict[str, Any]], scan_result: ScanResult) -> Optional[str]:
+def _norm_semester(val: str) -> str:
+    return " ".join(val.strip().lower().split())
+
+
+def detect_semester_rollover(
+    old_state: Optional[Dict[str, Any]], new_state: Dict[str, Any]
+) -> Optional[Tuple[str, str]]:
+    """Return (old_semester, new_semester) when state transitions to a new academic semester."""
+    if old_state is None:
+        return None
+    old_raw = str(old_state.get("semester") or "").strip()
+    new_raw = str(new_state.get("semester") or "").strip()
+    old_norm = _norm_semester(old_raw)
+    new_norm = _norm_semester(new_raw)
+    if old_norm and new_norm:
+        return (old_raw, new_raw) if old_norm != new_norm else None
+
+    old_courses = old_state.get("courses", {})
+    new_courses = new_state.get("courses", {})
+    if old_courses and new_courses and set(old_courses).isdisjoint(new_courses):
+        return (old_raw or "previous semester", new_raw or "new semester")
+    return None
+
+
+def validate_snapshot(
+    old_state: Optional[Dict[str, Any]],
+    scan_result: ScanResult,
+    *,
+    reset_state: bool = False,
+) -> Optional[str]:
     """Validate snapshot plausibility before persisting; returns an error reason or None."""
     if scan_result.session_expired:
         return f"Session expired mid-scan: {scan_result.session_expired_error}"
@@ -470,7 +688,12 @@ def validate_snapshot(old_state: Optional[Dict[str, Any]], scan_result: ScanResu
     if new_c == 0:
         return "Scan returned 0 courses."
 
+    if reset_state:
+        return None
+
     if old_state is not None:
+        if detect_semester_rollover(old_state, scan_result.state) is not None:
+            return None
         old_c, old_m, old_r = summarize_totals(old_state)
         if old_m > 0 and new_m == 0:
             return f"Total marks dropped from {old_m} to 0 (degenerate scan)."
@@ -708,6 +931,8 @@ def run_cycle(
     on_progress: Optional[Callable[[], None]] = None,
     lock_timeout: float = 30.0,
     notify_anomaly: bool = True,
+    semester: Optional[str] = None,
+    reset_state: bool = False,
 ) -> CycleResult:
     """Run one locked load -> multi-course fetch -> validate -> save -> diff + notify cycle."""
     with state_lock(state_path, timeout=lock_timeout):
@@ -719,6 +944,7 @@ def run_cycle(
             previous_state=old_state,
             cancel_event=cancel_event,
             on_progress=on_progress,
+            semester=semester,
         )
 
         if cancel_event is not None and cancel_event.is_set():
@@ -730,7 +956,7 @@ def run_cycle(
                 scan_result.session_expired_error or "Session expired mid-scan."
             )
 
-        anomaly = validate_snapshot(old_state, scan_result)
+        anomaly = validate_snapshot(old_state, scan_result, reset_state=reset_state)
         if anomaly is not None:
             new_c, new_m, new_r = summarize_totals(scan_result.state)
             old_c, old_m, old_r = (
@@ -847,22 +1073,40 @@ def run_cycle(
                 },
             )
 
-        if old_state is None:
+        rollover = None if reset_state else detect_semester_rollover(old_state, new_state)
+
+        if old_state is None or reset_state:
+            if cancel_event is not None and cancel_event.is_set():
+                return CycleResult(saved=False, anomaly="Cancelled")
             if not dry_run:
                 save_state(state_path, new_state, max_backups=max_backups)
                 if prev_anom is not None:
                     _clear_anomaly_state(state_path)
+            new_sem = str(new_state.get("semester") or "").strip()
+            baseline_data: Dict[str, Any] = {
+                "courses": c_count,
+                "marks": m_count,
+                "resources": r_count,
+            }
+            if new_sem:
+                baseline_data["semester"] = new_sem
+                baseline_msg = (
+                    f"Baseline saved for {c_count} courses "
+                    f"({new_sem}: {m_count} marks, {r_count} resources)."
+                )
+            else:
+                baseline_msg = (
+                    f"Baseline saved for {c_count} courses "
+                    f"({m_count} marks, {r_count} resources)."
+                )
             baseline_note = Notification(
                 event="baseline_saved",
                 title="COMSATS Portal Tracker started",
-                message=(
-                    f"Baseline saved for {c_count} courses "
-                    f"({m_count} marks, {r_count} resources)."
-                ),
+                message=baseline_msg,
                 priority="low",
                 tags=("white_check_mark",),
                 url=f"{base_url}/Courses",
-                data={"courses": c_count, "marks": m_count, "resources": r_count},
+                data=baseline_data,
             )
             sent_notes: List[Notification] = []
             if recovery_note is not None and notify_anomaly:
@@ -872,12 +1116,64 @@ def run_cycle(
             sent_notes.append(baseline_note)
             return CycleResult(saved=not dry_run, notifications=sent_notes)
 
+        if rollover is not None:
+            if cancel_event is not None and cancel_event.is_set():
+                return CycleResult(saved=False, anomaly="Cancelled")
+            old_sem_label, new_sem_label = rollover
+            if not dry_run:
+                save_state(state_path, new_state, max_backups=max_backups)
+                if prev_anom is not None:
+                    _clear_anomaly_state(state_path)
+            course_lines = "\n".join(
+                f"- {c.get('label') or cid}"
+                for cid, c in new_state.get("courses", {}).items()
+            )
+            rollover_title = (
+                "New semester detected"
+                if new_sem_label == "new semester"
+                else f"New semester detected: {new_sem_label}"
+            )
+            rollover_msg = (
+                f"Transition: {old_sem_label} -> {new_sem_label}\n"
+                f"Saved fresh baseline for {c_count} courses "
+                f"({m_count} marks, {r_count} resources)."
+            )
+            if course_lines:
+                rollover_msg += f"\n{course_lines}"
+            rollover_note = Notification(
+                event="semester_rollover",
+                title=rollover_title,
+                message=rollover_msg,
+                priority="default",
+                tags=("mortar_board", "white_check_mark"),
+                url=f"{base_url}/Courses",
+                data={
+                    "previous_semester": old_sem_label,
+                    "semester": new_sem_label,
+                    "courses": c_count,
+                    "marks": m_count,
+                    "resources": r_count,
+                },
+            )
+            sent_rollover: List[Notification] = []
+            if recovery_note is not None and notify_anomaly:
+                dispatch_all(notifiers, recovery_note, timeout=notifier_timeout)
+                sent_rollover.append(recovery_note)
+            dispatch_all(notifiers, rollover_note, timeout=notifier_timeout)
+            sent_rollover.append(rollover_note)
+            return CycleResult(saved=not dry_run, notifications=sent_rollover)
+
+        if not new_state.get("semester") and old_state.get("semester"):
+            new_state["semester"] = str(old_state["semester"]).strip()
+
         notifications = diff_states(
             old_state,
             new_state,
             base_url=base_url,
             track_announcements=track_announcements,
         )
+        if cancel_event is not None and cancel_event.is_set():
+            return CycleResult(saved=False, anomaly="Cancelled")
         if not dry_run:
             save_state(state_path, new_state, max_backups=max_backups)
             if prev_anom is not None:
@@ -904,8 +1200,9 @@ def run_with_timeout(
     timeout: float,
     cancel_event: Optional[threading.Event] = None,
     grace: float = 2.0,
+    stop_event: Optional[threading.Event] = None,
 ) -> T:
-    """Execute func in a daemon thread with a hard join deadline."""
+    """Execute func in a daemon thread with a hard join deadline and optional stop signal."""
     result_box: List[T] = []
     error_box: List[BaseException] = []
 
@@ -917,7 +1214,23 @@ def run_with_timeout(
 
     worker = threading.Thread(target=_runner, name="cycle-runner", daemon=True)
     worker.start()
-    worker.join(timeout=max(0.1, float(timeout)))
+    timeout_sec = max(0.1, float(timeout))
+    if stop_event is None:
+        worker.join(timeout=timeout_sec)
+    else:
+        deadline = time.monotonic() + timeout_sec
+        while worker.is_alive():
+            if stop_event.is_set():
+                if cancel_event is not None:
+                    cancel_event.set()
+                worker.join(timeout=max(0.0, float(grace)))
+                raise CycleCancelledError("Cycle cancelled by shutdown signal.")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=min(0.2, remaining))
+        if stop_event.is_set():
+            raise CycleCancelledError("Cycle cancelled by shutdown signal.")
 
     if worker.is_alive():
         if cancel_event is not None:
@@ -1122,10 +1435,15 @@ def run_daemon(
     heartbeat_path: Optional[Path] = None,
 ) -> int:
     stop = False
+    stop_event = threading.Event()
+    current_cancel_event: Optional[threading.Event] = None
 
     def _handle_sig(signum, frame):
         nonlocal stop
         stop = True
+        stop_event.set()
+        if current_cancel_event is not None:
+            current_cancel_event.set()
 
     signal.signal(signal.SIGINT, _handle_sig)
     signal.signal(signal.SIGTERM, _handle_sig)
@@ -1266,9 +1584,9 @@ def run_daemon(
                 return 1
 
             for _ in range(cfg.expired_poll_interval):
-                if stop:
+                if stop or stop_event.is_set():
                     break
-                time.sleep(1)
+                stop_event.wait(1.0)
             continue
 
         cancel_event = threading.Event()
@@ -1292,6 +1610,7 @@ def run_daemon(
                 courses = client.get_courses()
                 if cancel_event.is_set():
                     return
+                _clear_session_alerted(state_path)
                 now_mono = time.monotonic()
                 now_str = datetime.now().strftime("%H:%M:%S")
 
@@ -1308,6 +1627,7 @@ def run_daemon(
                         notifier_timeout=cfg.notifier_timeout,
                         cancel_event=cancel_event,
                         on_progress=_touch_scan_heartbeat,
+                        semester=cfg.semester,
                     )
                     last_fetch = time.monotonic()
                     if result.anomaly:
@@ -1316,12 +1636,10 @@ def run_daemon(
                         last_detail = result.anomaly
                     else:
                         active_anomaly = None
-                        _clear_session_alerted(state_path)
                         last_ok_ts = time.time()
                         last_status = "ok"
                         last_detail = f"{len(courses)} courses"
                 else:
-                    _clear_session_alerted(state_path)
                     last_ok_ts = time.time()
                     if active_anomaly:
                         last_status = "anomaly"
@@ -1331,7 +1649,16 @@ def run_daemon(
                         last_detail = f"{len(courses)} courses"
                     print(f"[{now_str}] Keep-alive OK ({len(courses)} courses).")
 
-            run_with_timeout(_do_tick, timeout=cfg.cycle_timeout, cancel_event=cancel_event)
+            current_cancel_event = cancel_event
+            try:
+                run_with_timeout(
+                    _do_tick,
+                    timeout=cfg.cycle_timeout,
+                    cancel_event=cancel_event,
+                    stop_event=stop_event,
+                )
+            finally:
+                current_cancel_event = None
             consecutive_timeouts = 0
             write_heartbeat(
                 hb_path,
@@ -1342,6 +1669,9 @@ def run_daemon(
                 detail=last_detail,
                 last_ok_ts=last_ok_ts,
             )
+
+        except CycleCancelledError:
+            break
 
         except SessionExpiredError as exc:
             expired_since = time.monotonic()
@@ -1423,7 +1753,7 @@ def run_daemon(
                 last_ok_ts=last_ok_ts,
             )
 
-        except (PortalHttpError, StateLockError) as exc:
+        except (PortalHttpError, StateLockError, ValueError) as exc:
             last_status = "portal_error"
             last_detail = str(exc)
             print(f"[WARN] Portal/state error (will retry next tick): {exc}")
@@ -1438,7 +1768,7 @@ def run_daemon(
             )
 
         for elapsed_sleep in range(cfg.keepalive_interval):
-            if stop:
+            if stop or stop_event.is_set():
                 break
             if elapsed_sleep > 0 and elapsed_sleep % 15 == 0:
                 write_heartbeat(
@@ -1450,7 +1780,7 @@ def run_daemon(
                     detail=last_detail,
                     last_ok_ts=last_ok_ts,
                 )
-            time.sleep(1)
+            stop_event.wait(1.0)
 
     print("Tracker stopped.")
     return 0
@@ -1465,6 +1795,11 @@ def main() -> int:
         help="Scan without writing state.json",
     )
     ap.add_argument(
+        "--reset-state",
+        action="store_true",
+        help="Accept the current portal snapshot as a fresh baseline (use with --once)",
+    )
+    ap.add_argument(
         "--test-notify",
         action="store_true",
         help="Send a test notification to all configured backends and exit",
@@ -1475,6 +1810,10 @@ def main() -> int:
         help="Verify daemon heartbeat freshness and exit 0 if healthy, 1 otherwise",
     )
     args = ap.parse_args()
+
+    if args.reset_state and not args.once:
+        print("[ERROR] --reset-state must be used together with --once.")
+        return 1
 
     root = Path(__file__).resolve().parent
     env_path = Path(os.environ.get("ENV_FILE") or (root / ".env"))
@@ -1530,6 +1869,8 @@ def main() -> int:
                     max_backups=cfg.max_state_backups,
                     notifier_timeout=cfg.notifier_timeout,
                     cancel_event=cancel_event,
+                    semester=cfg.semester,
+                    reset_state=args.reset_state,
                 )
 
             result = run_with_timeout(

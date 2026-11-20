@@ -140,7 +140,7 @@ If `WEBHOOK_URL` is configured, `tracker.py` sends an HTTP `POST` with `Content-
 }
 ```
 
-Events: `baseline_saved`, `marks_updated`, `marks_removed`, `resource_added`, `resource_removed`, `announcement_added`, `announcement_removed`, `course_removed`, `scan_anomaly`, `scan_recovered`, `session_expired`, `test`.
+Events: `baseline_saved`, `semester_rollover`, `marks_updated`, `marks_removed`, `resource_added`, `resource_removed`, `announcement_added`, `announcement_removed`, `course_removed`, `scan_anomaly`, `scan_recovered`, `session_expired`, `test`.
 
 ---
 
@@ -149,6 +149,7 @@ Events: `baseline_saved`, `marks_updated`, `marks_removed`, `resource_added`, `r
 - `python3 tracker.py` — run the 24/7 keep-alive + fetch loop
 - `python3 tracker.py --once` — run a single scan and exit
 - `python3 tracker.py --dry-run` — scan without modifying `state.json`
+- `python3 tracker.py --once --reset-state` — accept the current portal snapshot as a fresh baseline (for mid-semester drops)
 - `python3 tracker.py --test-notify` — verify your configured notifiers
 - `python3 tracker.py --healthcheck` — verify heartbeat freshness and status (used by Docker `HEALTHCHECK`)
 - `python3 probe.py` — diagnostic tool to inspect portal HTML endpoints

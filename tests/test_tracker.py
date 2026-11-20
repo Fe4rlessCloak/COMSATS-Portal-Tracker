@@ -16,6 +16,7 @@ import time
 import unittest
 import urllib.error
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +41,7 @@ from sis_client import (  # noqa: E402
     parse_courses,
     parse_learning_resources,
     parse_marks_summary,
+    parse_semester,
     scrub_diagnostic_html,
     verify_active_course,
 )
@@ -48,10 +50,14 @@ from tracker import (  # noqa: E402
     EnvWatcher,
     StateLockError,
     check_healthcheck,
+    detect_semester_rollover,
     diff_states,
     load_config,
     load_env_with_sources,
     load_state,
+    normalize_session_id,
+    parse_env_file,
+    parse_env_text,
     run_cycle,
     run_daemon,
     run_with_timeout,
@@ -1577,6 +1583,710 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             mock_run.assert_called_once()
             self.assertEqual(mock_run.call_args[0][0], "probe_cookie_from_env_file")
+
+    def test_env_parser_boms_and_encodings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False):
+                # 1. UTF-8 BOM directly before SIS_SESSION_ID on line 1
+                p1 = Path(tmp) / "utf8_bom.env"
+                p1.write_bytes(b"\xef\xbb\xbfSIS_SESSION_ID=bom_sid_1\n")
+                self.assertEqual(load_config(p1).session_id, "bom_sid_1")
+
+                # 2. UTF-8 BOM directly before comment containing '=' on line 1
+                p2 = Path(tmp) / "utf8_bom_comment.env"
+                p2.write_bytes(b"\xef\xbb\xbf# comment with = sign\nSIS_SESSION_ID=bom_sid_2\n")
+                self.assertEqual(load_config(p2).session_id, "bom_sid_2")
+
+                # 3. UTF-16 LE & UTF-16 BE with BOM (and UTF-32 LE with BOM)
+                p3 = Path(tmp) / "utf16le.env"
+                p3.write_bytes(b"\xff\xfe" + "SIS_SESSION_ID=u16le_sid\n".encode("utf-16-le"))
+                self.assertEqual(load_config(p3).session_id, "u16le_sid")
+
+                p4 = Path(tmp) / "utf16be.env"
+                p4.write_bytes(b"\xfe\xff" + "SIS_SESSION_ID=u16be_sid\n".encode("utf-16-be"))
+                self.assertEqual(load_config(p4).session_id, "u16be_sid")
+
+                p5 = Path(tmp) / "utf32le.env"
+                p5.write_bytes(b"\xff\xfe\x00\x00" + "SIS_SESSION_ID=u32le_sid\n".encode("utf-32-le"))
+                self.assertEqual(load_config(p5).session_id, "u32le_sid")
+
+                # 4. Windows-1252 (cp1252) em-dash 0x97 in comment
+                p6 = Path(tmp) / "cp1252.env"
+                p6.write_bytes(b"# COMSATS \x97 Portal\nSIS_SESSION_ID=cp1252_sid\n")
+                self.assertEqual(load_config(p6).session_id, "cp1252_sid")
+
+    def test_env_parser_export_inline_comments_and_quotes(self) -> None:
+        # export prefix variations and non-export keys starting with export/EXPORT
+        parsed_export = parse_env_text(
+            "export SIS_SESSION_ID=abc\n"
+            "EXPORT_FLAG=1\n"
+            "export_mode=2\n"
+        )
+        self.assertEqual(parsed_export["SIS_SESSION_ID"], "abc")
+        self.assertEqual(parsed_export["EXPORT_FLAG"], "1")
+        self.assertEqual(parsed_export["export_mode"], "2")
+        self.assertEqual(parse_env_text('export   SIS_SESSION_ID="abc"\n')["SIS_SESSION_ID"], "abc")
+        self.assertEqual(parse_env_text("export\tSIS_SESSION_ID='abc' # note\n")["SIS_SESSION_ID"], "abc")
+
+        # Unquoted inline # comments vs unquoted '#' without preceding whitespace
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text(
+                "SIS_SESSION_ID=abc123 # morning\n"
+                "KEEPALIVE_INTERVAL=60 # 1 min\n"
+                "TRACK_ANNOUNCEMENTS=true # on\n"
+                "WEBHOOK_URL=https://example.com/hook#frag\n"
+                "NTFY_TOKEN=tok#123 # real comment\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"SIS_SESSION_ID": "", "KEEPALIVE_INTERVAL": "", "TRACK_ANNOUNCEMENTS": ""},
+                clear=False,
+            ):
+                cfg = load_config(env_path)
+            self.assertEqual(cfg.session_id, "abc123")
+            self.assertEqual(cfg.keepalive_interval, 60)
+            self.assertTrue(cfg.track_announcements)
+            self.assertEqual(cfg.raw["WEBHOOK_URL"], "https://example.com/hook#frag")
+            self.assertEqual(cfg.raw["NTFY_TOKEN"], "tok#123")
+
+        self.assertEqual(parse_env_text("SIS_SESSION_ID=# comment\n")["SIS_SESSION_ID"], "")
+        self.assertEqual(parse_env_text("SIS_SESSION_ID= # comment\n")["SIS_SESSION_ID"], "")
+
+        # Quoted values with trailing # comments, preserved #, empty quotes, nested quotes, escapes
+        quoted_cases = [
+            ('K="abc" # c', "abc"),
+            ('K="abc"#c', "abc"),
+            ("K='abc' # c", "abc"),
+            ("K='abc'#c", "abc"),
+            ('K="abc # 123" # c', "abc # 123"),
+            ("K='abc # 123' # c", "abc # 123"),
+            ('K="" # empty', ""),
+            ("K='' # empty", ""),
+            ("""K="a'b'" """, "a'b'"),
+            ("""K='a"b"' """, 'a"b"'),
+            (r'K="a\"b\\c"', 'a"b\\c'),
+        ]
+        for line, expected in quoted_cases:
+            self.assertEqual(parse_env_text(line)["K"], expected, msg=f"Failed for {line!r}")
+
+        # Duplicate keys: last assignment wins, including blanking an earlier .env key
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text(
+                "SIS_SESSION_ID=first\nSIS_SESSION_ID=second\nNTFY_URL=https://ntfy.sh/t\nNTFY_URL=\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": "", "NTFY_URL": ""}, clear=False):
+                vals, _ = load_env_with_sources(env_path)
+            self.assertEqual(vals["SIS_SESSION_ID"], "second")
+            self.assertEqual(vals["NTFY_URL"], "")
+
+    def test_session_normalization_and_secret_free_diagnostics(self) -> None:
+        self.assertEqual(normalize_session_id("ASP.NET_SessionId=abc"), "abc")
+        self.assertEqual(normalize_session_id("asp.net_sessionid=abc; Path=/; HttpOnly"), "abc")
+        self.assertEqual(normalize_session_id("Cookie: foo=1; ASP.NET_SessionId=abc; bar=2"), "abc")
+        self.assertEqual(normalize_session_id("ASP.NET_SessionId="), "")
+        placeholder_parsed = parse_env_text('SIS_SESSION_ID="paste_your_ASP_NET_SessionId_here" # placeholder')
+        self.assertEqual(normalize_session_id(placeholder_parsed["SIS_SESSION_ID"]), "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Directory passed as ENV_FILE must not raise IsADirectoryError
+            dir_path = Path(tmp) / "env_dir"
+            dir_path.mkdir()
+            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False):
+                self.assertEqual(parse_env_file(dir_path), {})
+                with self.assertRaises(SystemExit) as dir_ctx:
+                    load_config(dir_path, require_session=True)
+            self.assertIn("directory", str(dir_ctx.exception))
+
+            # Missing SIS_SESSION_ID with typo'd key surfaces key name without leaking any values
+            typo_env = Path(tmp) / ".env"
+            typo_env.write_text(
+                "SIS_SESSIONID=super_secret_val\nNTFY_TOKEN=secret_token\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": "", "NTFY_TOKEN": ""}, clear=False):
+                with self.assertRaises(SystemExit) as typo_ctx:
+                    load_config(typo_env, require_session=True)
+            err_msg = str(typo_ctx.exception)
+            self.assertIn("SIS_SESSIONID", err_msg)
+            self.assertIn("NTFY_TOKEN", err_msg)
+            self.assertNotIn("super_secret_val", err_msg)
+            self.assertNotIn("secret_token", err_msg)
+
+    def test_daemon_and_probe_with_bom_export_and_inline_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            state_path = Path(tmp) / "data" / "state.json"
+            hb_path = Path(tmp) / "data" / "heartbeat.json"
+            env_path.write_bytes(
+                b"\xef\xbb\xbfexport SIS_SESSION_ID=\"expired_cookie\" # initial\n"
+                b"KEEPALIVE_INTERVAL=15 # sec\n"
+                b"FETCH_INTERVAL=30\n"
+                b"EXPIRED_POLL_INTERVAL=1\n"
+                b"SESSION_EXPIRED_TIMEOUT=20\n"
+            )
+
+            # Verify probe.load_env & probe.load_config handle BOM + export + quoted inline comment
+            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": "", "SIS_USER_AGENT": ""}, clear=False):
+                self.assertEqual(probe.load_env(env_path)["SIS_SESSION_ID"], "expired_cookie")
+                probe_sid, _ = probe.load_config(env_path)
+                self.assertEqual(probe_sid, "expired_cookie")
+
+            notifier = _RecordingNotifier()
+            resumed_event = threading.Event()
+            courses = [Course(course_id="100001", code="CSC101", name="Intro")]
+
+            class _FakeClient:
+                def __init__(self, session_id, **kwargs) -> None:
+                    self.session_id = session_id
+                    self.base_url = kwargs.get("base_url", "https://sis.comsats.edu.pk")
+                    self.user_agent = kwargs.get("user_agent", "")
+                    self.request_delay = 0.0
+                    self.cancel_event = None
+
+                def get_courses(self):
+                    if self.session_id == "expired_cookie":
+                        raise SessionExpiredError("Expired")
+                    if self.session_id == "fresh_cookie":
+                        resumed_event.set()
+                        return courses
+                    raise AssertionError(f"Unexpected session_id: {self.session_id!r}")
+
+                def select_course(self, cid, expected_course=None):
+                    return ""
+
+                def get_marks_summary(self, expected_course=None):
+                    from sis_client import MarkItem
+
+                    return [MarkItem("Quizzes:1", "Quizzes", "Q1", "9", "10", "")]
+
+                def get_learning_resources(self, expected_course=None):
+                    return []
+
+            def _updater() -> None:
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    if hb_path.exists() and "waiting_for_session" in hb_path.read_text(encoding="utf-8"):
+                        break
+                    time.sleep(0.05)
+                env_path.write_bytes(
+                    b"\xef\xbb\xbfexport SIS_SESSION_ID=\"fresh_cookie\" # updated morning\n"
+                    b"KEEPALIVE_INTERVAL=15 # sec\n"
+                    b"FETCH_INTERVAL=30\n"
+                    b"EXPIRED_POLL_INTERVAL=1\n"
+                    b"SESSION_EXPIRED_TIMEOUT=20\n"
+                )
+                self.assertTrue(resumed_event.wait(timeout=5.0))
+                time.sleep(0.2)
+                signal.raise_signal(signal.SIGTERM)
+
+            prev_int = signal.getsignal(signal.SIGINT)
+            prev_term = signal.getsignal(signal.SIGTERM)
+            t = threading.Thread(target=_updater, daemon=True)
+            t.start()
+            try:
+                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
+                    tracker, "SisClient", _FakeClient
+                ), mock.patch.object(tracker, "build_notifiers", return_value=[notifier]):
+                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+            finally:
+                signal.signal(signal.SIGINT, prev_int)
+                signal.signal(signal.SIGTERM, prev_term)
+                t.join(timeout=2.0)
+
+            self.assertEqual(rc, 0)
+            events = [n.event for n in notifier.notes]
+            self.assertIn("session_expired", events)
+            self.assertIn("baseline_saved", events)
+
+    def test_redirect_safety_blocks_cross_host_and_downgrade(self) -> None:
+        client = SisClient("secret_sid", request_delay=0.0)
+        auth_body = _auth_shell('<table class="sis-dash-table"></table>')
+
+        def _make_redir(url: str, location: str) -> urllib.error.HTTPError:
+            hdrs = email.message.Message()
+            hdrs["Location"] = location
+            return urllib.error.HTTPError(url, 302, "Found", hdrs, None)  # type: ignore[arg-type]
+
+        # 1. Cross-host redirect must fail without issuing a second request
+        cross_err = _make_redir("https://sis.comsats.edu.pk/Courses", "https://evil.example.com/steal")
+        try:
+            with mock.patch.object(client._opener, "open", side_effect=[cross_err]) as m_open:
+                with self.assertRaises(PortalHttpError):
+                    client.get_html("/Courses")
+                self.assertEqual(m_open.call_count, 1)
+        finally:
+            cross_err.close()
+
+        # 2. HTTPS -> HTTP downgrade redirect must fail without issuing a second request
+        down_err = _make_redir("https://sis.comsats.edu.pk/Courses", "http://sis.comsats.edu.pk/Courses/Index")
+        try:
+            with mock.patch.object(client._opener, "open", side_effect=[down_err]) as m_open:
+                with self.assertRaises(PortalHttpError):
+                    client.get_html("/Courses")
+                self.assertEqual(m_open.call_count, 1)
+        finally:
+            down_err.close()
+
+        # 3. Same-host HTTPS redirect is still allowed
+        same_err = _make_redir("https://sis.comsats.edu.pk/Courses", "/Courses/Index")
+        try:
+            with mock.patch.object(
+                client._opener,
+                "open",
+                side_effect=[same_err, _FakeHttpResponse(auth_body)],
+            ) as m_open:
+                self.assertEqual(client.get_html("/Courses"), auth_body)
+                self.assertEqual(m_open.call_count, 2)
+        finally:
+            same_err.close()
+
+        # 4. Cross-host login redirect still raises SessionExpiredError
+        login_err = _make_redir("https://sis.comsats.edu.pk/Courses", "https://sso.example.com/Login/Index")
+        try:
+            with mock.patch.object(client._opener, "open", side_effect=[login_err]):
+                with self.assertRaises(SessionExpiredError):
+                    client.get_html("/Courses")
+        finally:
+            login_err.close()
+
+        # 5. probe.fetch also stops without leaking cookies on cross-host or downgrade redirects
+        for target in ("https://evil.example.com/steal", "http://sis.comsats.edu.pk/Courses/Index"):
+            p_err = _make_redir("https://sis.comsats.edu.pk/Courses", target)
+            fake_opener = mock.Mock()
+            fake_opener.open.side_effect = [p_err]
+            try:
+                with mock.patch.object(probe.urllib.request, "build_opener", return_value=fake_opener):
+                    res = probe.fetch("/Courses", "secret_sid")
+                self.assertEqual(res.status, 302)
+                self.assertEqual(fake_opener.open.call_count, 1)
+            finally:
+                p_err.close()
+
+    def test_value_error_and_header_sanitization_safety(self) -> None:
+        # 1. Invalid base_url without scheme wraps ValueError in PortalHttpError
+        bad_client = SisClient("sid", base_url="sis.comsats.edu.pk", request_delay=0.0)
+        with self.assertRaises(PortalHttpError):
+            bad_client.get_html("/Courses")
+
+        # 2. Non-Latin-1 / CRLF in User-Agent is sanitized before Request construction
+        auth_body = _auth_shell('<table class="sis-dash-table"></table>')
+        seen_ua: list[str] = []
+        ua_client = SisClient(
+            "sid",
+            user_agent="Mozilla/5.0\r\nX-Bad: 1 — test",
+            request_delay=0.0,
+        )
+
+        def _capture_open(req, timeout=20):
+            seen_ua.append(req.headers.get("User-agent", ""))
+            return _FakeHttpResponse(auth_body)
+
+        with mock.patch.object(ua_client._opener, "open", side_effect=_capture_open):
+            ua_client.get_html("/Courses")
+        self.assertEqual(seen_ua, ["Mozilla/5.0X-Bad: 1  test"])
+
+        # 3. UnicodeEncodeError during open is wrapped as PortalHttpError
+        with mock.patch.object(
+            ua_client._opener,
+            "open",
+            side_effect=UnicodeEncodeError("latin-1", "bad", 0, 1, "ordinal not in range"),
+        ):
+            with self.assertRaises(PortalHttpError):
+                ua_client.get_html("/Courses")
+
+        # 4. run_daemon catches ValueError from get_courses cleanly without crashing
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            state_path = Path(tmp) / "data" / "state.json"
+            hb_path = Path(tmp) / "data" / "heartbeat.json"
+            env_path.write_text("SIS_SESSION_ID=valid\nKEEPALIVE_INTERVAL=15\n", encoding="utf-8")
+            errored_event = threading.Event()
+
+            class _ValueErrorClient:
+                def __init__(self, *args, **kwargs) -> None:
+                    self.cancel_event = None
+
+                def get_courses(self):
+                    errored_event.set()
+                    raise ValueError("unknown url type: bad")
+
+            def _stopper() -> None:
+                self.assertTrue(errored_event.wait(timeout=5.0))
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    if hb_path.exists() and "portal_error" in hb_path.read_text(encoding="utf-8"):
+                        break
+                    time.sleep(0.05)
+                signal.raise_signal(signal.SIGTERM)
+
+            prev_int = signal.getsignal(signal.SIGINT)
+            prev_term = signal.getsignal(signal.SIGTERM)
+            t = threading.Thread(target=_stopper, daemon=True)
+            t.start()
+            try:
+                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
+                    tracker, "SisClient", _ValueErrorClient
+                ), mock.patch.object(tracker, "build_notifiers", return_value=[_RecordingNotifier()]):
+                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+            finally:
+                signal.signal(signal.SIGINT, prev_int)
+                signal.signal(signal.SIGTERM, prev_term)
+                t.join(timeout=2.0)
+
+            self.assertEqual(rc, 0)
+            hb = json.loads(hb_path.read_text(encoding="utf-8"))
+            self.assertEqual(hb["status"], "portal_error")
+            self.assertIn("unknown url type", hb["detail"])
+
+    def test_sigterm_cancels_inflight_scan_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            state_path = Path(tmp) / "data" / "state.json"
+            hb_path = Path(tmp) / "data" / "heartbeat.json"
+            env_path.write_text(
+                "SIS_SESSION_ID=valid\nKEEPALIVE_INTERVAL=15\nCYCLE_TIMEOUT=60\n",
+                encoding="utf-8",
+            )
+            courses = [Course(course_id="100001", code="CSC101", name="Course 1")]
+            in_scan = threading.Event()
+            observed_cancel: list[threading.Event] = []
+
+            class _SlowScanClient:
+                def __init__(self, *args, **kwargs) -> None:
+                    self.cancel_event: Optional[threading.Event] = kwargs.get("cancel_event")
+                    self.last_semester = "Fall 2026"
+
+                def get_courses(self):
+                    return courses
+
+                def select_course(self, cid, expected_course=None):
+                    if self.cancel_event is not None:
+                        observed_cancel.append(self.cancel_event)
+                    in_scan.set()
+                    if self.cancel_event is not None:
+                        self.cancel_event.wait(10.0)
+                        if self.cancel_event.is_set():
+                            raise PortalHttpError("Request cancelled.")
+                    return ""
+
+                def get_marks_summary(self, expected_course=None):
+                    return []
+
+                def get_learning_resources(self, expected_course=None):
+                    return []
+
+            sig_t0: list[float] = []
+
+            def _stopper() -> None:
+                self.assertTrue(in_scan.wait(timeout=5.0))
+                sig_t0.append(time.monotonic())
+                signal.raise_signal(signal.SIGTERM)
+
+            prev_int = signal.getsignal(signal.SIGINT)
+            prev_term = signal.getsignal(signal.SIGTERM)
+            t = threading.Thread(target=_stopper, daemon=True)
+            t.start()
+            try:
+                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
+                    tracker, "SisClient", _SlowScanClient
+                ), mock.patch.object(tracker, "build_notifiers", return_value=[_RecordingNotifier()]):
+                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+            finally:
+                signal.signal(signal.SIGINT, prev_int)
+                signal.signal(signal.SIGTERM, prev_term)
+                t.join(timeout=2.0)
+
+            elapsed_after_sig = time.monotonic() - sig_t0[0]
+            self.assertEqual(rc, 0)
+            self.assertLess(elapsed_after_sig, 2.0)
+            self.assertTrue(observed_cancel and observed_cancel[0].is_set())
+            self.assertFalse(state_path.exists())
+
+    def test_backup_chain_recovery_and_corrupt_state_preservation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "data" / "state.json"
+            s1 = _make_state(marks_count=1, res_count=1, course_count=1)
+            s2 = _make_state(marks_count=2, res_count=1, course_count=1)
+            s3 = _make_state(marks_count=3, res_count=1, course_count=1)
+            s4 = _make_state(marks_count=4, res_count=1, course_count=1)
+
+            save_state(state_path, s1, max_backups=3)
+            save_state(state_path, s2, max_backups=3)
+            save_state(state_path, s3, max_backups=3)
+            # Now state.json=s3, .bak=s2, .bak.2=s1
+
+            # Corrupt both state.json and .bak -> load_state falls back to .bak.2
+            state_path.write_text("{bad primary", encoding="utf-8")
+            state_path.with_name("state.json.bak").write_text("{bad bak", encoding="utf-8")
+            self.assertEqual(load_state(state_path), s1)
+
+            # Restore .bak to s2 while state.json stays corrupt -> save_state(s4) preserves .bak=s2
+            save_state(state_path.with_name("state.json.bak"), s2, max_backups=0)
+            save_state(state_path, s4, max_backups=3)
+            self.assertEqual(load_state(state_path), s4)
+            self.assertEqual(
+                json.loads(state_path.with_name("state.json.bak").read_text(encoding="utf-8")),
+                s2,
+            )
+
+    def test_semester_tracking_rollover_retake_legacy_and_reset_state(self) -> None:
+        from sis_client import MarkItem
+
+        self.assertEqual(
+            parse_semester("<div><p>Current session: Fall 2026  . Open a course.</p></div>"),
+            "Fall 2026",
+        )
+        self.assertEqual(parse_semester("<div><span>Spring 2027</span></div>"), "Spring 2027")
+        snap_courses = ROOT / "snapshots" / "courses.html"
+        if snap_courses.exists():
+            self.assertTrue(
+                bool(parse_semester(snap_courses.read_text(encoding="utf-8", errors="replace")))
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "data" / "state.json"
+            fall_state = _make_state(marks_count=6, res_count=2, course_count=2)
+            fall_state["semester"] = "Fall 2026"
+            save_state(state_path, fall_state)
+
+            class _RolloverClient:
+                def __init__(self, semester: str, marks: list[MarkItem]) -> None:
+                    self.last_semester = semester
+                    self._marks = marks
+
+                def select_course(self, cid, expected_course=None):
+                    return ""
+
+                def get_marks_summary(self, expected_course=None):
+                    return list(self._marks)
+
+                def get_learning_resources(self, expected_course=None):
+                    return []
+
+            # 1. Same semester (Fall 2026 -> Fall 2026) with 6 -> 0 marks STILL blocked as anomaly
+            notifier = _RecordingNotifier()
+            c_same = [
+                Course(course_id="100001", code="CSC101", name="Course 1"),
+                Course(course_id="100002", code="CSC102", name="Course 2"),
+            ]
+            res_anom = run_cycle(
+                _RolloverClient("Fall 2026", []),  # type: ignore[arg-type]
+                c_same,
+                state_path=state_path,
+                base_url="https://sis.comsats.edu.pk",
+                track_announcements=False,
+                notifiers=[notifier],
+            )
+            self.assertFalse(res_anom.saved)
+            self.assertIsNotNone(res_anom.anomaly)
+
+            # 2. New semester (Fall 2026 -> Spring 2027) WITH retaken course 100001 and 0 marks rolls over
+            notifier.notes.clear()
+            c_spring = [
+                Course(course_id="100001", code="CSC101", name="Course 1 (Retake)"),
+                Course(course_id="200003", code="CSC203", name="Course 3"),
+            ]
+            res_roll = run_cycle(
+                _RolloverClient("Spring 2027", []),  # type: ignore[arg-type]
+                c_spring,
+                state_path=state_path,
+                base_url="https://sis.comsats.edu.pk",
+                track_announcements=False,
+                notifiers=[notifier],
+            )
+            self.assertTrue(res_roll.saved)
+            self.assertIsNone(res_roll.anomaly)
+            events = [n.event for n in notifier.notes]
+            self.assertIn("semester_rollover", events)
+            self.assertNotIn("course_removed", events)
+            saved_spring = load_state(state_path)
+            assert saved_spring is not None
+            self.assertEqual(saved_spring.get("semester"), "Spring 2027")
+            self.assertEqual(
+                json.loads(state_path.with_name("state.json.bak").read_text(encoding="utf-8")).get("semester"),
+                "Fall 2026",
+            )
+
+            # 3. Legacy state without "semester": same courses upgrade cleanly without rollover;
+            #    disjoint courses roll over cleanly even with 0 marks
+            legacy_state = _make_state(marks_count=6, res_count=1, course_count=1)
+            self.assertNotIn("semester", legacy_state)
+            save_state(state_path, legacy_state)
+            legacy_same_marks = [
+                MarkItem(f"Quizzes:0_{i}", "Quizzes", f"Quiz{i}", "8.0", "10.0", "01 Nov")
+                for i in range(6)
+            ]
+            res_legacy_same = run_cycle(
+                _RolloverClient("Fall 2026", legacy_same_marks),  # type: ignore[arg-type]
+                [Course(course_id="100001", code="CSC101", name="Course 1")],
+                state_path=state_path,
+                base_url="https://sis.comsats.edu.pk",
+                track_announcements=False,
+                notifiers=[_RecordingNotifier()],
+            )
+            self.assertTrue(res_legacy_same.saved)
+            self.assertEqual((load_state(state_path) or {}).get("semester"), "Fall 2026")
+            self.assertIsNone(detect_semester_rollover(legacy_state, load_state(state_path) or {}))
+
+            save_state(state_path, legacy_state)
+            disjoint_notifier = _RecordingNotifier()
+            res_legacy_disjoint = run_cycle(
+                _RolloverClient("", []),  # type: ignore[arg-type]
+                [Course(course_id="999001", code="CSC499", name="New Term Course")],
+                state_path=state_path,
+                base_url="https://sis.comsats.edu.pk",
+                track_announcements=False,
+                notifiers=[disjoint_notifier],
+            )
+            self.assertTrue(res_legacy_disjoint.saved)
+            self.assertEqual([n.event for n in disjoint_notifier.notes], ["semester_rollover"])
+
+            # 4. --once --reset-state overrides same-semester >50% drop, plus SIS_SEMESTER override;
+            #    --reset-state without --once returns 1
+            env_path = Path(tmp) / ".env"
+            env_path.write_text("SIS_SESSION_ID=valid\nSIS_SEMESTER=Summer 2027\n", encoding="utf-8")
+            big_state = _make_state(marks_count=6, res_count=2, course_count=1)
+            big_state["semester"] = "Summer 2027"
+            save_state(state_path, big_state)
+
+            class _ResetCliClient:
+                def __init__(self, *args, **kwargs) -> None:
+                    self.cancel_event = None
+                    self.last_semester = ""
+
+                def get_courses(self):
+                    return [Course(course_id="100001", code="CSC101", name="Course 1")]
+
+                def select_course(self, cid, expected_course=None):
+                    return ""
+
+                def get_marks_summary(self, expected_course=None):
+                    return []
+
+                def get_learning_resources(self, expected_course=None):
+                    return []
+
+            reset_notifier = _RecordingNotifier()
+            with mock.patch.dict(
+                os.environ,
+                {"ENV_FILE": str(env_path), "STATE_FILE": str(state_path), "SIS_SESSION_ID": ""},
+                clear=False,
+            ), mock.patch.object(tracker, "SisClient", _ResetCliClient), mock.patch.object(
+                tracker, "build_notifiers", return_value=[reset_notifier]
+            ):
+                with mock.patch.object(sys, "argv", ["tracker.py", "--reset-state"]):
+                    self.assertEqual(tracker.main(), 1)
+                with mock.patch.object(sys, "argv", ["tracker.py", "--once", "--reset-state"]):
+                    rc_reset = tracker.main()
+
+            self.assertEqual(rc_reset, 0)
+            self.assertEqual([n.event for n in reset_notifier.notes], ["baseline_saved"])
+            reset_saved = load_state(state_path)
+            assert reset_saved is not None
+            self.assertEqual(reset_saved.get("semester"), "Summer 2027")
+            self.assertEqual(len(reset_saved["courses"]["100001"]["marks"]), 0)
+
+    def test_session_alerted_cleared_on_get_courses_even_if_scan_hits_anomaly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            state_path = Path(tmp) / "data" / "state.json"
+            hb_path = Path(tmp) / "data" / "heartbeat.json"
+            env_content = (
+                "SIS_SESSION_ID=reused_cookie\n"
+                "KEEPALIVE_INTERVAL=1\n"
+                "FETCH_INTERVAL=30\n"
+                "EXPIRED_POLL_INTERVAL=1\n"
+                "SESSION_EXPIRED_TIMEOUT=20\n"
+            )
+            env_path.write_text(env_content, encoding="utf-8")
+            save_state(state_path, _make_state(marks_count=6, res_count=1, course_count=1))
+
+            notifier = _RecordingNotifier()
+            courses = [Course(course_id="100001", code="CSC101", name="Course 1")]
+            attempts = 0
+            attempt_lock = threading.Lock()
+            second_expire_seen = threading.Event()
+
+            class _FlakyReusedClient:
+                def __init__(self, session_id, **kwargs) -> None:
+                    self._session_id = session_id
+                    self.cancel_event = None
+                    self.last_marks_html = ""
+                    self.last_set_cookie_names: list[str] = []
+                    self.last_semester = ""
+
+                @property
+                def session_id(self) -> str:
+                    return self._session_id
+
+                @session_id.setter
+                def session_id(self, value: str) -> None:
+                    self._session_id = value
+
+                def get_courses(self):
+                    nonlocal attempts
+                    with attempt_lock:
+                        attempts += 1
+                        cur = attempts
+                    if cur == 1:
+                        raise SessionExpiredError("Expired #1")
+                    if cur == 2:
+                        return courses
+                    second_expire_seen.set()
+                    raise SessionExpiredError("Expired #2")
+
+                def select_course(self, cid, expected_course=None):
+                    return ""
+
+                def get_marks_summary(self, expected_course=None):
+                    return []
+
+                def get_learning_resources(self, expected_course=None):
+                    return []
+
+            def _driver() -> None:
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    if hb_path.exists() and "waiting_for_session" in hb_path.read_text(encoding="utf-8"):
+                        break
+                    time.sleep(0.05)
+                # Touch .env with same cookie -> attempt #2 passes get_courses(), hits anomaly
+                env_path.write_text(env_content + "# refreshed\n", encoding="utf-8")
+                self.assertTrue(second_expire_seen.wait(timeout=5.0))
+                time.sleep(0.2)
+                signal.raise_signal(signal.SIGTERM)
+
+            orig_load_config = tracker.load_config
+
+            def _fast_load_config(ep: Path, require_session: bool = True) -> tracker.TrackerConfig:
+                cfg_obj = orig_load_config(ep, require_session=require_session)
+                cfg_obj.keepalive_interval = 1
+                return cfg_obj
+
+            prev_int = signal.getsignal(signal.SIGINT)
+            prev_term = signal.getsignal(signal.SIGTERM)
+            t = threading.Thread(target=_driver, daemon=True)
+            t.start()
+            try:
+                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
+                    tracker, "SisClient", _FlakyReusedClient
+                ), mock.patch.object(
+                    tracker, "load_config", side_effect=_fast_load_config
+                ), mock.patch.object(tracker, "build_notifiers", return_value=[notifier]):
+                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+            finally:
+                signal.signal(signal.SIGINT, prev_int)
+                signal.signal(signal.SIGTERM, prev_term)
+                t.join(timeout=2.0)
+
+            self.assertEqual(rc, 0)
+            events = [n.event for n in notifier.notes]
+            self.assertEqual(events.count("session_expired"), 2)
+            self.assertIn("scan_anomaly", events)
 
 
 if __name__ == "__main__":

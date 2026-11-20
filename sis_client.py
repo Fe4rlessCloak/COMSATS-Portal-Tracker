@@ -715,6 +715,44 @@ def parse_active_course(html: str) -> Optional[ActiveCourseInfo]:
     return None
 
 
+_BLOCK_TAG_RE = re.compile(
+    r"</?(?:p|div|h[1-6]|li|tr|td|th|br|header|section|article)\b[^>]*>",
+    re.IGNORECASE,
+)
+_CURRENT_SESSION_RE = re.compile(
+    r"current\s+session\s*:\s*([^\n\r.<]{2,60})",
+    re.IGNORECASE,
+)
+_TERM_YEAR_RE = re.compile(
+    r"\b((?:Fall|Spring|Summer)\s+20\d{2})\b",
+    re.IGNORECASE,
+)
+
+
+def parse_semester(html: str) -> str:
+    """Extract the active academic semester label (e.g. 'Fall 2026') from /Courses HTML."""
+    if not html:
+        return ""
+    text = _strip_script_and_style(html)
+    text = _BLOCK_TAG_RE.sub("\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+
+    m = _CURRENT_SESSION_RE.search(text)
+    if m:
+        candidate = m.group(1).strip(" .,:;-|")
+        if candidate:
+            return candidate
+
+    m_term = _TERM_YEAR_RE.search(text)
+    if m_term:
+        parts = m_term.group(1).split()
+        if len(parts) == 2:
+            return f"{parts[0].capitalize()} {parts[1]}"
+    return ""
+
+
 def _norm_course_code(val: str) -> str:
     return re.sub(r"\s+", "", val).upper()
 
@@ -988,6 +1026,34 @@ def _stage_set_cookies(
             seen_names.append(name)
 
 
+def _is_safe_redirect_target(origin_url: str, target_url: str) -> bool:
+    """Return True if target_url keeps the same host/port and does not downgrade HTTPS to HTTP."""
+    try:
+        orig = urllib.parse.urlparse(origin_url.strip())
+        dest = urllib.parse.urlparse(target_url.strip())
+        orig_scheme = orig.scheme.lower()
+        dest_scheme = dest.scheme.lower()
+        if dest_scheme not in ("http", "https"):
+            return False
+        if orig_scheme == "https" and dest_scheme != "https":
+            return False
+        if not orig.hostname or not dest.hostname:
+            return False
+        if orig.hostname.lower() != dest.hostname.lower():
+            return False
+        orig_port = orig.port or (443 if orig_scheme == "https" else 80)
+        dest_port = dest.port or (443 if dest_scheme == "https" else 80)
+        return orig_port == dest_port
+    except ValueError:
+        return False
+
+
+def _sanitize_header_value(val: str) -> str:
+    """Strip CR/LF and non-Latin-1 characters so outbound headers cannot raise ValueError."""
+    cleaned = val.replace("\r", "").replace("\n", "")
+    return cleaned.encode("latin-1", errors="ignore").decode("latin-1").strip()
+
+
 class SisClient:
     """HTTP client for authenticated COMSATS Student Portal requests."""
 
@@ -1014,6 +1080,7 @@ class SisClient:
         self.last_resources_html: str = ""
         self.last_set_cookie_names: List[str] = []
         self.last_response_info: Dict[str, Any] = {}
+        self.last_semester: str = ""
 
     @property
     def session_id(self) -> str:
@@ -1090,15 +1157,15 @@ class SisClient:
         for _ in range(4):
             self._throttle()
             req_headers = {
-                "User-Agent": self.user_agent,
+                "User-Agent": _sanitize_header_value(self.user_agent) or DEFAULT_USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": f"{self.base_url}/",
+                "Referer": _sanitize_header_value(f"{self.base_url}/") or f"{DEFAULT_BASE_URL}/",
             }
             cookie_hdr = self._build_cookie_header(pending)
             if cookie_hdr:
                 req_headers["Cookie"] = cookie_hdr
-            req = urllib.request.Request(url, headers=req_headers, method="GET")
             try:
+                req = urllib.request.Request(url, headers=req_headers, method="GET")
                 with self._opener.open(req, timeout=self.timeout) as resp:
                     self._last_request_ts = time.monotonic()
                     final_url = resp.geturl() or url
@@ -1145,17 +1212,28 @@ class SisClient:
                         }
                         raise SessionExpiredError(f"Redirected to login ({loc}).") from e
                     if loc:
+                        if not _is_safe_redirect_target(self.base_url, next_url):
+                            raise PortalHttpError(
+                                f"Refusing unsafe redirect from {url} to {next_url}"
+                            ) from e
                         _stage_set_cookies(e.headers, pending, seen_names)
                         url = next_url
                         continue
                 raise PortalHttpError(f"HTTP {e.code} fetching {url}") from e
-            except (urllib.error.URLError, TimeoutError, http.client.HTTPException, OSError) as e:
-                raise PortalHttpError(f"Network error fetching {url}: {e}") from e
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                http.client.HTTPException,
+                OSError,
+                ValueError,
+            ) as e:
+                raise PortalHttpError(f"HTTP/network error fetching {url}: {e}") from e
 
         raise PortalHttpError(f"Too many redirects fetching {path}")
 
     def get_courses(self) -> List[Course]:
         html = self.get_html("/Courses")
+        self.last_semester = parse_semester(html)
         if not has_courses_page_marker(html):
             raise PortalParseError("Dashboard response missing expected courses table markup.")
         courses = parse_courses(html)

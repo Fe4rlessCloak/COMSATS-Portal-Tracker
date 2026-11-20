@@ -26,6 +26,9 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from sis_client import _is_safe_redirect_target
+from tracker import load_env_dict, normalize_session_id, parse_env_file
+
 BASE_URL = "https://sis.comsats.edu.pk"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -189,25 +192,15 @@ class StructureExtractor(HTMLParser):
 
 def load_env(env_path: Path) -> Dict[str, str]:
     """Load key=value pairs from .env if present."""
-    values: Dict[str, str] = {}
-    if env_path.exists():
-        for raw in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            values[k.strip()] = v.strip().strip('"').strip("'")
-    return values
+    return parse_env_file(env_path)
 
 
 def load_config(env_path: Path) -> Tuple[str, str]:
     """Load SIS_SESSION_ID and optional SIS_USER_AGENT from env or .env."""
-    env_file = load_env(env_path)
-    session_id = (os.environ.get("SIS_SESSION_ID") or env_file.get("SIS_SESSION_ID") or "").strip()
-    if session_id.startswith("ASP.NET_SessionId="):
-        session_id = session_id.split("=", 1)[1].strip()
+    values = load_env_dict(env_path)
+    session_id = normalize_session_id(values.get("SIS_SESSION_ID", ""))
 
-    if not session_id or session_id == "paste_your_ASP_NET_SessionId_here":
+    if not session_id:
         raise SystemExit(
             "Missing SIS_SESSION_ID.\n"
             f"1. Copy {env_path.parent / '.env.example'} to {env_path}\n"
@@ -215,9 +208,7 @@ def load_config(env_path: Path) -> Tuple[str, str]:
             "3. Re-run this script."
         )
 
-    user_agent = (
-        os.environ.get("SIS_USER_AGENT") or env_file.get("SIS_USER_AGENT") or ""
-    ).strip() or USER_AGENT
+    user_agent = values.get("SIS_USER_AGENT", "").strip() or USER_AGENT
     return session_id, user_agent
 
 
@@ -249,8 +240,10 @@ def fetch(path: str, session_id: str, user_agent: str = USER_AGENT) -> HttpResul
         except urllib.error.HTTPError as e:
             loc = e.headers.get("Location", "") if e.headers else ""
             if e.code in (301, 302, 303, 307, 308) and loc and "login" not in loc.lower():
-                url = urllib.parse.urljoin(url, loc)
-                continue
+                next_url = urllib.parse.urljoin(url, loc)
+                if _is_safe_redirect_target(url, next_url):
+                    url = next_url
+                    continue
             raw = e.read().decode("utf-8", errors="replace") if e.fp else ""
             return HttpResult(
                 url=url,
