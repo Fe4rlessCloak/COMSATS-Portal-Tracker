@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import contextlib
-import email.message
 import io
 import json
 import os
@@ -14,7 +13,6 @@ import tempfile
 import threading
 import time
 import unittest
-import urllib.error
 from pathlib import Path
 from typing import Optional
 from unittest import mock
@@ -30,9 +28,7 @@ from sis_client import (  # noqa: E402
     Course,
     CourseMismatchError,
     PortalHttpError,
-    PortalParseError,
     SessionExpiredError,
-    SisClient,
     detect_login_page,
     extract_diagnostic_text,
     has_authenticated_shell,
@@ -283,30 +279,37 @@ class _RecordingNotifier(BaseNotifier):
         self.notes.append(note)
 
 
-class _FakeHttpResponse:
-    def __init__(
-        self,
-        body: str,
-        url: str = "https://sis.comsats.edu.pk/Courses",
-        headers=None,
-        status: int = 200,
-    ) -> None:
-        self._body = body.encode("utf-8")
-        self._url = url
-        self.headers = headers
-        self.status = status
+class _ReconfigurableClient:
+    """Explicit-reconfiguration shim shared by ad-hoc daemon test clients.
 
-    def read(self) -> bytes:
-        return self._body
+    ``run_daemon`` hot-reloads through ``client.reconfigure(...)`` instead of assigning
+    fields, so fakes need the same method.
+    """
 
-    def geturl(self) -> str:
-        return self._url
+    reconfig_calls: list
 
-    def __enter__(self) -> "_FakeHttpResponse":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        return False
+    def reconfigure(self, session_id=None, base_url=None, user_agent=None, request_delay=None, reset_cookies=False):
+        calls = getattr(self, "reconfig_calls", None)
+        if calls is None:
+            calls = []
+            self.reconfig_calls = calls
+        calls.append(
+            {
+                "session_id": session_id,
+                "base_url": base_url,
+                "user_agent": user_agent,
+                "request_delay": request_delay,
+                "reset_cookies": reset_cookies,
+            }
+        )
+        if session_id is not None:
+            self.session_id = session_id
+        if base_url is not None:
+            self.base_url = base_url
+        if user_agent is not None:
+            self.user_agent = user_agent
+        if request_delay is not None:
+            self.request_delay = max(0.0, request_delay)
 
 
 def _make_mark(key: str, title: str, obtained: str = "8.0") -> dict:
@@ -544,7 +547,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             resumed_event = threading.Event()
             courses = [Course(course_id="100001", code="CSC101", name="Intro")]
 
-            class _FakeClient:
+            class _FakeClient(_ReconfigurableClient):
                 def __init__(self, session_id, **kwargs) -> None:
                     self.session_id = session_id
                     self.base_url = kwargs.get("base_url", "https://sis.comsats.edu.pk")
@@ -677,42 +680,8 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
         self.assertIsNotNone(detect_login_page("<html><body><div>500 Error</div></body></html>"))
         self.assertIsNone(detect_login_page(_auth_shell('<table class="sis-dash-table"></table>')))
 
-        # 2. HTTP 302 redirect to /Login and 200 alternate login via SisClient.get_html
-        client = SisClient("abc", request_delay=0.0)
-        redirect_err = urllib.error.HTTPError(
-            "https://sis.comsats.edu.pk/Courses",
-            302,
-            "Found",
-            {"Location": "/Login/Index"},  # type: ignore[arg-type]
-            None,
-        )
-        try:
-            with mock.patch.object(client._opener, "open", side_effect=redirect_err):
-                with self.assertRaises(SessionExpiredError):
-                    client.get_html("/Courses")
-        finally:
-            redirect_err.close()
-
-        with mock.patch.object(
-            client._opener,
-            "open",
-            return_value=_FakeHttpResponse(
-                '<html><body class="sis-login-page"><form action="/Login"><button>Go</button></form></body></html>'
-            ),
-        ):
-            with self.assertRaises(SessionExpiredError):
-                client.get_html("/Courses")
-
-        # Missing page markup on authenticated shell raises PortalParseError
-        with mock.patch.object(
-            client._opener,
-            "open",
-            return_value=_FakeHttpResponse(_auth_shell("<div>Empty error shell</div>")),
-        ):
-            with self.assertRaises(PortalParseError):
-                client.get_marks_summary()
-            with self.assertRaises(PortalParseError):
-                client.get_learning_resources()
+        # 2. SisClient login detection through redirects/pages is covered in tests/test_portal.py
+        #    (stub HTTP transport adapter); only the pure HTML/URL detectors live here.
 
         # Real HTML snapshots (if present locally) must pass authenticated shell & not false-positive
         snap_dir = ROOT / "snapshots"
@@ -908,20 +877,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
         with self.assertRaises(CourseMismatchError):
             verify_active_course(html_csc325, expected_336)
 
-        # Stuck on CSC336 while scanning CSC325 via SisClient raises CourseMismatchError
-        client = SisClient("valid", request_delay=0.0)
-        stuck_html = _auth_shell(
-            '<div class="sis-lr"><span class="sis-lr-count">0 resources</span></div>',
-            course_code="CSC336",
-            course_name="Web Technologies",
-        )
-        with mock.patch.object(
-            client._opener, "open", return_value=_FakeHttpResponse(stuck_html)
-        ):
-            with self.assertRaises(CourseMismatchError):
-                client.select_course("182153", expected_course=expected_325)
-            with self.assertRaises(CourseMismatchError):
-                client.get_learning_resources(expected_course=expected_325)
+        # Stuck on CSC336 while scanning CSC325 is covered in tests/test_portal.py (stub transport).
 
     def test_bug9_once_handles_non_session_errors_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1171,140 +1127,6 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             assert saved_after is not None
             self.assertEqual(len(saved_after["courses"]["100001"]["marks"]), 7)
 
-    def test_sis_client_cookie_jar_and_set_cookie_rotation(self) -> None:
-        client = SisClient("init_sid", request_delay=0.0)
-        seen_cookies: list[str] = []
-
-        def _msg(*cookies: str) -> email.message.Message:
-            m = email.message.Message()
-            for c in cookies:
-                m.add_header("Set-Cookie", c)
-            return m
-
-        auth_body = _auth_shell('<table class="sis-dash-table"></table>')
-
-        # 1. Authenticated 200 setting ARRAffinity persists on next request
-        def _open_step1(req, timeout=20):
-            seen_cookies.append(req.headers.get("Cookie", ""))
-            if len(seen_cookies) == 1:
-                return _FakeHttpResponse(
-                    auth_body,
-                    headers=_msg("ARRAffinity=node1; Path=/; HttpOnly"),
-                )
-            return _FakeHttpResponse(auth_body)
-
-        with mock.patch.object(client._opener, "open", side_effect=_open_step1):
-            client.get_html("/Courses")
-            client.get_html("/Courses")
-
-        self.assertEqual(seen_cookies[0], "ASP.NET_SessionId=init_sid")
-        self.assertIn("ASP.NET_SessionId=init_sid", seen_cookies[1])
-        self.assertIn("ARRAffinity=node1", seen_cookies[1])
-        self.assertEqual(client.session_id, "init_sid")
-
-        # 2. Non-login 302 redirect sets cookie for hop 2 and commits after hop 2 passes login detection
-        seen_cookies.clear()
-        redir_headers = _msg("PortalAffinity=edge2; Path=/")
-        redir_headers["Location"] = "/Courses/Index"
-        redir_err = urllib.error.HTTPError(
-            "https://sis.comsats.edu.pk/Courses",
-            302,
-            "Found",
-            redir_headers,  # type: ignore[arg-type]
-            None,
-        )
-
-        call_idx = 0
-
-        def _open_step2(req, timeout=20):
-            nonlocal call_idx
-            call_idx += 1
-            seen_cookies.append(req.headers.get("Cookie", ""))
-            if call_idx == 1:
-                raise redir_err
-            return _FakeHttpResponse(auth_body)
-
-        try:
-            with mock.patch.object(client._opener, "open", side_effect=_open_step2):
-                client.get_html("/Courses")
-                client.get_html("/Courses")
-        finally:
-            redir_err.close()
-
-        self.assertIn("PortalAffinity=edge2", seen_cookies[1])
-        self.assertIn("PortalAffinity=edge2", seen_cookies[2])
-        self.assertEqual(client.last_set_cookie_names, [])
-
-        # 3. Authenticated 200 rotating ASP.NET_SessionId updates client.session_id and subsequent requests
-        seen_cookies.clear()
-
-        def _open_step3(req, timeout=20):
-            seen_cookies.append(req.headers.get("Cookie", ""))
-            if len(seen_cookies) == 1:
-                return _FakeHttpResponse(
-                    auth_body,
-                    headers=_msg(
-                        "ASP.NET_SessionId=rotated_sid; Path=/; HttpOnly",
-                        "PortalAffinity=; Expires=Thu, 01-Jan-1970 00:00:00 GMT",
-                    ),
-                )
-            return _FakeHttpResponse(auth_body)
-
-        with mock.patch.object(client._opener, "open", side_effect=_open_step3):
-            client.get_html("/Courses")
-            client.get_html("/Courses")
-
-        self.assertEqual(client.session_id, "rotated_sid")
-        self.assertIn("ASP.NET_SessionId=rotated_sid", seen_cookies[1])
-        self.assertIn("ARRAffinity=node1", seen_cookies[1])
-        self.assertNotIn("PortalAffinity", seen_cookies[1])
-
-        # 4. Login 302 or 200 login page with Set-Cookie must NOT mutate cookie jar or session_id
-        login_redir_hdr = _msg("ASP.NET_SessionId=evil_redir; Path=/")
-        login_redir_hdr["Location"] = "/Login/Index"
-        login_redir_err = urllib.error.HTTPError(
-            "https://sis.comsats.edu.pk/Courses",
-            302,
-            "Found",
-            login_redir_hdr,  # type: ignore[arg-type]
-            None,
-        )
-        try:
-            with mock.patch.object(client._opener, "open", side_effect=login_redir_err):
-                with self.assertRaises(SessionExpiredError):
-                    client.get_html("/Courses")
-        finally:
-            login_redir_err.close()
-
-        self.assertEqual(client.session_id, "rotated_sid")
-
-        with mock.patch.object(
-            client._opener,
-            "open",
-            return_value=_FakeHttpResponse(
-                '<html><body class="sis-login-page"><form action="/Login"></form></body></html>',
-                headers=_msg("ASP.NET_SessionId=evil_200; Path=/"),
-            ),
-        ):
-            with self.assertRaises(SessionExpiredError):
-                client.get_html("/Courses")
-
-        self.assertEqual(client.session_id, "rotated_sid")
-
-        # 5. Manual session_id assignment resets old auxiliary cookies
-        client.session_id = "brand_new"
-        seen_cookies.clear()
-        with mock.patch.object(
-            client._opener,
-            "open",
-            side_effect=lambda req, timeout=20: (
-                seen_cookies.append(req.headers.get("Cookie", "")),
-                _FakeHttpResponse(auth_body),
-            )[1],
-        ):
-            client.get_html("/Courses")
-        self.assertEqual(seen_cookies[0], "ASP.NET_SessionId=brand_new")
-
     def test_daemon_heartbeat_keeps_anomaly_across_keepalive_and_same_cookie_env_wakeup(self) -> None:
         # Part A: Heartbeat keeps status="anomaly" across keep-alive ticks
         with tempfile.TemporaryDirectory() as tmp:
@@ -1415,7 +1237,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             attempts = 0
             retested_while_expired = threading.Event()
 
-            class _SameCookieClient:
+            class _SameCookieClient(_ReconfigurableClient):
                 def __init__(self, session_id, **kwargs) -> None:
                     self._session_id = ""
                     self.session_id = session_id
@@ -1530,7 +1352,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             resumed_event = threading.Event()
             courses = [Course(course_id="100001", code="CSC101", name="Intro")]
 
-            class _FakeClient:
+            class _FakeClient(_ReconfigurableClient):
                 def __init__(self, session_id, **kwargs) -> None:
                     self.session_id = session_id
                     self.base_url = kwargs.get("base_url", "https://sis.comsats.edu.pk")
@@ -1595,103 +1417,9 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             self.assertIn("session_expired", events)
             self.assertIn("baseline_saved", events)
 
-    def test_redirect_safety_blocks_cross_host_and_downgrade(self) -> None:
-        client = SisClient("secret_sid", request_delay=0.0)
-        auth_body = _auth_shell('<table class="sis-dash-table"></table>')
-
-        def _make_redir(url: str, location: str) -> urllib.error.HTTPError:
-            hdrs = email.message.Message()
-            hdrs["Location"] = location
-            return urllib.error.HTTPError(url, 302, "Found", hdrs, None)  # type: ignore[arg-type]
-
-        # 1. Cross-host redirect must fail without issuing a second request
-        cross_err = _make_redir("https://sis.comsats.edu.pk/Courses", "https://evil.example.com/steal")
-        try:
-            with mock.patch.object(client._opener, "open", side_effect=[cross_err]) as m_open:
-                with self.assertRaises(PortalHttpError):
-                    client.get_html("/Courses")
-                self.assertEqual(m_open.call_count, 1)
-        finally:
-            cross_err.close()
-
-        # 2. HTTPS -> HTTP downgrade redirect must fail without issuing a second request
-        down_err = _make_redir("https://sis.comsats.edu.pk/Courses", "http://sis.comsats.edu.pk/Courses/Index")
-        try:
-            with mock.patch.object(client._opener, "open", side_effect=[down_err]) as m_open:
-                with self.assertRaises(PortalHttpError):
-                    client.get_html("/Courses")
-                self.assertEqual(m_open.call_count, 1)
-        finally:
-            down_err.close()
-
-        # 3. Same-host HTTPS redirect is still allowed
-        same_err = _make_redir("https://sis.comsats.edu.pk/Courses", "/Courses/Index")
-        try:
-            with mock.patch.object(
-                client._opener,
-                "open",
-                side_effect=[same_err, _FakeHttpResponse(auth_body)],
-            ) as m_open:
-                self.assertEqual(client.get_html("/Courses"), auth_body)
-                self.assertEqual(m_open.call_count, 2)
-        finally:
-            same_err.close()
-
-        # 4. Cross-host login redirect still raises SessionExpiredError
-        login_err = _make_redir("https://sis.comsats.edu.pk/Courses", "https://sso.example.com/Login/Index")
-        try:
-            with mock.patch.object(client._opener, "open", side_effect=[login_err]):
-                with self.assertRaises(SessionExpiredError):
-                    client.get_html("/Courses")
-        finally:
-            login_err.close()
-
-        # 5. probe.fetch also stops without leaking cookies on cross-host or downgrade redirects
-        for target in ("https://evil.example.com/steal", "http://sis.comsats.edu.pk/Courses/Index"):
-            p_err = _make_redir("https://sis.comsats.edu.pk/Courses", target)
-            fake_opener = mock.Mock()
-            fake_opener.open.side_effect = [p_err]
-            try:
-                with mock.patch.object(probe.urllib.request, "build_opener", return_value=fake_opener):
-                    res = probe.fetch("/Courses", "secret_sid")
-                self.assertEqual(res.status, 302)
-                self.assertEqual(fake_opener.open.call_count, 1)
-            finally:
-                p_err.close()
-
-    def test_value_error_and_header_sanitization_safety(self) -> None:
-        # 1. Invalid base_url without scheme wraps ValueError in PortalHttpError
-        bad_client = SisClient("sid", base_url="sis.comsats.edu.pk", request_delay=0.0)
-        with self.assertRaises(PortalHttpError):
-            bad_client.get_html("/Courses")
-
-        # 2. Non-Latin-1 / CRLF in User-Agent is sanitized before Request construction
-        auth_body = _auth_shell('<table class="sis-dash-table"></table>')
-        seen_ua: list[str] = []
-        ua_client = SisClient(
-            "sid",
-            user_agent="Mozilla/5.0\r\nX-Bad: 1 — test",
-            request_delay=0.0,
-        )
-
-        def _capture_open(req, timeout=20):
-            seen_ua.append(req.headers.get("User-agent", ""))
-            return _FakeHttpResponse(auth_body)
-
-        with mock.patch.object(ua_client._opener, "open", side_effect=_capture_open):
-            ua_client.get_html("/Courses")
-        self.assertEqual(seen_ua, ["Mozilla/5.0X-Bad: 1  test"])
-
-        # 3. UnicodeEncodeError during open is wrapped as PortalHttpError
-        with mock.patch.object(
-            ua_client._opener,
-            "open",
-            side_effect=UnicodeEncodeError("latin-1", "bad", 0, 1, "ordinal not in range"),
-        ):
-            with self.assertRaises(PortalHttpError):
-                ua_client.get_html("/Courses")
-
-        # 4. run_daemon catches ValueError from get_courses cleanly without crashing
+    def test_daemon_survives_value_error_from_portal(self) -> None:
+        # Header sanitization, invalid base URL, and transport-exception translation are
+        # covered in tests/test_portal.py through the stub transport adapter.
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / ".env"
             state_path = Path(tmp) / "data" / "state.json"
@@ -1982,7 +1710,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             attempt_lock = threading.Lock()
             second_expire_seen = threading.Event()
 
-            class _FlakyReusedClient:
+            class _FlakyReusedClient(_ReconfigurableClient):
                 def __init__(self, session_id, **kwargs) -> None:
                     self._session_id = session_id
                     self.cancel_event = None

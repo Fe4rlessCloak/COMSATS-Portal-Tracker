@@ -112,8 +112,12 @@ def scan_all_courses(
     sample_marks_course = ""
     sample_from_prior_marks = False
 
-    def _collect_cookies() -> None:
-        for name in getattr(client, "last_set_cookie_names", None) or ():
+    def _collect_cookies(exc: Optional[BaseException] = None) -> None:
+        names: List[str] = []
+        if exc is not None:
+            names.extend(getattr(exc, "set_cookie_names", ()) or ())
+        names.extend(getattr(client, "last_set_cookie_names", None) or ())
+        for name in names:
             if name not in seen_cookie_names:
                 seen_cookie_names.append(name)
 
@@ -164,7 +168,7 @@ def scan_all_courses(
             if on_progress is not None:
                 on_progress()
         except SessionExpiredError as exc:
-            _collect_cookies()
+            _collect_cookies(exc)
             _carry_forward(course)
             for rem in courses[idx + 1 :]:
                 _carry_forward(rem)
@@ -179,7 +183,7 @@ def scan_all_courses(
                 set_cookie_names=seen_cookie_names,
             )
         except (PortalHttpError, ValueError) as exc:
-            _collect_cookies()
+            _collect_cookies(exc)
             print(f"[WARN] Failed scanning {course.label} ({course.course_id}): {exc}")
             partial = True
             failed_courses.append(course.label)
@@ -882,10 +886,12 @@ def run_daemon(
 
             if fresh_cfg.session_id and fresh_cfg.session_id != active_session_id:
                 active_session_id = fresh_cfg.session_id
-                client.session_id = active_session_id
-                client.user_agent = fresh_cfg.user_agent
-                client.base_url = fresh_cfg.base_url
-                client.request_delay = max(0.0, fresh_cfg.request_delay)
+                client.reconfigure(
+                    session_id=active_session_id,
+                    user_agent=fresh_cfg.user_agent,
+                    base_url=fresh_cfg.base_url,
+                    request_delay=fresh_cfg.request_delay,
+                )
                 expired_since = None
                 last_expired_log = 0.0
                 last_fetch = 0.0
@@ -903,12 +909,17 @@ def run_daemon(
                         f"(source={session_src}) — resuming."
                     )
             elif env_changed:
-                client.user_agent = fresh_cfg.user_agent
-                client.base_url = fresh_cfg.base_url
-                client.request_delay = max(0.0, fresh_cfg.request_delay)
                 now_str = datetime.now().strftime("%H:%M:%S")
                 if expired_since is not None and fresh_cfg.session_id:
-                    client.session_id = fresh_cfg.session_id
+                    # Expired-session .env change: force-clear the cookie jar even though the
+                    # session identifier is unchanged, so stale auxiliary cookies are dropped.
+                    client.reconfigure(
+                        session_id=fresh_cfg.session_id,
+                        user_agent=fresh_cfg.user_agent,
+                        base_url=fresh_cfg.base_url,
+                        request_delay=fresh_cfg.request_delay,
+                        reset_cookies=True,
+                    )
                     expired_since = None
                     last_expired_log = 0.0
                     last_fetch = 0.0
@@ -918,6 +929,11 @@ def run_daemon(
                         f"SIS_SESSION_ID unchanged; source={session_src}) — re-testing session."
                     )
                 else:
+                    client.reconfigure(
+                        user_agent=fresh_cfg.user_agent,
+                        base_url=fresh_cfg.base_url,
+                        request_delay=fresh_cfg.request_delay,
+                    )
                     print(
                         f"[{now_str}] [INFO] Detected .env change ({change_desc}; "
                         f"SIS_SESSION_ID unchanged; source={session_src})."
