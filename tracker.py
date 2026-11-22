@@ -15,13 +15,10 @@ Two-tier lightweight architecture:
 from __future__ import annotations
 
 import argparse
-import contextlib
 import copy
 import hashlib
-import json
 import os
 import re
-import shutil
 import signal
 import sys
 import threading
@@ -30,14 +27,14 @@ import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows compatibility for importing parser helpers
-    fcntl = None  # type: ignore[assignment]
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from notifiers import BaseNotifier, Notification, build_notifiers, dispatch_all
+from runtime_store import (
+    RuntimeStore,
+    StateLockError,
+    default_heartbeat_path,
+)
 from sis_client import (
     AnnouncementItem,
     Course,
@@ -52,7 +49,6 @@ from sis_client import (
     SisClient,
     extract_diagnostic_text,
     parse_announcements,
-    scrub_diagnostic_html,
 )
 
 T = TypeVar("T")
@@ -96,10 +92,6 @@ class CycleTimeoutError(RuntimeError):
 
 class CycleCancelledError(RuntimeError):
     """Raised when a running cycle is interrupted by a shutdown signal."""
-
-
-class StateLockError(RuntimeError):
-    """Raised when the state file lock cannot be acquired within timeout."""
 
 
 @dataclass
@@ -429,113 +421,6 @@ def load_config(env_path: Path, require_session: bool = True) -> TrackerConfig:
         healthcheck_max_age=_parse_int(values, "HEALTHCHECK_MAX_AGE", 0, minimum=0),
         semester=values.get("SIS_SEMESTER", "").strip(),
     )
-
-
-@contextlib.contextmanager
-def state_lock(state_path: Path, timeout: float = 30.0) -> Iterator[None]:
-    """Acquire an exclusive advisory lock around state load/scan/save cycles."""
-    if fcntl is None:
-        raise RuntimeError("state_lock requires POSIX fcntl")
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = state_path.with_name(f"{state_path.name}.lock")
-    fh = lock_path.open("a+", encoding="utf-8")
-    deadline = time.monotonic() + max(0.0, timeout)
-    acquired = False
-    try:
-        while True:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise StateLockError(
-                        f"Timed out waiting for lock {lock_path} after {timeout:.1f}s"
-                    )
-                time.sleep(0.05)
-        yield
-    finally:
-        if acquired:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        fh.close()
-
-
-def _read_json_dict(path: Path) -> Optional[Dict[str, Any]]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _state_backup_paths(state_path: Path) -> List[Path]:
-    """Return existing backup paths ordered from newest (.bak) to oldest (.bak.N)."""
-    paths: List[Path] = []
-    primary_bak = state_path.with_name(f"{state_path.name}.bak")
-    if primary_bak.exists():
-        paths.append(primary_bak)
-    numbered_re = re.compile(rf"^{re.escape(state_path.name)}\.bak\.(\d+)$")
-    numbered: List[Tuple[int, Path]] = []
-    try:
-        for candidate in state_path.parent.iterdir():
-            m = numbered_re.match(candidate.name)
-            if m:
-                numbered.append((int(m.group(1)), candidate))
-    except OSError:
-        pass
-    numbered.sort(key=lambda pair: pair[0])
-    paths.extend(path for _, path in numbered)
-    return paths
-
-
-def load_state(state_path: Path) -> Optional[Dict[str, Any]]:
-    if not state_path.exists():
-        return None
-    data = _read_json_dict(state_path)
-    if data is not None:
-        return data
-
-    for bak_path in _state_backup_paths(state_path):
-        bak_data = _read_json_dict(bak_path)
-        if bak_data is not None:
-            print(f"[WARN] Corrupt state file {state_path}; recovered baseline from {bak_path}.")
-            return bak_data
-    return None
-
-
-def save_state(state_path: Path, state: Dict[str, Any], max_backups: int = 5) -> None:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = f".{os.getpid()}.{threading.get_ident()}"
-    tmp_path = state_path.with_name(f"{state_path.name}.tmp{suffix}")
-    bak_tmp = state_path.with_name(f"{state_path.name}.bak.tmp{suffix}")
-    try:
-        tmp_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-
-        if state_path.exists() and max_backups >= 1:
-            if _read_json_dict(state_path) is not None:
-                for idx in range(max_backups, 1, -1):
-                    src_name = (
-                        f"{state_path.name}.bak" if idx == 2 else f"{state_path.name}.bak.{idx - 1}"
-                    )
-                    src = state_path.with_name(src_name)
-                    dst = state_path.with_name(f"{state_path.name}.bak.{idx}")
-                    if src.exists():
-                        os.replace(src, dst)
-                shutil.copy2(state_path, bak_tmp)
-                os.replace(bak_tmp, state_path.with_name(f"{state_path.name}.bak"))
-            else:
-                print(
-                    f"[WARN] Skipping backup rotation of corrupt {state_path}; "
-                    "preserving existing backups."
-                )
-
-        os.replace(tmp_path, state_path)
-    except BaseException:
-        for leftover in (tmp_path, bak_tmp):
-            with contextlib.suppress(OSError):
-                if leftover.exists():
-                    leftover.unlink()
-        raise
 
 
 def scan_all_courses(
@@ -925,6 +810,7 @@ def run_cycle(
     notifiers: List[BaseNotifier],
     dry_run: bool = False,
     *,
+    store: Optional[RuntimeStore] = None,
     max_backups: int = 5,
     notifier_timeout: Optional[float] = None,
     cancel_event: Optional[threading.Event] = None,
@@ -935,8 +821,9 @@ def run_cycle(
     reset_state: bool = False,
 ) -> CycleResult:
     """Run one locked load -> multi-course fetch -> validate -> save -> diff + notify cycle."""
-    with state_lock(state_path, timeout=lock_timeout):
-        old_state = load_state(state_path)
+    store = store or RuntimeStore(state_path)
+    with store.lock(timeout=lock_timeout):
+        old_state = store.load_state()
         scan_result = scan_all_courses(
             client,
             courses,
@@ -964,7 +851,7 @@ def run_cycle(
             )
             now_iso = datetime.now(timezone.utc).isoformat()
             anomaly_key = anomaly.strip()
-            prev_anom = _load_anomaly_state(state_path)
+            prev_anom = store.load_anomaly()
             if prev_anom is not None and str(prev_anom.get("key") or "") == anomaly_key:
                 occurrence = int(prev_anom.get("count") or 1) + 1
                 first_seen = str(prev_anom.get("first_seen") or now_iso)
@@ -975,8 +862,7 @@ def run_cycle(
                 should_notify = notify_anomaly
 
             if not dry_run:
-                _save_anomaly_state(
-                    state_path,
+                store.save_anomaly(
                     {
                         "key": anomaly_key,
                         "reason": anomaly,
@@ -984,14 +870,17 @@ def run_cycle(
                         "last_seen": now_iso,
                         "count": occurrence,
                         "scanned": {"courses": new_c, "marks": new_m, "resources": new_r},
-                    },
+                    }
                 )
-                _write_anomaly_diagnostics(
-                    state_path,
-                    anomaly,
-                    old_state,
-                    scan_result,
-                    occurrence,
+                store.write_anomaly_diagnostics(
+                    reason=anomaly,
+                    occurrence=occurrence,
+                    scanned_totals={"courses": new_c, "marks": new_m, "resources": new_r},
+                    baseline_totals={"courses": old_c, "marks": old_m, "resources": old_r},
+                    failed_courses=scan_result.failed_courses,
+                    set_cookie_names=scan_result.set_cookie_names,
+                    sample_marks_course=scan_result.sample_marks_course,
+                    marks_html=scan_result.sample_marks_html,
                 )
 
             preview = extract_diagnostic_text(scan_result.sample_marks_html, max_chars=240)
@@ -1047,7 +936,7 @@ def run_cycle(
             return CycleResult(saved=False, anomaly=anomaly, notifications=[])
 
         new_state = scan_result.state
-        prev_anom = _load_anomaly_state(state_path)
+        prev_anom = store.load_anomaly()
         c_count, m_count, r_count = summarize_totals(new_state)
         recovery_note: Optional[Notification] = None
         if prev_anom is not None:
@@ -1079,9 +968,9 @@ def run_cycle(
             if cancel_event is not None and cancel_event.is_set():
                 return CycleResult(saved=False, anomaly="Cancelled")
             if not dry_run:
-                save_state(state_path, new_state, max_backups=max_backups)
+                store.save_state(new_state, max_backups=max_backups)
                 if prev_anom is not None:
-                    _clear_anomaly_state(state_path)
+                    store.clear_anomaly()
             new_sem = str(new_state.get("semester") or "").strip()
             baseline_data: Dict[str, Any] = {
                 "courses": c_count,
@@ -1121,9 +1010,9 @@ def run_cycle(
                 return CycleResult(saved=False, anomaly="Cancelled")
             old_sem_label, new_sem_label = rollover
             if not dry_run:
-                save_state(state_path, new_state, max_backups=max_backups)
+                store.save_state(new_state, max_backups=max_backups)
                 if prev_anom is not None:
-                    _clear_anomaly_state(state_path)
+                    store.clear_anomaly()
             course_lines = "\n".join(
                 f"- {c.get('label') or cid}"
                 for cid, c in new_state.get("courses", {}).items()
@@ -1175,9 +1064,9 @@ def run_cycle(
         if cancel_event is not None and cancel_event.is_set():
             return CycleResult(saved=False, anomaly="Cancelled")
         if not dry_run:
-            save_state(state_path, new_state, max_backups=max_backups)
+            store.save_state(new_state, max_backups=max_backups)
             if prev_anom is not None:
-                _clear_anomaly_state(state_path)
+                store.clear_anomaly()
 
         all_notes: List[Notification] = []
         if recovery_note is not None and notify_anomaly:
@@ -1246,188 +1135,6 @@ def run_with_timeout(
     return result_box[0]
 
 
-def default_heartbeat_path(state_path: Path) -> Path:
-    env_hb = os.environ.get("HEARTBEAT_FILE", "").strip()
-    return Path(env_hb) if env_hb else state_path.with_name("heartbeat.json")
-
-
-def write_heartbeat(
-    heartbeat_path: Path,
-    status: str,
-    *,
-    keepalive_interval: int,
-    fetch_interval: int,
-    healthcheck_max_age: int = 0,
-    detail: str = "",
-    last_ok_ts: Optional[float] = None,
-) -> None:
-    heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
-    now_ts = time.time()
-    payload = {
-        "timestamp": now_ts,
-        "iso": datetime.now(timezone.utc).isoformat(),
-        "pid": os.getpid(),
-        "status": status,
-        "keepalive_interval": keepalive_interval,
-        "fetch_interval": fetch_interval,
-        "healthcheck_max_age": healthcheck_max_age,
-        "detail": detail,
-        "last_ok_timestamp": last_ok_ts,
-    }
-    tmp = heartbeat_path.with_name(
-        f"{heartbeat_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
-    )
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp, heartbeat_path)
-
-
-def check_healthcheck(
-    heartbeat_path: Path, max_age_override: Optional[int] = None
-) -> Tuple[bool, str]:
-    """Verify heartbeat freshness and daemon status for container HEALTHCHECK."""
-    if not heartbeat_path.exists():
-        return False, f"Heartbeat file missing: {heartbeat_path}"
-    try:
-        hb = json.loads(heartbeat_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        return False, f"Heartbeat unreadable: {exc}"
-    if not isinstance(hb, dict) or "timestamp" not in hb:
-        return False, "Heartbeat payload invalid."
-
-    try:
-        ts = float(hb["timestamp"])
-    except (TypeError, ValueError):
-        return False, "Heartbeat timestamp invalid."
-
-    if max_age_override is not None and max_age_override > 0:
-        max_age = int(max_age_override)
-    else:
-        hb_max = int(hb.get("healthcheck_max_age") or 0)
-        keepalive = int(hb.get("keepalive_interval") or 120)
-        max_age = hb_max if hb_max > 0 else max(keepalive, 60)
-
-    age = max(0.0, time.time() - ts)
-    if age > max_age:
-        return False, f"Heartbeat stale ({age:.1f}s > {max_age}s)"
-
-    status = str(hb.get("status") or "unknown")
-    detail = str(hb.get("detail") or "")
-    if status in ("waiting_for_session", "exiting_session_expired", "wedged_exiting"):
-        suffix = f" ({detail})" if detail else ""
-        return False, f"Unhealthy status: {status}{suffix}"
-
-    return True, f"OK (status={status}, age={age:.1f}s)"
-
-
-def _session_hash(session_id: str) -> str:
-    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
-
-
-def _session_alert_path(state_path: Path) -> Path:
-    return state_path.with_name(".session_alerted")
-
-
-def _was_session_alerted(state_path: Path, session_id: str) -> bool:
-    if not session_id:
-        return False
-    marker = _session_alert_path(state_path)
-    try:
-        return marker.exists() and marker.read_text(encoding="utf-8").strip() == _session_hash(
-            session_id
-        )
-    except OSError:
-        return False
-
-
-def _mark_session_alerted(state_path: Path, session_id: str) -> None:
-    if not session_id:
-        return
-    marker = _session_alert_path(state_path)
-    try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(_session_hash(session_id), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def _clear_session_alerted(state_path: Path) -> None:
-    marker = _session_alert_path(state_path)
-    try:
-        if marker.exists():
-            marker.unlink()
-    except OSError:
-        pass
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def _anomaly_alert_path(state_path: Path) -> Path:
-    return state_path.with_name(".anomaly_alerted")
-
-
-def _load_anomaly_state(state_path: Path) -> Optional[Dict[str, Any]]:
-    return _read_json_dict(_anomaly_alert_path(state_path))
-
-
-def _save_anomaly_state(state_path: Path, payload: Dict[str, Any]) -> None:
-    try:
-        _atomic_write_text(
-            _anomaly_alert_path(state_path),
-            json.dumps(payload, indent=2, ensure_ascii=False),
-        )
-    except OSError as exc:
-        print(f"[WARN] Could not persist anomaly marker: {exc}")
-
-
-def _clear_anomaly_state(state_path: Path) -> None:
-    marker = _anomaly_alert_path(state_path)
-    try:
-        if marker.exists():
-            marker.unlink()
-    except OSError:
-        pass
-
-
-def _write_anomaly_diagnostics(
-    state_path: Path,
-    anomaly: str,
-    old_state: Optional[Dict[str, Any]],
-    scan_result: ScanResult,
-    occurrence: int,
-) -> None:
-    new_c, new_m, new_r = summarize_totals(scan_result.state)
-    old_c, old_m, old_r = (
-        summarize_totals(old_state) if old_state is not None else (0, 0, 0)
-    )
-    scrubbed_html = scrub_diagnostic_html(scan_result.sample_marks_html)
-    preview = extract_diagnostic_text(scan_result.sample_marks_html, max_chars=500)
-    diag_payload = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "reason": anomaly,
-        "occurrence": occurrence,
-        "scanned_totals": {"courses": new_c, "marks": new_m, "resources": new_r},
-        "baseline_totals": {"courses": old_c, "marks": old_m, "resources": old_r},
-        "failed_courses": list(scan_result.failed_courses),
-        "set_cookie_names": list(scan_result.set_cookie_names),
-        "sample_marks_course": scan_result.sample_marks_course,
-        "sample_marks_preview": preview,
-    }
-    try:
-        _atomic_write_text(
-            state_path.with_name("last_anomaly.json"),
-            json.dumps(diag_payload, indent=2, ensure_ascii=False),
-        )
-        if scrubbed_html:
-            _atomic_write_text(state_path.with_name("last_anomaly_marks.html"), scrubbed_html)
-    except OSError as exc:
-        print(f"[WARN] Could not write anomaly diagnostics: {exc}")
-
-
 def run_daemon(
     env_path: Path,
     state_path: Path,
@@ -1458,6 +1165,14 @@ def run_daemon(
     )
 
     hb_path = heartbeat_path or default_heartbeat_path(state_path)
+    store = RuntimeStore(
+        state_path,
+        hb_path,
+        keepalive_interval=cfg.keepalive_interval,
+        fetch_interval=cfg.fetch_interval,
+        healthcheck_max_age=cfg.healthcheck_max_age,
+        max_backups=cfg.max_state_backups,
+    )
     env_watcher = EnvWatcher(env_path)
 
     last_fetch = 0.0
@@ -1476,14 +1191,7 @@ def run_daemon(
         f"notifiers={[n.name for n in notifiers]})"
     )
     print(f"[INFO] SIS_SESSION_ID loaded from {cfg.sources.get('SIS_SESSION_ID', 'unknown')}")
-    write_heartbeat(
-        hb_path,
-        "starting",
-        keepalive_interval=cfg.keepalive_interval,
-        fetch_interval=cfg.fetch_interval,
-        healthcheck_max_age=cfg.healthcheck_max_age,
-        last_ok_ts=last_ok_ts,
-    )
+    store.write_heartbeat("starting", last_ok=last_ok_ts)
 
     while not stop:
         # Hot-reload .env by path so inode replacements and overrides are always observed
@@ -1502,7 +1210,7 @@ def run_daemon(
                 last_expired_log = 0.0
                 last_fetch = 0.0
                 active_anomaly = None
-                _clear_session_alerted(state_path)
+                store.clear_session_alerted()
                 now_str = datetime.now().strftime("%H:%M:%S")
                 if env_changed:
                     print(
@@ -1536,6 +1244,11 @@ def run_daemon(
                     )
 
             cfg = fresh_cfg
+            store.bind_heartbeat(
+                keepalive_interval=cfg.keepalive_interval,
+                fetch_interval=cfg.fetch_interval,
+                healthcheck_max_age=cfg.healthcheck_max_age,
+            )
             notifiers = build_notifiers(cfg.raw)
         except Exception as exc:
             print(f"[WARN] Could not reload .env: {exc}")
@@ -1547,15 +1260,7 @@ def run_daemon(
             elapsed = now_mono - expired_since
             last_status = "waiting_for_session"
             last_detail = f"expired for {int(elapsed)}s"
-            write_heartbeat(
-                hb_path,
-                last_status,
-                keepalive_interval=cfg.keepalive_interval,
-                fetch_interval=cfg.fetch_interval,
-                healthcheck_max_age=cfg.healthcheck_max_age,
-                detail=last_detail,
-                last_ok_ts=last_ok_ts,
-            )
+            store.write_heartbeat(last_status, detail=last_detail, last_ok=last_ok_ts)
 
             log_interval = min(60.0, max(15.0, float(cfg.expired_poll_interval) * 4.0))
             if last_expired_log == 0.0 or (now_mono - last_expired_log) >= log_interval:
@@ -1572,14 +1277,8 @@ def run_daemon(
                     f"[{now_str}] [ERROR] Session remained expired for {int(elapsed)}s "
                     "— exiting with code 1 for restart."
                 )
-                write_heartbeat(
-                    hb_path,
-                    "exiting_session_expired",
-                    keepalive_interval=cfg.keepalive_interval,
-                    fetch_interval=cfg.fetch_interval,
-                    healthcheck_max_age=cfg.healthcheck_max_age,
-                    detail=last_detail,
-                    last_ok_ts=last_ok_ts,
+                store.write_heartbeat(
+                    "exiting_session_expired", detail=last_detail, last_ok=last_ok_ts
                 )
                 return 1
 
@@ -1593,14 +1292,7 @@ def run_daemon(
         client.cancel_event = cancel_event
 
         def _touch_scan_heartbeat() -> None:
-            write_heartbeat(
-                hb_path,
-                "scanning",
-                keepalive_interval=cfg.keepalive_interval,
-                fetch_interval=cfg.fetch_interval,
-                healthcheck_max_age=cfg.healthcheck_max_age,
-                last_ok_ts=last_ok_ts,
-            )
+            store.write_heartbeat("scanning", last_ok=last_ok_ts)
 
         try:
             _touch_scan_heartbeat()
@@ -1610,7 +1302,7 @@ def run_daemon(
                 courses = client.get_courses()
                 if cancel_event.is_set():
                     return
-                _clear_session_alerted(state_path)
+                store.clear_session_alerted()
                 now_mono = time.monotonic()
                 now_str = datetime.now().strftime("%H:%M:%S")
 
@@ -1623,6 +1315,7 @@ def run_daemon(
                         track_announcements=cfg.track_announcements,
                         notifiers=notifiers,
                         dry_run=dry_run,
+                        store=store,
                         max_backups=cfg.max_state_backups,
                         notifier_timeout=cfg.notifier_timeout,
                         cancel_event=cancel_event,
@@ -1660,15 +1353,7 @@ def run_daemon(
             finally:
                 current_cancel_event = None
             consecutive_timeouts = 0
-            write_heartbeat(
-                hb_path,
-                last_status,
-                keepalive_interval=cfg.keepalive_interval,
-                fetch_interval=cfg.fetch_interval,
-                healthcheck_max_age=cfg.healthcheck_max_age,
-                detail=last_detail,
-                last_ok_ts=last_ok_ts,
-            )
+            store.write_heartbeat(last_status, detail=last_detail, last_ok=last_ok_ts)
 
         except CycleCancelledError:
             break
@@ -1679,8 +1364,8 @@ def run_daemon(
             last_status = "waiting_for_session"
             last_detail = str(exc)
 
-            if not _was_session_alerted(state_path, active_session_id):
-                _mark_session_alerted(state_path, active_session_id)
+            if not store.was_session_alerted(active_session_id):
+                store.mark_session_alerted(active_session_id)
                 dispatch_all(
                     notifiers,
                     Notification(
@@ -1701,24 +1386,10 @@ def run_daemon(
                     f"[WARN] Session expired ({exc}) — alert already sent for current SIS_SESSION_ID."
                 )
 
-            write_heartbeat(
-                hb_path,
-                last_status,
-                keepalive_interval=cfg.keepalive_interval,
-                fetch_interval=cfg.fetch_interval,
-                healthcheck_max_age=cfg.healthcheck_max_age,
-                detail=last_detail,
-                last_ok_ts=last_ok_ts,
-            )
+            store.write_heartbeat(last_status, detail=last_detail, last_ok=last_ok_ts)
             if cfg.session_expired_timeout == 0:
-                write_heartbeat(
-                    hb_path,
-                    "exiting_session_expired",
-                    keepalive_interval=cfg.keepalive_interval,
-                    fetch_interval=cfg.fetch_interval,
-                    healthcheck_max_age=cfg.healthcheck_max_age,
-                    detail=last_detail,
-                    last_ok_ts=last_ok_ts,
+                store.write_heartbeat(
+                    "exiting_session_expired", detail=last_detail, last_ok=last_ok_ts
                 )
                 return 1
             continue
@@ -1730,56 +1401,24 @@ def run_daemon(
                     f"[ERROR] {exc} (wedged={exc.wedged}, consecutive={consecutive_timeouts}) "
                     "— exiting with code 1 for restart."
                 )
-                write_heartbeat(
-                    hb_path,
-                    "wedged_exiting",
-                    keepalive_interval=cfg.keepalive_interval,
-                    fetch_interval=cfg.fetch_interval,
-                    healthcheck_max_age=cfg.healthcheck_max_age,
-                    detail=str(exc),
-                    last_ok_ts=last_ok_ts,
-                )
+                store.write_heartbeat("wedged_exiting", detail=str(exc), last_ok=last_ok_ts)
                 return 1
             last_status = "timeout"
             last_detail = str(exc)
             print(f"[WARN] {exc} — will retry next tick.")
-            write_heartbeat(
-                hb_path,
-                last_status,
-                keepalive_interval=cfg.keepalive_interval,
-                fetch_interval=cfg.fetch_interval,
-                healthcheck_max_age=cfg.healthcheck_max_age,
-                detail=last_detail,
-                last_ok_ts=last_ok_ts,
-            )
+            store.write_heartbeat(last_status, detail=last_detail, last_ok=last_ok_ts)
 
         except (PortalHttpError, StateLockError, ValueError) as exc:
             last_status = "portal_error"
             last_detail = str(exc)
             print(f"[WARN] Portal/state error (will retry next tick): {exc}")
-            write_heartbeat(
-                hb_path,
-                last_status,
-                keepalive_interval=cfg.keepalive_interval,
-                fetch_interval=cfg.fetch_interval,
-                healthcheck_max_age=cfg.healthcheck_max_age,
-                detail=last_detail,
-                last_ok_ts=last_ok_ts,
-            )
+            store.write_heartbeat(last_status, detail=last_detail, last_ok=last_ok_ts)
 
         for elapsed_sleep in range(cfg.keepalive_interval):
             if stop or stop_event.is_set():
                 break
             if elapsed_sleep > 0 and elapsed_sleep % 15 == 0:
-                write_heartbeat(
-                    hb_path,
-                    last_status,
-                    keepalive_interval=cfg.keepalive_interval,
-                    fetch_interval=cfg.fetch_interval,
-                    healthcheck_max_age=cfg.healthcheck_max_age,
-                    detail=last_detail,
-                    last_ok_ts=last_ok_ts,
-                )
+                store.write_heartbeat(last_status, detail=last_detail, last_ok=last_ok_ts)
             stop_event.wait(1.0)
 
     print("Tracker stopped.")
@@ -1822,8 +1461,8 @@ def main() -> int:
     if args.healthcheck:
         cfg_vals = load_env_dict(env_path)
         max_age_override = _parse_int(cfg_vals, "HEALTHCHECK_MAX_AGE", 0, minimum=0) or None
-        hb_path = default_heartbeat_path(state_path)
-        ok, msg = check_healthcheck(hb_path, max_age_override=max_age_override)
+        store = RuntimeStore(state_path)
+        ok, msg = store.check_healthcheck(max_age_override=max_age_override)
         print(msg)
         return 0 if ok else 1
 
@@ -1866,6 +1505,7 @@ def main() -> int:
                     track_announcements=cfg.track_announcements,
                     notifiers=notifiers,
                     dry_run=args.dry_run,
+                    store=RuntimeStore(state_path, max_backups=cfg.max_state_backups),
                     max_backups=cfg.max_state_backups,
                     notifier_timeout=cfg.notifier_timeout,
                     cancel_event=cancel_event,
