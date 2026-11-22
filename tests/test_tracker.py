@@ -36,7 +36,6 @@ from sis_client import (  # noqa: E402
     SessionExpiredError,
     SisClient,
     detect_login_page,
-    extract_diagnostic_text,
     has_authenticated_shell,
     parse_active_course,
     parse_announcements,
@@ -44,22 +43,19 @@ from sis_client import (  # noqa: E402
     parse_learning_resources,
     parse_marks_summary,
     parse_semester,
-    scrub_diagnostic_html,
     verify_active_course,
 )
-from runtime_store import RuntimeStore, StateLockError  # noqa: E402
 from support_portal_pages import SimulatedPortal  # noqa: E402
 from support_stub_transport import StubResponse, StubTransport, StubTransportError  # noqa: E402
+from runtime_store import RuntimeStore  # noqa: E402
 from tracker import (  # noqa: E402
+    CycleOptions,
     CycleTimeoutError,
-    detect_semester_rollover,
-    diff_states,
     load_config,
     run_cycle,
     run_daemon,
     run_with_timeout,
     scan_all_courses,
-    validate_snapshot,
 )
 
 PORTAL_BASE = "https://sis.comsats.edu.pk"
@@ -239,74 +235,6 @@ class ParserAndDiffTests(unittest.TestCase):
         self.assertEqual(anns[0].title, "Quiz 2 Postponed")
         self.assertIn("Moved to Friday.", anns[0].body)
 
-    def test_diff_states_detects_new_and_updated_marks_and_resources(self) -> None:
-        old_state = {
-            "courses": {
-                "100001": {
-                    "code": "CSC101",
-                    "name": "Intro to Computing",
-                    "label": "CSC101 — Intro to Computing",
-                    "marks": {
-                        "Quizzes:9001": {
-                            "key": "Quizzes:9001",
-                            "section": "Quizzes",
-                            "title": "Quiz1",
-                            "obtained": "7.0",
-                            "total": "10.0",
-                            "date_text": "31 Oct 2026",
-                        }
-                    },
-                    "resources": {},
-                }
-            }
-        }
-        new_state = {
-            "courses": {
-                "100001": {
-                    "code": "CSC101",
-                    "name": "Intro to Computing",
-                    "label": "CSC101 — Intro to Computing",
-                    "marks": {
-                        "Quizzes:9001": {
-                            "key": "Quizzes:9001",
-                            "section": "Quizzes",
-                            "title": "Quiz1",
-                            "obtained": "8.0",
-                            "total": "10.0",
-                            "date_text": "31 Oct 2026",
-                        },
-                        "Assignments:9002": {
-                            "key": "Assignments:9002",
-                            "section": "Assignments",
-                            "title": "Assign1",
-                            "obtained": "9.0",
-                            "total": "10.0",
-                            "date_text": "01 Nov 2026",
-                        },
-                    },
-                    "resources": {
-                        "res-55": {
-                            "key": "res-55",
-                            "title": "Week 1 Slides",
-                            "material_type": "Lecture Notes",
-                            "date_text": "02 Nov 2026",
-                            "size": "1.2 MB",
-                            "href": "/LearningResources/Download/55",
-                        }
-                    },
-                }
-            }
-        }
-        notes = diff_states(old_state, new_state, base_url="https://sis.comsats.edu.pk")
-        events = [n.event for n in notes]
-        self.assertEqual(events, ["marks_updated", "resource_added"])
-        self.assertIn("7.0 / 10.0 -> 8.0 / 10.0", notes[0].message)
-        self.assertIn("+ [Assignments] Assign1: 9.0 / 10.0", notes[0].message)
-        self.assertIn("Week 1 Slides", notes[1].message)
-        self.assertEqual(
-            notes[1].url, "https://sis.comsats.edu.pk/LearningResources/Download/55"
-        )
-
     def test_latin1_safe_header_normalization(self) -> None:
         self.assertEqual(_latin1_safe("Marks update: CSC101 — Intro"), "Marks update: CSC101 - Intro")
 
@@ -381,149 +309,375 @@ def _auth_shell(inner: str, course_code: str = "", course_name: str = "") -> str
     )
 
 
-class ReliabilityAndBugfixTests(unittest.TestCase):
-    def test_bug1_degenerate_scan_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "data" / "state.json"
-            good_baseline = _make_state(marks_count=6, res_count=6, course_count=1)
-            save_state(state_path, good_baseline, max_backups=3)
-            baseline = load_state(state_path)
-            notifier = _RecordingNotifier()
+class CycleIntegrationTests(unittest.TestCase):
+    """End-to-end `run_cycle` through every real layer.
 
-            courses = [Course(course_id="100001", code="CSC101", name="Course 1")]
-            portal = SimulatedPortal(courses=courses, marks={"100001": []})
-            result = run_cycle(
-                portal_client(portal),
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertFalse(result.saved)
-            self.assertIsNotNone(result.anomaly)
-            self.assertEqual(load_state(state_path), baseline)
-            self.assertEqual([n.event for n in notifier.notes], ["scan_anomaly"])
+    Wiring is deliberately complete: the real `SisClient` over `SimulatedPortal` (itself a
+    `StubTransport`, so every outbound request is recorded at the HTTP edge), a real
+    `RuntimeStore` over a temp directory, the real `snapshot_transition` module, and the
+    recording notifier. Nothing here patches Portal behaviour, the policy, or the store.
+    """
 
-            # Sharp >50% drop and 0-course scan are also rejected by validate_snapshot
-            self.assertIsNotNone(
-                validate_snapshot(
-                    baseline,
-                    tracker.ScanResult(state=_make_state(marks_count=2, res_count=6, course_count=1)),
-                )
-            )
-            self.assertIsNotNone(
-                validate_snapshot(
-                    baseline,
-                    tracker.ScanResult(state={"courses": {}}),
-                )
-            )
+    BASE = "https://sis.comsats.edu.pk"
 
-    def test_bug2_diff_detects_removals_and_legitimate_single_removal_persists(self) -> None:
-        old_state = {
-            "courses": {
-                "100001": {
-                    "code": "CSC101",
-                    "name": "Intro",
-                    "label": "CSC101 — Intro",
-                    "marks": {
-                        "Quizzes:1": _make_mark("Quizzes:1", "Quiz1", "7.0"),
-                        "Quizzes:2": _make_mark("Quizzes:2", "Quiz2", "8.0"),
-                    },
-                    "resources": {
-                        "res-1": _make_resource("res-1", "Week 1"),
-                    },
-                    "announcements": {
-                        "Ann1|10 Nov": {"key": "Ann1|10 Nov", "title": "Ann1", "meta": "10 Nov", "body": "Hi"},
-                    },
-                },
-                "100002": {
-                    "code": "MTH104",
-                    "name": "Calculus",
-                    "label": "MTH104 — Calculus",
-                    "marks": {"Quizzes:9": _make_mark("Quizzes:9", "Q9", "5.0")},
-                    "resources": {},
-                    "announcements": {},
-                },
-            }
-        }
-        new_state = {
-            "courses": {
-                "100001": {
-                    "code": "CSC101",
-                    "name": "Intro",
-                    "label": "CSC101 — Intro",
-                    "marks": {
-                        "Quizzes:1": _make_mark("Quizzes:1", "Quiz1", "7.0"),
-                    },
-                    "resources": {},
-                    "announcements": {},
-                }
-            }
-        }
-        notes = diff_states(
-            old_state,
-            new_state,
-            base_url="https://sis.comsats.edu.pk",
-            track_announcements=True,
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state_path = Path(self._tmp.name) / "data" / "state.json"
+        self.data_dir = self.state_path.parent
+        self.store = RuntimeStore(self.state_path)
+        self.notifier = _RecordingNotifier()
+        self.course = Course(course_id="100001", code="CSC101", name="Intro to Computing")
+
+    # -- helpers -------------------------------------------------------------
+    def portal(self, marks=(), resources=(), semester="Fall 2026", **kwargs):
+        return SimulatedPortal(
+            courses=[self.course],
+            semester=semester,
+            marks={self.course.course_id: list(marks)},
+            resources={self.course.course_id: list(resources)},
+            **kwargs,
         )
-        events = [n.event for n in notes]
+
+    def cycle(self, portal, courses=None, **kwargs):
+        return run_cycle(
+            portal_client(portal),
+            courses if courses is not None else [self.course],
+            self.store,
+            CycleOptions(base_url=self.BASE, semester=kwargs.pop("semester", portal.semester), **kwargs),
+            [self.notifier],
+        )
+
+    def events(self) -> list:
+        return [n.event for n in self.notifier.notes]
+
+    def saved(self):
+        return self.store.load_state()
+
+    # -- baseline ------------------------------------------------------------
+    def test_first_cycle_saves_a_baseline(self) -> None:
+        res = self.cycle(self.portal(marks=[MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")]))
+        self.assertTrue(res.saved)
+        self.assertIsNone(res.anomaly)
+        self.assertEqual(self.events(), ["baseline_saved"])
+        self.assertEqual(self.store.load_state()["semester"], "Fall 2026")
+        self.assertEqual(self.store.load_state()["courses"]["100001"]["code"], "CSC101")
+        self.assertFalse(self.data_dir.joinpath(".anomaly_alerted").exists())
+
+    def test_dry_run_baseline_writes_nothing(self) -> None:
+        res = self.cycle(
+            self.portal(marks=[MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")]),
+            dry_run=True,
+        )
+        self.assertFalse(res.saved)
+        self.assertEqual(self.events(), ["baseline_saved"])
+        self.assertFalse(self.state_path.exists())
+
+    # -- unchanged / incremental --------------------------------------------
+    def test_unchanged_cycle_reports_but_does_not_notify(self) -> None:
+        marks = [MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")]
+        self.cycle(self.portal(marks=marks))
+        self.notifier.notes.clear()
+
+        res = self.cycle(self.portal(marks=marks))
+        self.assertTrue(res.saved)
+        self.assertIsNone(res.anomaly)
+        self.assertEqual(self.notifier.notes, [])
+        self.assertEqual(len(self.saved()["courses"]["100001"]["marks"]), 1)
+
+    def test_new_marks_are_announced_and_persisted(self) -> None:
+        self.cycle(self.portal(marks=[MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")]))
+        self.notifier.notes.clear()
+
+        res = self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem("Quizzes:1", "Quizzes", "Quiz1", "9.0", "10.0", ""),
+                    MarkItem("Quizzes:2", "Quizzes", "Quiz2", "5.0", "10.0", ""),
+                ],
+                resources=[
+                    ResourceItem("res-1", "Slides", "Week 1", "01 Nov", "1.0 MB",
+                                 "/LearningResources/Download/res-1")
+                ],
+            )
+        )
+        self.assertTrue(res.saved)
+        self.assertEqual(self.events(), ["marks_updated", "resource_added"])
+        self.assertEqual(self.notifier.notes[0].data["items"][0]["change"], "updated")
+        self.assertEqual(self.notifier.notes[0].data["items"][1]["change"], "added")
+        self.assertEqual(len(self.saved()["courses"]["100001"]["marks"]), 2)
+
+    def test_legitimate_small_removal_persists_and_alerts(self) -> None:
+        self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", ""),
+                    MarkItem("Quizzes:2", "Quizzes", "Quiz2", "7.0", "10.0", ""),
+                ],
+                resources=[ResourceItem("res-1", "Slides", "Week 1", "01 Nov", "1.0 MB", "/x")],
+            )
+        )
+        self.notifier.notes.clear()
+
+        res = self.cycle(
+            self.portal(
+                marks=[MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")],
+                resources=[ResourceItem("res-1", "Slides", "Week 1", "01 Nov", "1.0 MB", "/x")],
+            )
+        )
+        self.assertTrue(res.saved)
+        self.assertEqual(self.events(), ["marks_removed"])
+        self.assertEqual(len(self.saved()["courses"]["100001"]["marks"]), 1)
+
+    # -- rollover ------------------------------------------------------------
+    def test_semester_rollover_by_label_saves_a_fresh_baseline(self) -> None:
+        self.cycle(self.portal(marks=[MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")]))
+        self.notifier.notes.clear()
+
+        res = self.cycle(self.portal(marks=[], semester="Spring 2027"))
+        self.assertTrue(res.saved)
+        self.assertEqual(self.events(), ["semester_rollover"])
+        self.assertEqual(self.saved()["semester"], "Spring 2027")
         self.assertEqual(
-            events,
-            ["marks_removed", "resource_removed", "announcement_removed", "course_removed"],
+            json.loads(self.data_dir.joinpath("state.json.bak").read_text(encoding="utf-8"))["semester"],
+            "Fall 2026",
         )
-        self.assertIn("Quiz2", notes[0].message)
-        self.assertIn("Week 1", notes[1].message)
-        self.assertIn("Ann1", notes[2].message)
-        self.assertIn("MTH104 — Calculus", notes[3].message)
 
-        # Legitimate removal of 1 mark (2 -> 1) passes validation and alerts marks_removed
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "state.json"
-            baseline = _make_state(marks_count=2, res_count=1, course_count=1)
-            save_state(state_path, baseline)
-            notifier = _RecordingNotifier()
+    def test_semester_rollover_by_disjoint_course_ids(self) -> None:
+        legacy = _make_state(marks_count=2, res_count=0, course_count=1)
+        self.assertNotIn("semester", legacy)
+        self.store.save_state(legacy)
+        new_course = Course(course_id="999001", code="CSC499", name="New Term Course")
+        other = SimulatedPortal(courses=[new_course], semester="")
 
-            courses = [Course(course_id="100001", code="CSC101", name="Course 1")]
-            portal = SimulatedPortal(
-                courses=courses,
-                marks={
-                    "100001": [
-                        MarkItem(
-                            key="Quizzes:0_0",
-                            section="Quizzes",
-                            title="Quiz0",
-                            obtained="8.0",
-                            total="10.0",
-                            date_text="01 Nov 2026",
-                        )
-                    ]
-                },
-                resources={
-                    "100001": [
-                        ResourceItem(
-                            key="res-0_0",
-                            title="Slide 0",
-                            material_type="Slides",
-                            date_text="01 Nov 2026",
-                            size="1.0 MB",
-                            href="/LearningResources/Download/res-0_0",
-                        )
-                    ]
-                },
+        res = run_cycle(
+            portal_client(other),
+            [new_course],
+            self.store,
+            CycleOptions(base_url=self.BASE, semester=""),
+            [self.notifier],
+        )
+        self.assertTrue(res.saved)
+        self.assertEqual(self.events(), ["semester_rollover"])
+        self.assertIn("999001", self.saved()["courses"])
+
+    def test_legacy_state_gains_a_semester_label_without_rolling_over(self) -> None:
+        legacy = _make_state(marks_count=2, res_count=0, course_count=1)
+        self.store.save_state(legacy)
+
+        res = self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem(f"Quizzes:0_{i}", "Quizzes", f"Quiz{i}", "8.0", "10.0", "01 Nov")
+                    for i in range(2)
+                ]
             )
+        )
+        self.assertTrue(res.saved)
+        self.assertEqual(self.notifier.notes, [])
+        self.assertEqual(self.saved()["semester"], "Fall 2026")
+
+    def test_reset_state_rebaselines_over_a_degenerate_snapshot(self) -> None:
+        self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem(f"Quizzes:{i}", "Quizzes", f"Q{i}", "8.0", "10.0", "")
+                    for i in range(6)
+                ]
+            )
+        )
+        self.notifier.notes.clear()
+
+        res = self.cycle(self.portal(marks=[]), reset_state=True)
+        self.assertTrue(res.saved)
+        self.assertEqual(self.events(), ["baseline_saved"])
+        self.assertEqual(self.saved()["courses"]["100001"]["marks"], {})
+
+    # -- anomalies -----------------------------------------------------------
+    def test_anomaly_rejection_dedupes_then_recovers(self) -> None:
+        self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem(f"Quizzes:{i}", "Quizzes", f"Q{i}", "8.0", "10.0", "")
+                    for i in range(6)
+                ],
+                resources=[ResourceItem("res-1", "Slides", "Week 1", "01 Nov", "1.0 MB", "/x")],
+                set_cookie_on_switch="ARRAffinity",
+            )
+        )
+        baseline = self.saved()
+        self.notifier.notes.clear()
+
+        # 1st degenerate scan: rejected, alerted once, diagnostics written.
+        empty_marks = self.portal(marks=[], resources=[])
+        empty_marks.set_cookie_on_switch = "ARRAffinity"
+        res1 = self.cycle(empty_marks)
+        self.assertFalse(res1.saved)
+        self.assertIsNotNone(res1.anomaly)
+        self.assertEqual(self.events(), ["scan_anomaly"])
+        self.assertEqual(self.saved(), baseline)
+        self.assertIn("ARRAffinity", self.notifier.notes[0].data["set_cookie_names"])
+
+        marker = json.loads(self.data_dir.joinpath(".anomaly_alerted").read_text(encoding="utf-8"))
+        self.assertEqual(marker["count"], 1)
+        diag = json.loads(self.data_dir.joinpath("last_anomaly.json").read_text(encoding="utf-8"))
+        self.assertEqual(diag["occurrence"], 1)
+        self.assertEqual(diag["scanned_totals"], {"courses": 1, "marks": 0, "resources": 0})
+        self.assertEqual(diag["baseline_totals"], {"courses": 1, "marks": 6, "resources": 1})
+        self.assertIn("No marks available.", diag["sample_marks_preview"])
+        diag_first_seen = marker["first_seen"]
+        saved_html = self.data_dir.joinpath("last_anomaly_marks.html").read_text(encoding="utf-8")
+        self.assertIn("No marks available.", saved_html)
+
+        # 2nd identical anomaly: deduplicated (no notification) but counted.
+        res2 = self.cycle(self.portal(marks=[], resources=[]))
+        self.assertFalse(res2.saved)
+        self.assertEqual(res2.notifications, [])
+        self.assertEqual(self.events(), ["scan_anomaly"])
+        marker = json.loads(self.data_dir.joinpath(".anomaly_alerted").read_text(encoding="utf-8"))
+        self.assertEqual(marker["count"], 2)
+        self.assertEqual(marker["first_seen"], diag_first_seen)
+
+        # Recovery: state saved, one recovery alert ahead of the diff alert, marker cleared.
+        res3 = self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem(f"Quizzes:{i}", "Quizzes", f"Q{i}", "8.0", "10.0", "")
+                    for i in range(7)
+                ],
+                resources=[],
+            )
+        )
+        self.assertTrue(res3.saved)
+        self.assertIsNone(res3.anomaly)
+        # The recovery alert always precedes the diff alerts; the scan below also drops
+        # the baseline's single resource, which is a legitimate removal.
+        self.assertEqual(
+            self.events(),
+            ["scan_anomaly", "scan_recovered", "marks_updated", "resource_removed"],
+        )
+        self.assertFalse(self.data_dir.joinpath(".anomaly_alerted").exists())
+        self.assertEqual(len(self.saved()["courses"]["100001"]["marks"]), 7)
+
+    def test_dry_run_anomaly_persists_no_marker_or_diagnostics(self) -> None:
+        self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem(f"Quizzes:{i}", "Quizzes", f"Q{i}", "8.0", "10.0", "")
+                    for i in range(6)
+                ]
+            )
+        )
+        self.notifier.notes.clear()
+
+        res = self.cycle(self.portal(marks=[]), dry_run=True)
+        self.assertFalse(res.saved)
+        self.assertIsNotNone(res.anomaly)
+        self.assertEqual(self.events(), ["scan_anomaly"])
+        self.assertFalse(self.data_dir.joinpath(".anomaly_alerted").exists())
+        self.assertFalse(self.data_dir.joinpath("last_anomaly.json").exists())
+
+    def test_partial_scan_is_rejected_and_the_baseline_survives(self) -> None:
+        second = Course(course_id="100002", code="MTH104", name="Calculus")
+        portal = SimulatedPortal(
+            courses=[self.course, second],
+            semester="Fall 2026",
+            marks={"100001": [MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")],
+                   "100002": [MarkItem("Quizzes:9", "Quizzes", "Q9", "5.0", "10.0", "")]},
+        )
+        self.cycle(portal, courses=[self.course, second])
+        baseline = self.saved()
+        self.notifier.notes.clear()
+
+        portal.failures["/Courses/SetCourse/100002"] = PortalHttpError("HTTP 500")
+        res = self.cycle(portal, courses=[self.course, second])
+        self.assertFalse(res.saved)
+        self.assertIn("Partial scan", res.anomaly or "")
+        self.assertEqual(self.saved(), baseline)
+        self.assertEqual(self.events(), ["scan_anomaly"])
+
+    def test_mid_scan_session_expiry_leaves_state_untouched(self) -> None:
+        second = Course(course_id="100002", code="MTH104", name="Calculus")
+        self.store.save_state(_make_state(marks_count=2, res_count=1, course_count=2))
+        baseline_bytes = self.state_path.read_bytes()
+
+        portal = SimulatedPortal(
+            courses=[self.course, second],
+            semester="Fall 2026",
+            marks={"100001": [MarkItem("Quizzes:100", "Quizzes", "New", "9.0", "10.0", "")]},
+            failures={
+                "/Courses/SetCourse/100002": StubResponse(
+                    "", status=302, headers={"Location": "/Login/Index"}
+                )
+            },
+        )
+        with self.assertRaises(SessionExpiredError):
+            self.cycle(portal, courses=[self.course, second])
+
+        self.assertEqual(self.state_path.read_bytes(), baseline_bytes)
+        self.assertEqual(self.notifier.notes, [])
+        self.assertFalse(self.data_dir.joinpath(".anomaly_alerted").exists())
+
+    # -- store discipline ----------------------------------------------------
+    def test_baseline_is_loaded_before_the_portal_is_scanned(self) -> None:
+        self.store.save_state(_make_state(marks_count=2, res_count=1, course_count=1))
+        order: list = []
+        orig_load = RuntimeStore.load_state
+
+        def _spy_load(store_self):
+            order.append("load_state")
+            return orig_load(store_self)
+
+        def _spy_scan(*args, **kwargs):
+            order.append("scan_all_courses")
+            return tracker.ScanResult(
+                state=_make_state(marks_count=3, res_count=1, course_count=1)
+            )
+
+        with mock.patch.object(RuntimeStore, "load_state", _spy_load), mock.patch.object(
+            tracker, "scan_all_courses", side_effect=_spy_scan
+        ):
             res = run_cycle(
-                portal_client(portal),
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
+                None,  # type: ignore[arg-type]
+                [self.course],
+                self.store,
+                CycleOptions(base_url=self.BASE),
+                [],
             )
-            self.assertTrue(res.saved)
-            self.assertIsNone(res.anomaly)
-            self.assertEqual([n.event for n in notifier.notes], ["marks_removed"])
 
+        self.assertTrue(res.saved)
+        self.assertEqual(order, ["load_state", "scan_all_courses"])
+
+    def test_cycle_options_and_legacy_kwargs_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(TypeError):
+            run_cycle(
+                None,  # type: ignore[arg-type]
+                [self.course],
+                self.store,
+                CycleOptions(base_url=self.BASE),
+                [],
+                base_url=self.BASE,
+            )
+        with self.assertRaises(TypeError):
+            run_cycle(None, [self.course], self.store, None, [], base_url=self.BASE,
+                      not_a_real_option=1)
+
+    def test_legacy_keyword_call_style_still_works(self) -> None:
+        res = run_cycle(
+            portal_client(self.portal(marks=[])),
+            [self.course],
+            state_path=self.state_path,
+            base_url=self.BASE,
+            track_announcements=False,
+            notifiers=[self.notifier],
+            semester="Fall 2026",
+        )
+        self.assertTrue(res.saved)
+        self.assertEqual(self.events(), ["baseline_saved"])
+        self.assertTrue(self.state_path.exists())
+
+
+class ReliabilityAndBugfixTests(unittest.TestCase):
     def test_bug3_session_expiry_resumes_on_env_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / ".env"
@@ -790,55 +944,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
         self.assertIn("Quizzes:100", scan.state["courses"]["100001"]["marks"])
         self.assertEqual(scan.state["courses"]["100002"], prev_state["courses"]["100002"])
 
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "state.json"
-            save_state(state_path, prev_state)
-            notifier = _RecordingNotifier()
-            res = run_cycle(
-                portal_client(_portal(
-                    failures={"/Courses/SetCourse/100002": PortalHttpError("HTTP 500")}
-                )),
-                [c1, c2],
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertFalse(res.saved)
-            self.assertEqual(load_state(state_path), prev_state)
-            self.assertEqual([n.event for n in notifier.notes], ["scan_anomaly"])
 
-        # Mid-scan session expiry: course 1 is preserved, course 2 carries forward, and
-        # run_cycle raises without touching the baseline.
-        expire_portal = _portal(
-            failures={"/Courses/SetCourse/100002": StubResponse(
-                "", status=302, headers={"Location": "/Login/Index"}
-            )}
-        )
-        scan_exp = scan_all_courses(
-            portal_client(expire_portal), [c1, c2], previous_state=prev_state
-        )
-        self.assertTrue(scan_exp.session_expired)
-        self.assertIn("Quizzes:100", scan_exp.state["courses"]["100001"]["marks"])
-        self.assertEqual(scan_exp.state["courses"]["100002"], prev_state["courses"]["100002"])
-
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "state.json"
-            save_state(state_path, prev_state)
-            with self.assertRaises(SessionExpiredError):
-                run_cycle(
-                    portal_client(_portal(
-                        failures={"/Courses/SetCourse/100002": StubResponse(
-                            "", status=302, headers={"Location": "/Login/Index"}
-                        )}
-                    )),
-                    [c1, c2],
-                    state_path=state_path,
-                    base_url="https://sis.comsats.edu.pk",
-                    track_announcements=False,
-                    notifiers=[],
-                )
-            self.assertEqual(load_state(state_path), prev_state)
 
     def test_bug8_active_course_verification_prevents_attribution_drift(self) -> None:
         html_csc325 = _auth_shell(
@@ -882,233 +988,6 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertIn("[ERROR] Scan failed:", buf.getvalue())
             self.assertIn("502", buf.getvalue())
-
-    def test_bug10_load_before_scan_and_state_locking(self) -> None:
-        """The baseline is read under the lock before the portal is scanned."""
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "state.json"
-            baseline = _make_state(marks_count=2, res_count=1, course_count=1)
-            save_state(state_path, baseline)
-
-            call_order: list[str] = []
-            orig_load = RuntimeStore.load_state
-
-            def _spy_load(store_self):
-                call_order.append("load_state")
-                return orig_load(store_self)
-
-            def _spy_scan(*args, **kwargs):
-                call_order.append("scan_all_courses")
-                return tracker.ScanResult(state=_make_state(marks_count=3, res_count=1, course_count=1))
-
-            with mock.patch.object(
-                RuntimeStore, "load_state", _spy_load
-            ), mock.patch.object(
-                tracker, "scan_all_courses", side_effect=_spy_scan
-            ):
-                res = run_cycle(
-                    client=None,  # type: ignore[arg-type]
-                    courses=[Course(course_id="100001", code="CSC101", name="Course 1")],
-                    state_path=state_path,
-                    base_url="https://sis.comsats.edu.pk",
-                    track_announcements=False,
-                    notifiers=[],
-                )
-
-            self.assertTrue(res.saved)
-            # The baseline is read before the portal is scanned, inside the lock.
-            self.assertEqual(call_order, ["load_state", "scan_all_courses"])
-
-    def test_anomaly_dedup_recovery_and_diagnostics(self) -> None:
-        from sis_client import MarkItem, ResourceItem
-
-        marks_empty_html = (
-            '<html><body class="sis-portal-body">'
-            '<header class="sis-portal-header">'
-            '<a id="Dash_Board" href="/Courses/Index">Dashboard</a>'
-            '<div class="page_title_container"><h3>Course 1</h3>'
-            "<h5>Course Code : CSC101 &nbsp;&nbsp; Credit Hours : 3</h5></div>"
-            '<form id="synopsisForm" method="post" action="https://ww5.comsats.edu.pk/efs/StudentLogin.aspx">'
-            '<input name="uid" hidden type="text" value="CIIT/TEST-001/ISB">'
-            '<input name="pwd" hidden type="password" value="SUPER_SECRET_PWD">'
-            "</form></header>"
-            '<div class="main_body"><div class="content_area">'
-            '<div class="sis-marks-summary"><p class="sis-marks-empty">No marks available.</p>'
-            '<input type="password" value="INNER_SECRET">'
-            "</div></div></div>"
-            '<footer class="sis-portal-footer"><p>Footer</p></footer>'
-            "</body></html>"
-        )
-
-        # Verify scrubbing directly and against local real snapshots if present
-        scrubbed = scrub_diagnostic_html(marks_empty_html)
-        self.assertNotIn("SUPER_SECRET_PWD", scrubbed)
-        self.assertNotIn("synopsisForm", scrubbed)
-        self.assertNotIn("INNER_SECRET", scrubbed)
-        self.assertIn("<!-- password input redacted -->", scrubbed)
-        self.assertIn("No marks available.", extract_diagnostic_text(marks_empty_html))
-
-        snap_marks = ROOT / "snapshots" / "marks_summary.html"
-        if snap_marks.exists():
-            raw_snap = snap_marks.read_text(encoding="utf-8", errors="replace")
-            scrubbed_snap = scrub_diagnostic_html(raw_snap)
-            self.assertNotIn("synopsisForm", scrubbed_snap)
-            self.assertNotIn('type=\'password\'', scrubbed_snap.lower())
-            self.assertNotIn('type="password"', scrubbed_snap.lower())
-
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "data" / "state.json"
-            baseline = _make_state(marks_count=6, res_count=2, course_count=1)
-            save_state(state_path, baseline)
-            courses = [Course(course_id="100001", code="CSC101", name="Course 1")]
-
-            # A real client over a simulator whose marks page we swap out between cycles.
-            portal = SimulatedPortal(
-                courses=courses,
-                marks={"100001": []},
-                marks_html={"100001": marks_empty_html},
-                set_cookie_on_switch="ARRAffinity",
-                resources={
-                    "100001": [
-                        ResourceItem(
-                            key=f"res-0_{i}",
-                            title=f"Slide {i}",
-                            material_type="Slides",
-                            date_text="01 Nov 2026",
-                            size="1.0 MB",
-                            href=f"/LearningResources/Download/res-0_{i}",
-                        )
-                        for i in range(2)
-                    ]
-                },
-            )
-
-            def _client() -> SisClient:
-                return portal_client(portal)
-
-            def _set_mode(mode: str) -> None:
-                if mode == "zero_marks":
-                    portal.marks_html["100001"] = marks_empty_html
-                else:
-                    portal.marks_html.pop("100001", None)
-                portal.marks["100001"] = (
-                    [
-                        MarkItem(
-                            key=f"Quizzes:0_{i}",
-                            section="Quizzes",
-                            title=f"Quiz{i}",
-                            obtained="8.0",
-                            total="10.0",
-                            date_text="01 Nov 2026",
-                        )
-                        for i in range(7)
-                    ]
-                    if mode == "recovered"
-                    else []
-                )
-                if mode == "partial_error":
-                    portal.failures["/MarksSummary/Index"] = PortalHttpError("503 Unavailable")
-                else:
-                    portal.failures.pop("/MarksSummary/Index", None)
-
-            # Dry-run anomaly should not persist marker or diagnostics files
-            dry_notifier = _RecordingNotifier()
-            dry_res = run_cycle(
-                _client(),
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[dry_notifier],
-                dry_run=True,
-            )
-            self.assertFalse(dry_res.saved)
-            self.assertIsNotNone(dry_res.anomaly)
-            self.assertFalse(state_path.with_name(".anomaly_alerted").exists())
-            self.assertFalse(state_path.with_name("last_anomaly.json").exists())
-
-            # 1st real zero-marks anomaly sends 1 alert and writes diagnostics
-            notifier = _RecordingNotifier()
-            res1 = run_cycle(
-                _client(),
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertFalse(res1.saved)
-            self.assertEqual([n.event for n in res1.notifications], ["scan_anomaly"])
-            self.assertEqual([n.event for n in notifier.notes], ["scan_anomaly"])
-            self.assertIn("Scanned: 1 courses, 0 marks, 2 resources", notifier.notes[0].message)
-            self.assertEqual(notifier.notes[0].data["set_cookie_names"], ["ARRAffinity"])  # type: ignore[index]
-
-            diag = json.loads(state_path.with_name("last_anomaly.json").read_text(encoding="utf-8"))
-            self.assertEqual(diag["occurrence"], 1)
-            self.assertEqual(diag["scanned_totals"], {"courses": 1, "marks": 0, "resources": 2})
-            self.assertEqual(diag["baseline_totals"], {"courses": 1, "marks": 6, "resources": 2})
-            self.assertEqual(diag["set_cookie_names"], ["ARRAffinity"])
-            self.assertIn("No marks available.", diag["sample_marks_preview"])
-            self.assertNotIn("SUPER_SECRET_PWD", json.dumps(diag))
-
-            diag_html = state_path.with_name("last_anomaly_marks.html").read_text(encoding="utf-8")
-            self.assertNotIn("SUPER_SECRET_PWD", diag_html)
-            self.assertNotIn("synopsisForm", diag_html)
-            self.assertNotIn("INNER_SECRET", diag_html)
-            self.assertIn("No marks available.", diag_html)
-
-            # 2nd identical zero-marks anomaly is deduplicated (no notification)
-            res2 = run_cycle(
-                _client(),
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertFalse(res2.saved)
-            self.assertEqual(res2.notifications, [])
-            self.assertEqual([n.event for n in notifier.notes], ["scan_anomaly"])
-            marker2 = json.loads(state_path.with_name(".anomaly_alerted").read_text(encoding="utf-8"))
-            self.assertEqual(marker2["count"], 2)
-
-            # Different anomaly reason sends a new alert and resets count to 1
-            _set_mode("partial_error")
-            res3 = run_cycle(
-                _client(),
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertFalse(res3.saved)
-            self.assertEqual([n.event for n in notifier.notes], ["scan_anomaly", "scan_anomaly"])
-            marker3 = json.loads(state_path.with_name(".anomaly_alerted").read_text(encoding="utf-8"))
-            self.assertEqual(marker3["count"], 1)
-
-            # Recovery scan with 1 new mark clears marker, saves state, and sends both recovery + marks_updated
-            _set_mode("recovered")
-            res4 = run_cycle(
-                _client(),
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertTrue(res4.saved)
-            self.assertIsNone(res4.anomaly)
-            self.assertFalse(state_path.with_name(".anomaly_alerted").exists())
-            self.assertEqual([n.event for n in res4.notifications], ["scan_recovered", "marks_updated"])
-            self.assertEqual(
-                [n.event for n in notifier.notes],
-                ["scan_anomaly", "scan_anomaly", "scan_recovered", "marks_updated"],
-            )
-            saved_after = load_state(state_path)
-            self.assertIsNotNone(saved_after)
-            assert saved_after is not None
-            self.assertEqual(len(saved_after["courses"]["100001"]["marks"]), 7)
 
     def test_daemon_heartbeat_keeps_anomaly_across_keepalive_and_same_cookie_env_wakeup(self) -> None:
         # Part A: Heartbeat keeps status="anomaly" across keep-alive ticks
@@ -1496,107 +1375,11 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                 bool(parse_semester(snap_courses.read_text(encoding="utf-8", errors="replace")))
             )
 
+        # In-cycle rollover / retake / legacy-upgrade scenarios are covered end-to-end by
+        # CycleIntegrationTests and purely by tests/test_snapshot_transition.py; what stays
+        # here is the CLI contract around --reset-state.
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "data" / "state.json"
-            fall_state = _make_state(marks_count=6, res_count=2, course_count=2)
-            fall_state["semester"] = "Fall 2026"
-            save_state(state_path, fall_state)
-
-            # Semester labels now come from the caller (tracker passes
-            # ``cfg.semester or roster.semester``), so these cycles pass it explicitly.
-            def _rollover_portal(
-                semester: str, marks: list, courses: list
-            ) -> SimulatedPortal:
-                return SimulatedPortal(
-                    courses=courses,
-                    semester=semester,
-                    marks={c.course_id: list(marks) for c in courses},
-                )
-
-            # 1. Same semester (Fall 2026 -> Fall 2026) with 6 -> 0 marks STILL blocked as anomaly
-            notifier = _RecordingNotifier()
-            c_same = [
-                Course(course_id="100001", code="CSC101", name="Course 1"),
-                Course(course_id="100002", code="CSC102", name="Course 2"),
-            ]
-            res_anom = run_cycle(
-                portal_client(_rollover_portal("Fall 2026", [], c_same)),
-                c_same,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-                semester="Fall 2026",
-            )
-            self.assertFalse(res_anom.saved)
-            self.assertIsNotNone(res_anom.anomaly)
-
-            # 2. New semester (Fall 2026 -> Spring 2027) WITH retaken course 100001 and 0 marks rolls over
-            notifier.notes.clear()
-            c_spring = [
-                Course(course_id="100001", code="CSC101", name="Course 1 (Retake)"),
-                Course(course_id="200003", code="CSC203", name="Course 3"),
-            ]
-            res_roll = run_cycle(
-                portal_client(_rollover_portal("Spring 2027", [], c_spring)),
-                c_spring,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-                semester="Spring 2027",
-            )
-            self.assertTrue(res_roll.saved)
-            self.assertIsNone(res_roll.anomaly)
-            events = [n.event for n in notifier.notes]
-            self.assertIn("semester_rollover", events)
-            self.assertNotIn("course_removed", events)
-            saved_spring = load_state(state_path)
-            assert saved_spring is not None
-            self.assertEqual(saved_spring.get("semester"), "Spring 2027")
-            self.assertEqual(
-                json.loads(state_path.with_name("state.json.bak").read_text(encoding="utf-8")).get("semester"),
-                "Fall 2026",
-            )
-
-            # 3. Legacy state without "semester": same courses upgrade cleanly without rollover;
-            #    disjoint courses roll over cleanly even with 0 marks
-            legacy_state = _make_state(marks_count=6, res_count=1, course_count=1)
-            self.assertNotIn("semester", legacy_state)
-            save_state(state_path, legacy_state)
-            legacy_same_marks = [
-                MarkItem(f"Quizzes:0_{i}", "Quizzes", f"Quiz{i}", "8.0", "10.0", "01 Nov")
-                for i in range(6)
-            ]
-            legacy_course = [Course(course_id="100001", code="CSC101", name="Course 1")]
-            res_legacy_same = run_cycle(
-                portal_client(_rollover_portal("Fall 2026", legacy_same_marks, legacy_course)),
-                legacy_course,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[_RecordingNotifier()],
-                semester="Fall 2026",
-            )
-            self.assertTrue(res_legacy_same.saved)
-            self.assertEqual((load_state(state_path) or {}).get("semester"), "Fall 2026")
-            self.assertIsNone(detect_semester_rollover(legacy_state, load_state(state_path) or {}))
-
-            save_state(state_path, legacy_state)
-            disjoint_notifier = _RecordingNotifier()
-            new_course = [Course(course_id="999001", code="CSC499", name="New Term Course")]
-            res_legacy_disjoint = run_cycle(
-                portal_client(_rollover_portal("", [], new_course)),
-                new_course,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[disjoint_notifier],
-                semester="",
-            )
-            self.assertTrue(res_legacy_disjoint.saved)
-            self.assertEqual([n.event for n in disjoint_notifier.notes], ["semester_rollover"])
-
             # 4. --once --reset-state overrides same-semester >50% drop, plus SIS_SEMESTER override;
             #    --reset-state without --once returns 1
             env_path = Path(tmp) / ".env"

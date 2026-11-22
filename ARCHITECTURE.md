@@ -11,14 +11,16 @@ Zero external packages — **Python 3.9+ standard library only** (`urllib`, `htm
 | File | Role |
 | :--- | :--- |
 | `config.py` | **Leaf** config module (no project imports): `.env` byte decoding (UTF-8/16/32 BOMs + cp1252 fallback), text parsing (`export`, quotes/escapes, inline `#`), `SIS_SESSION_ID` normalization + placeholder rejection, secret-free missing-session diagnostics, process-env vs. file precedence with per-key provenance, single-read `.env` fingerprint watching, path resolution (`ENV_FILE`/`STATE_FILE`/`HEARTBEAT_FILE`), typed `TrackerConfig`, and the one canonical `NOTIFIER_TIMEOUT` rule. Every entry point takes an optional `environ` mapping. |
-| `tracker.py` | Main daemon loop, snapshot validation, diffing, watchdog timeouts, and the CLI (`--once`, `--healthcheck`, ...). Imports env/config/watch behaviour from `config.py`, consumes only *typed* Portal results (never raw HTML), and persists everything through `RuntimeStore`. |
+| `tracker.py` | **Orchestration / CLI** — daemon loop, warm-up + keep-alive cadence, watchdog timeouts, and the CLI (`--once`, `--dry-run`, `--reset-state`, `--test-notify`, `--healthcheck`). Owns `scan_all_courses()`, `run_cycle()`, `run_with_timeout()`, `run_daemon()`, and `main()`; consumes only *typed* Portal results (never raw HTML) and persists everything through `RuntimeStore`. `ScanResult`/`CycleResult` and every policy decision come from `snapshot_transition`. |
+| `snapshot_transition.py` | **Snapshot Transition (pure)** — zero network/filesystem/locking/logging/dispatch. Owns `compute_transition(previous_state, scan, prior_anomaly, now, options) -> TransitionOutcome` plus the policy primitives `normalize_semester()`, `detect_semester_rollover()`, `validate_snapshot()`, `diff_states()`, `summarize_totals()` and the carrier dataclasses `ScanResult`/`CycleResult`/`TransitionOptions`/`TransitionOutcome`/`AnomalyAction`. Computes rollover once and totals once per snapshot, and returns the state to commit, the anomaly action, and the ordered notifications. |
 | `runtime_store.py` | **Runtime Store** — single owner of all eight `data/` runtime files: exclusive `fcntl.flock` locking, atomic state saves with rolling backups + corrupt fallback, heartbeat writing/`--healthcheck` evaluation, SHA-256 session-expiry marker, anomaly marker, and scrubbed anomaly diagnostics. One atomic temp-file+`os.replace` writer with guaranteed temp cleanup. |
 | `sis_client.py` | **Portal module** — HTTP client (`SisClient`) behind a single injectable HTTP transport adapter (`PortalTransport`, production `UrllibTransport`), with `ASP.NET_SessionId` + authenticated `Set-Cookie` handling, explicit `reconfigure()` for connection settings, login/expiry detection, and two typed operations that own the ASP.NET quirks: `fetch_roster() -> RosterResult` and `fetch_course_snapshot(course, include_announcements) -> CourseSnapshotResult`. Diagnostic HTML is scrubbed *inside* the module before it is returned. |
 | `notifiers.py` | Pluggable push backends (`ConsoleNotifier`, `NtfyNotifier`, `WebhookNotifier`, `DiscordNotifier`, `TelegramNotifier`) with threaded, timeout-bounded `dispatch_all`. `build_notifiers()` takes the unified timeout from `config.py`. |
 | `probe.py` | Standalone diagnostic CLI (respects `ENV_FILE`) to inspect raw portal HTML endpoints and test keep-alive timing. Imports env loading + session normalization from `config`, never from `tracker`. |
-| `Dockerfile` | `python:3.13-slim` container running `python3 -u tracker.py` with `HEALTHCHECK` calling `python3 tracker.py --healthcheck`. Copies every top-level module (`config.py`, `sis_client.py`, `notifiers.py`, `runtime_store.py`, `tracker.py`, `probe.py`). |
+| `Dockerfile` | `python:3.13-slim` container running `python3 -u tracker.py` with `HEALTHCHECK` calling `python3 tracker.py --healthcheck`. Copies every top-level module (`config.py`, `sis_client.py`, `notifiers.py`, `runtime_store.py`, `snapshot_transition.py`, `tracker.py`, `probe.py`). |
 | `docker-compose.yml` | Runs `comsats-portal-tracker` with `restart: unless-stopped`, directory-mounted config (`./:/app/config:ro`), and persistent `./data:/app/data`. |
-| `tests/test_tracker.py` | Offline unit tests (`python3 -m unittest discover -s tests -v`) covering parsers, diffing, real HTML snapshots, daemon behaviour, and every failure fallback. |
+| `tests/test_tracker.py` | Offline unit tests (`python3 -m unittest discover -s tests -v`) covering parsers, real HTML snapshots, daemon behaviour, and every failure fallback, plus `CycleIntegrationTests` — full `run_cycle` cycles wired as real `SisClient` -> `SimulatedPortal` -> real `RuntimeStore` (temp dir) -> real `snapshot_transition` -> recording notifier. |
+| `tests/test_snapshot_transition.py` | Zero-seam tests for the pure Snapshot Transition module: every validation/rollover/dedupe/recovery/diff rule with plain Python in and out, plus "rollover once" and "totals once" proofs via counting dict subclasses. No filesystem, no network, no mocks. |
 | `tests/test_config.py` | Offline tests for the leaf Config module: encodings, parsing, session normalization, precedence/provenance, diagnostics, unified `NOTIFIER_TIMEOUT`, single-read watching, notifier-change detection, and prober loading — all via injected `environ` mappings and real temp `.env` files. |
 | `tests/test_runtime_store.py` | Behavioral tests for the Runtime Store against real temp dirs: real `flock` contention/timeout, atomic writes + temp cleanup on simulated disk failure, backup rotation/recovery, markers, diagnostics, bound heartbeat, healthcheck. |
 | `tests/test_portal.py` | Portal transport-seam tests: every `SisClient` protocol behavior (redirect safety, cookie lifecycle, login detection, active-course verification, cancellation, header sanitization, error translation, explicit reconfiguration) driven through one stub transport adapter, plus the typed `fetch_roster()` / `fetch_course_snapshot()` contract and behavioral proof that password inputs, `synopsisForm`, and session-cookie *values* never cross the seam. |
@@ -57,8 +59,11 @@ The COMSATS ASP.NET portal kills idle sessions after ~4–5 minutes. Because scr
  │      │    run_cycle() under RuntimeStore.lock() (state.json.lock):     │
  │      │      store.load_state() -> scan_all_courses()                    │
  │      │        (per course: client.fetch_course_snapshot)                │
- │      │      -> validate_snapshot() -> store.save_state() (.bak)        │
- │      │      -> diff_states()                                           │
+ │      │      -> store.load_anomaly()                                    │
+ │      │      -> compute_transition(...)   # pure, no I/O                │
+ │      │           totals x1/snapshot, rollover x1                       │
+ │      │      -> ONE tail: cancel -> dry-run gate -> store commit        │
+ │      │           (save_state / save_anomaly+diag / clear_anomaly)      │
  │      │      -> dispatch_all() (bounded by NOTIFIER_TIMEOUT)            │
  │      └─ Else: Keep-alive OK                                            │
  │                                                                        │
@@ -150,14 +155,69 @@ Future sessions editing `sis_client.py` should keep these portal behaviors in mi
 
 ---
 
+## 3a. Snapshot Transition (pure policy)
+
+`snapshot_transition.py` is the single place that decides what a completed scan means. It
+performs **no** I/O: no network, no filesystem, no locking, no logging, no notification
+dispatch. `tracker.run_cycle()` loads the baseline and the prior anomaly marker, hands
+them in, and then executes the returned plan.
+
+```python
+compute_transition(previous_state, scan, prior_anomaly, now, options) -> TransitionOutcome
+
+TransitionOptions(base_url, track_announcements=False, reset_state=False, notify_anomaly=True)
+
+TransitionOutcome(
+    kind,               # baseline_saved | semester_rollover | diff_applied | anomaly_rejected
+    persist_state,      # whether the caller must commit `state`
+    state,              # the finalized snapshot dict to write (None when rejected)
+    anomaly_action,     # AnomalyAction(kind="none"|"record"|"clear", marker, diagnostics)
+    notifications,      # ordered: scan_recovered first, then baseline/rollover/diff
+    baseline_totals,    # (courses, marks, resources) of the previous baseline
+    scanned_totals,     # (courses, marks, resources) of this scan
+    summary,            # status metadata the daemon prints / maps into heartbeat detail
+)
+```
+
+Decision order (each step can only short-circuit what follows):
+
+1. **Reject** — session expiry mid-scan, partial scan, 0-course scan, `>0 -> 0` mark drop,
+   or a `<50%` drop when the baseline had `>=3` courses / `>=5` marks / `>=5` resources.
+   Rollover beats every drop rule; `reset_state` beats every drop rule.
+2. **Recover** — if an anomaly marker was present and the scan is accepted, one
+   `scan_recovered` notification is placed *first* and the marker is scheduled for clearing
+   (`notify_anomaly=False` suppresses the notification but still clears the marker).
+3. **Classify** — `baseline_saved` (no previous state, or `reset_state`),
+   `semester_rollover` (differing normalized label, or disjoint non-empty course IDs), or
+   `diff_applied` (the normal path, which also carries the previous semester label forward
+   when the scan omitted one).
+
+Two computations happen **once per transition, never repeated**: `detect_semester_rollover()`
+is evaluated a single time and fed into the rejection gate, and `summarize_totals()` runs
+once for the baseline and once for the new snapshot. The pre-extraction code re-evaluated
+rollover inside `validate_snapshot()` on every call and recomputed totals seven times.
+`tests/test_snapshot_transition.py::OnceOnlyComputationTests` locks this in with counting
+dict subclasses rather than mocks.
+
+Anomaly deduplication is part of the outcome: an identical `reason` key increments
+`occurrence`, keeps the original `first_seen`, refreshes `last_seen`, refreshes the
+diagnostics payload, and suppresses the notification; a different reason restarts at 1 and
+notifies (unless `notify_anomaly` is off).
+
+The two policy primitives `validate_snapshot()` and `detect_semester_rollover()` remain
+directly callable for callers that only hold a snapshot, and `diff_states()` remains the
+public diff entry point — all three live here now, not in `tracker.py`.
+
+---
+
 ## 4. Fallbacks, Guardrails & Failure Recovery
 
 | Failure Mode | What Happens (Safeguard / Fallback) |
 | :--- | :--- |
-| **One course fails mid-scan** (`PortalHttpError`, `PortalParseError`, `CourseMismatchError`) | `scan_all_courses()` calls `client.fetch_course_snapshot(course, ...)` per course; a per-course failure is logged `[WARN]` with that course's `set_cookie_names`, the course's entry is carried forward from `previous_state`, the remaining courses keep scanning, and `partial=True` is set. `validate_snapshot()` then refuses to overwrite `state.json` and triggers deduplicated `scan_anomaly` handling. |
+| **One course fails mid-scan** (`PortalHttpError`, `PortalParseError`, `CourseMismatchError`) | `scan_all_courses()` calls `client.fetch_course_snapshot(course, ...)` per course; a per-course failure is logged `[WARN]` with that course's `set_cookie_names`, the course's entry is carried forward from `previous_state`, the remaining courses keep scanning, and `partial=True` is set. `compute_transition()` then returns `anomaly_rejected`, so `run_cycle()` refuses to overwrite `state.json` and triggers deduplicated `scan_anomaly` handling. |
 | **Session expires mid-scan** (`SessionExpiredError`) | `scan_all_courses()` stops making further course requests immediately, preserves already-fetched + carried-forward courses in `ScanResult`, and `run_cycle()` raises `SessionExpiredError` **without** touching `state.json`. The expiry's `set_cookie_names` (widened with names from earlier successful hops in the same snapshot) still reach `ScanResult.set_cookie_names`. |
-| **Degenerate / empty scan, semester rollover, & anomaly alert spam** (0 courses, `>0 -> 0` marks, or `>50%` drop when baseline has `>=3` courses or `>=5` marks/resources) | The semester label comes from `fetch_roster().semester` (or the `SIS_SEMESTER` override, `cfg.semester or roster.semester`) and is recorded in `state.json`. When the semester changes (`detect_semester_rollover()`, including when retaken courses share course IDs across semesters, or for legacy `state.json` files with 0% course ID overlap), `run_cycle()` backs up the old semester, saves the new baseline, and emits one `semester_rollover` notification. Within the same semester, `validate_snapshot()` rejects anomalous drops (unless `--once --reset-state` is passed), persists the anomaly key/count in `data/.anomaly_alerted` (sending **one** `scan_anomaly` alert per unique anomaly reason until recovery), writes diagnostics to `data/last_anomaly.json` and `data/last_anomaly_marks.html` from the snapshot's **already-scrubbed** `diagnostic_html` / `diagnostic_preview` (the Portal module stripped `synopsisForm` and password inputs before this point), and sends a `scan_recovered` alert once normal scans resume. Keep-alives preserve `"status": "anomaly"` in `heartbeat.json` until a full scan recovers. |
-| **Silent deletions on the portal** | `diff_states()` compares both directions (`new - old` and `old - new`), emitting `marks_removed`, `resource_removed`, `announcement_removed`, and `course_removed`. Legitimate small removals (e.g. `2 -> 1` marks) pass plausibility checks, update state, and notify. |
+| **Degenerate / empty scan, semester rollover, & anomaly alert spam** (0 courses, `>0 -> 0` marks, or `>50%` drop when baseline has `>=3` courses or `>=5` marks/resources) | The semester label comes from `fetch_roster().semester` (or the `SIS_SEMESTER` override, `cfg.semester or roster.semester`) and is recorded in `state.json`. When the semester changes (`compute_transition()` -> `semester_rollover`, including when retaken courses share course IDs across semesters, or for legacy `state.json` files with 0% course ID overlap), `run_cycle()` backs up the old semester, saves the new baseline, and emits one `semester_rollover` notification. Within the same semester, `compute_transition()` returns `anomaly_rejected` for anomalous drops (unless `--once --reset-state` is passed), persists the anomaly key/count in `data/.anomaly_alerted` (sending **one** `scan_anomaly` alert per unique anomaly reason until recovery), writes diagnostics to `data/last_anomaly.json` and `data/last_anomaly_marks.html` from the snapshot's **already-scrubbed** `diagnostic_html` / `diagnostic_preview` (the Portal module stripped `synopsisForm` and password inputs before this point), and sends a `scan_recovered` alert once normal scans resume — always ordered ahead of that scan's baseline/rollover/diff notifications. Keep-alives preserve `"status": "anomaly"` in `heartbeat.json` until a full scan recovers. |
+| **Silent deletions on the portal** | `snapshot_transition.diff_states()` compares both directions (`new - old` and `old - new`), emitting `marks_removed`, `resource_removed`, `announcement_removed`, and `course_removed`. Legitimate small removals (e.g. `2 -> 1` marks) pass plausibility checks, update state, and notify. |
 | **Corrupt `state.json` or concurrent `--once` + daemon race** | `RuntimeStore.lock()` acquires an exclusive `fcntl.flock` on `data/state.json.lock` **before** `load_state()` so old state is always read prior to scanning. `save_state()` writes a PID/thread-scoped temp file (cleaning up temps on any error), skips rotating `.bak*` if `state.json` on disk is corrupt JSON, and otherwise atomically rotates `state.json.bak`..`.bak.5` before `os.replace`ing `state.json`. If `state.json` is corrupt JSON, `load_state()` falls back across `state.json.bak` through `state.json.bak.N`. |
 | **Session expiry & restart alert spam** | `run_daemon()` hashes the expired cookie into `data/.session_alerted` so it sends **one** `session_expired` notification (even across container restarts while still expired). It polls `.env` every `EXPIRED_POLL_INTERVAL` (`15s`) and exits with code `1` once `SESSION_EXPIRED_TIMEOUT` (`300s`) elapses so Docker's `restart: unless-stopped` recycles the container. Any `.env` save while waiting immediately re-tests the session, and any successful `fetch_roster()` clears `.session_alerted` immediately (even if the subsequent full scan hits an anomaly). |
 | **`.env` edits with inode replacement, BOM/shell formats, or `env_file:` overrides** | `docker-compose.yml` mounts `./:/app/config:ro` (`ENV_FILE=/app/config/.env`) instead of a single-file `.env` mount, so atomic-save editors (`vim`, VS Code, `sed -i`) are visible immediately. `config.py` supports UTF-8/UTF-16/UTF-32 BOMs (with cp1252 fallback), POSIX `export KEY=VALUE` lines, single/double quotes with escape handling, inline `#` comments (both unquoted and after quoted values), and `Cookie:` / `ASP.NET_SessionId=` normalization (`normalize_session_id()` also rejects the placeholder examples). `load_env_with_sources()` lets non-empty `.env` keys override the environment mapping (falling back to it if `.env` leaves a key blank) and records the winning source per key. `config.EnvWatcher.check()` reads `.env` **at most once per check** and reuses those bytes for both the fingerprint (existence, inode, mtime, size, SHA-256) and the newly parsed `TrackerConfig`, returning change status, description, and config together. Every config entry point takes an optional `environ` mapping (defaulting to the process environment) so callers and tests never mutate global environment state. |
@@ -207,6 +267,10 @@ All runtime files live under `./data/` (mounted to `/app/data` in Docker) and ar
   ```bash
   python3 -m unittest discover -s tests -v
   ```
+- **Change snapshot policy in `snapshot_transition.py`, not `tracker.py`**: validation,
+  rollover, anomaly dedupe/recovery, and diffing all live in that pure module, which must
+  never import `tracker`, `runtime_store`, or `os`/`io`/`json`. `run_cycle()` only loads,
+  calls `compute_transition()`, commits the returned plan, and dispatches.
 - **Add configuration by editing `config.py`, not `tracker.py`**: env decoding, parsing, session
   normalization, source provenance, path resolution and typed `TrackerConfig` all live in the leaf
   `config.py`. Keeping it leaf (no imports of `tracker`, `probe`, `sis_client` or `notifiers`) is

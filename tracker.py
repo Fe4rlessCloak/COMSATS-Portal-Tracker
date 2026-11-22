@@ -20,11 +20,10 @@ import signal
 import sys
 import threading
 import time
-import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, TypeVar
 
 from config import (
     EnvWatcher,
@@ -38,6 +37,8 @@ from config import (
 )
 from notifiers import BaseNotifier, Notification, build_notifiers, dispatch_all
 from runtime_store import RuntimeStore, StateLockError
+# DEFAULT_BASE_URL / DEFAULT_USER_AGENT stay re-exported here: probe.py-era callers and
+# tests/test_config.py reach for them through this module.
 from sis_client import (
     Course,
     DEFAULT_BASE_URL,
@@ -649,17 +650,18 @@ def run_daemon(
                     result = run_cycle(
                         client,
                         courses,
-                        state_path=state_path,
-                        base_url=cfg.base_url,
-                        track_announcements=cfg.track_announcements,
-                        notifiers=notifiers,
-                        dry_run=dry_run,
-                        store=store,
-                        max_backups=cfg.max_state_backups,
-                        notifier_timeout=cfg.notifier_timeout,
-                        cancel_event=cancel_event,
-                        on_progress=_touch_scan_heartbeat,
-                        semester=cfg.semester or roster.semester,
+                        store,
+                        CycleOptions(
+                            base_url=cfg.base_url,
+                            track_announcements=cfg.track_announcements,
+                            semester=cfg.semester or roster.semester,
+                            dry_run=dry_run,
+                            max_backups=cfg.max_state_backups,
+                            notifier_timeout=cfg.notifier_timeout,
+                            cancel_event=cancel_event,
+                            on_progress=_touch_scan_heartbeat,
+                        ),
+                        notifiers,
                     )
                     last_fetch = time.monotonic()
                     if result.anomaly:
@@ -839,17 +841,18 @@ def main(environ: Optional[Mapping[str, str]] = None) -> int:
                 return run_cycle(
                     client,
                     roster.courses,
-                    state_path=state_path,
-                    base_url=cfg.base_url,
-                    track_announcements=cfg.track_announcements,
-                    notifiers=notifiers,
-                    dry_run=args.dry_run,
-                    store=RuntimeStore(state_path, max_backups=cfg.max_state_backups),
-                    max_backups=cfg.max_state_backups,
-                    notifier_timeout=cfg.notifier_timeout,
-                    cancel_event=cancel_event,
-                    semester=cfg.semester or roster.semester,
-                    reset_state=args.reset_state,
+                    RuntimeStore(state_path, max_backups=cfg.max_state_backups),
+                    CycleOptions(
+                        base_url=cfg.base_url,
+                        track_announcements=cfg.track_announcements,
+                        semester=cfg.semester or roster.semester,
+                        reset_state=args.reset_state,
+                        dry_run=args.dry_run,
+                        max_backups=cfg.max_state_backups,
+                        notifier_timeout=cfg.notifier_timeout,
+                        cancel_event=cancel_event,
+                    ),
+                    notifiers,
                 )
 
             result = run_with_timeout(
