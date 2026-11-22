@@ -1478,10 +1478,15 @@ class SisClient:
         html = self.get_html("/Courses")
         self.last_semester = parse_semester(html)
         if not has_courses_page_marker(html):
-            raise PortalParseError("Dashboard response missing expected courses table markup.")
+            raise PortalParseError(
+                "Dashboard response missing expected courses table markup.",
+                set_cookie_names=self.last_set_cookie_names,
+            )
         courses = parse_courses(html)
         if not courses:
-            raise PortalParseError("Dashboard parsed 0 courses.")
+            raise PortalParseError(
+                "Dashboard parsed 0 courses.", set_cookie_names=self.last_set_cookie_names
+            )
         return courses
 
     def select_course(self, course_id: str, expected_course: Optional[Course] = None) -> str:
@@ -1495,7 +1500,10 @@ class SisClient:
         html = self.get_html("/MarksSummary/Index")
         self.last_marks_html = html
         if not has_marks_page_marker(html):
-            raise PortalParseError("MarksSummary response missing expected marks markup.")
+            raise PortalParseError(
+                "MarksSummary response missing expected marks markup.",
+                set_cookie_names=self.last_set_cookie_names,
+            )
         if expected_course is not None:
             verify_active_course(html, expected_course)
         return parse_marks_summary(html)
@@ -1504,7 +1512,10 @@ class SisClient:
         html = self.get_html("/LearningResources/Index")
         self.last_resources_html = html
         if not has_resources_page_marker(html):
-            raise PortalParseError("LearningResources response missing expected resources markup.")
+            raise PortalParseError(
+                "LearningResources response missing expected resources markup.",
+                set_cookie_names=self.last_set_cookie_names,
+            )
         if expected_course is not None:
             verify_active_course(html, expected_course)
         return parse_learning_resources(html)

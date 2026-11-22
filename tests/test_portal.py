@@ -390,10 +390,23 @@ class PortalLoginDetectionTests(unittest.TestCase):
         stub.add(StubResponse(_auth_shell("<div>Empty error shell</div>")))
         stub.add(StubResponse(_auth_shell("<div>Empty error shell</div>")))
         client = _client(stub)
-        with self.assertRaises(PortalParseError):
+        with self.assertRaises(PortalParseError) as ctx:
             client.get_marks_summary()
+        self.assertEqual(ctx.exception.set_cookie_names, ())
         with self.assertRaises(PortalParseError):
             client.get_learning_resources()
+
+    def test_parse_error_reports_cookie_names_observed_on_the_page(self) -> None:
+        stub = StubTransport()
+        stub.add(
+            StubResponse(
+                _auth_shell("<div>Empty error shell</div>"),
+                headers={"Set-Cookie": ["ARRAffinity=node1; Path=/"]},
+            )
+        )
+        with self.assertRaises(PortalParseError) as ctx:
+            _client(stub).get_marks_summary()
+        self.assertEqual(ctx.exception.set_cookie_names, ("ARRAffinity",))
 
 
 class PortalActiveCourseTests(unittest.TestCase):
