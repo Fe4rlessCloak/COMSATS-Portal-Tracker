@@ -23,7 +23,6 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import config as config_module  # noqa: E402
 import probe  # noqa: E402
 import tracker  # noqa: E402
 from notifiers import BaseNotifier, Notification, _latin1_safe, dispatch_all  # noqa: E402
@@ -2091,14 +2090,9 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             orig_load_config = tracker.load_config
 
             def _fast_load_config(
-                ep: Path,
-                require_session: bool = True,
-                raw: object = config_module._UNREAD,
-                environ: Optional[dict] = None,
+                ep: Path, require_session: bool = True, **kwargs: object
             ) -> tracker.TrackerConfig:
-                cfg_obj = orig_load_config(
-                    ep, require_session=require_session, raw=raw, environ=environ
-                )
+                cfg_obj = orig_load_config(ep, require_session=require_session, **kwargs)
                 cfg_obj.keepalive_interval = 1
                 return cfg_obj
 

@@ -565,11 +565,9 @@ class DaemonNotifierRebuildTests(unittest.TestCase):
 
             real_load_config = config.load_config
 
-            def _fast_load_config(
-                env_file, require_session=True, environ=None, raw=config._UNREAD
-            ):  # noqa: ANN001
+            def _fast_load_config(env_file, require_session=True, **kwargs):
                 cfg = real_load_config(
-                    env_file, require_session=require_session, environ=environ, raw=raw
+                    env_file, require_session=require_session, **kwargs
                 )
                 cfg.keepalive_interval = 1
                 return cfg

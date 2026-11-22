@@ -1513,7 +1513,7 @@ def main(environ: Optional[Mapping[str, str]] = None) -> int:
 
     if args.test_notify:
         cfg = load_config(env_path, require_session=False, environ=environ)
-        notifiers = build_notifiers(cfg.raw)
+        notifiers = build_notifiers(cfg.raw, timeout=cfg.notifier_timeout)
         dispatch_all(
             notifiers,
             Notification(
@@ -1530,7 +1530,7 @@ def main(environ: Optional[Mapping[str, str]] = None) -> int:
 
     if args.once:
         cfg = load_config(env_path, require_session=True, environ=environ)
-        notifiers = build_notifiers(cfg.raw)
+        notifiers = build_notifiers(cfg.raw, timeout=cfg.notifier_timeout)
         cancel_event = threading.Event()
         client = SisClient(
             session_id=cfg.session_id,
