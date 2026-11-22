@@ -342,6 +342,18 @@ class SnapshotValidationTests(unittest.TestCase):
         )
         self.assertEqual(reason, "Session expired mid-scan: cookie stale")
 
+    def test_session_expiry_is_rejected_by_the_standalone_gate_only(self) -> None:
+        """A2: expiry has ONE owner. validate_snapshot() names it; compute_transition()
+        refuses an expired scan outright so there is no second, unreachable branch."""
+        expired = scan_of(
+            state(), session_expired=True, session_expired_error="cookie stale"
+        )
+        self.assertEqual(
+            validate_snapshot(state(), expired), "Session expired mid-scan: cookie stale"
+        )
+        with self.assertRaises(ValueError):
+            transition(state(), expired)
+
     def test_partial_scan_is_rejected_and_names_the_failed_courses(self) -> None:
         reason = validate_snapshot(
             state(),

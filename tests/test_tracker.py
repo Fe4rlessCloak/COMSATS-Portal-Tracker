@@ -618,6 +618,38 @@ class CycleIntegrationTests(unittest.TestCase):
         self.assertEqual(self.notifier.notes, [])
         self.assertFalse(self.data_dir.joinpath(".anomaly_alerted").exists())
 
+    def test_mid_scan_session_expiry_relays_observed_cookie_names(self) -> None:
+        """A1: names collected mid-scan must ride the re-raised exception, not vanish."""
+        second = Course(course_id="100002", code="MTH104", name="Calculus")
+        self.store.save_state(_make_state(marks_count=2, res_count=1, course_count=2))
+        baseline_bytes = self.state_path.read_bytes()
+
+        portal = SimulatedPortal(
+            courses=[self.course, second],
+            semester="Fall 2026",
+            marks={"100001": [MarkItem("Quizzes:1", "Quizzes", "Quiz1", "9.0", "10.0", "")]},
+            set_cookie_on_switch="PortalAffinity",  # observed on course 1's SetCourse
+            failures={
+                "/Courses/SetCourse/100002": StubResponse(
+                    "",
+                    status=302,
+                    headers={
+                        "Location": "/Login/Index",
+                        "Set-Cookie": ["ARRAffinity=node7; Path=/"],
+                    },
+                )
+            },
+        )
+        with self.assertRaises(SessionExpiredError) as ctx:
+            self.cycle(portal, courses=[self.course, second])
+
+        self.assertEqual(
+            ctx.exception.set_cookie_names, ("PortalAffinity", "ARRAffinity")
+        )
+        # Names only — the cookie *value* must never be copied onto the exception text.
+        self.assertNotIn("node7", str(ctx.exception))
+        self.assertEqual(self.state_path.read_bytes(), baseline_bytes)
+
     # -- store discipline ----------------------------------------------------
     def test_baseline_is_loaded_before_the_portal_is_scanned(self) -> None:
         self.store.save_state(_make_state(marks_count=2, res_count=1, course_count=1))
@@ -815,6 +847,60 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             self.assertIn("exiting with code 1 for restart", output)
             hb = json.loads(hb_path.read_text(encoding="utf-8"))
             self.assertEqual(hb["status"], "exiting_session_expired")
+
+    def test_session_expired_alert_names_the_rotated_cookies(self) -> None:
+        """A1: the daemon's session-expired diagnostic exposes cookie NAMES, never values."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            state_path = Path(tmp) / "data" / "state.json"
+            hb_path = Path(tmp) / "data" / "heartbeat.json"
+            env_path.write_text(
+                "SIS_SESSION_ID=dead_cookie\n"
+                "KEEPALIVE_INTERVAL=15\n"
+                "FETCH_INTERVAL=30\n"
+                "EXPIRED_POLL_INTERVAL=1\n"
+                "SESSION_EXPIRED_TIMEOUT=1\n",
+                encoding="utf-8",
+            )
+            notifier = _RecordingNotifier()
+            portal = SimulatedPortal(
+                courses=[Course(course_id="100001", code="CSC101", name="Intro")],
+                marks={"100001": [MarkItem("Quizzes:1", "Quizzes", "Q1", "9", "10", "")]},
+                expire_sessions={"dead_cookie"},
+                login_redirect_sets_cookie="ARRAffinity",
+            )
+            buf = io.StringIO()
+            with mock.patch.object(
+                tracker, "SisClient", portal_factory(portal)
+            ), mock.patch.object(
+                tracker, "build_notifiers", return_value=[notifier]
+            ), contextlib.redirect_stdout(buf):
+                rc1 = run_daemon(
+                    env_path,
+                    state_path,
+                    heartbeat_path=hb_path,
+                    environ={"SIS_SESSION_ID": ""},
+                )
+                # Second run: the alert marker exists, so the daemon takes the
+                # "already alerted" branch and prints the diagnostic line.
+                rc2 = run_daemon(
+                    env_path,
+                    state_path,
+                    heartbeat_path=hb_path,
+                    environ={"SIS_SESSION_ID": ""},
+                )
+
+            self.assertEqual(rc1, 1)
+            self.assertEqual(rc2, 1)
+            self.assertEqual([n.event for n in notifier.notes], ["session_expired"])
+            message = notifier.notes[0].message
+            self.assertIn("ARRAffinity", message)
+            # The notification is names-only: no cookie VALUE ever reaches it.
+            self.assertNotIn("node7", message)
+            self.assertIn("ARRAffinity", buf.getvalue())
+            hb = json.loads(hb_path.read_text(encoding="utf-8"))
+            self.assertIn("ARRAffinity", hb["detail"])
+            self.assertNotIn("node7", hb["detail"])
 
     def test_bug5_login_detection_and_real_snapshots(self) -> None:
         # 1. Explicit markers, alternative login markup, meta refresh, JS redirect, final URL, missing shell

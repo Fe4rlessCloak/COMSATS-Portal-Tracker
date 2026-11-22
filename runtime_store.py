@@ -31,13 +31,14 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, ContextManager, Dict, Iterator, List, Optional, Tuple
+from typing import Any, ContextManager, Dict, Iterator, List, Mapping, Optional, Tuple
 
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows compatibility for non-locking helpers
     fcntl = None  # type: ignore[assignment]
 
+from config import resolve_heartbeat_file
 from sis_client import extract_diagnostic_text, scrub_diagnostic_html
 
 DEFAULT_KEEPALIVE_INTERVAL = 120
@@ -116,20 +117,6 @@ def _state_backup_paths(state_path: Path) -> List[Path]:
     return paths
 
 
-def default_heartbeat_path(
-    state_path: Path, environ: Optional[Dict[str, str]] = None
-) -> Path:
-    """Resolve the heartbeat path: ``HEARTBEAT_FILE`` if set, else next to state.
-
-    ``environ`` defaults to the process environment to preserve the original
-    behaviour; callers that already hold a resolved configuration should pass the
-    mapping explicitly instead of relying on ``os.environ``.
-    """
-    values = os.environ if environ is None else environ
-    env_hb = str(values.get("HEARTBEAT_FILE") or "").strip()
-    return Path(env_hb) if env_hb else state_path.with_name("heartbeat.json")
-
-
 @contextlib.contextmanager
 def state_lock(state_path: Path, timeout: float = DEFAULT_LOCK_TIMEOUT) -> Iterator[None]:
     """Acquire an exclusive advisory lock around state load/scan/save cycles."""
@@ -172,6 +159,7 @@ class RuntimeStore:
         state_path: Path,
         heartbeat_path: Optional[Path] = None,
         *,
+        environ: Optional[Mapping[str, str]] = None,
         keepalive_interval: int = DEFAULT_KEEPALIVE_INTERVAL,
         fetch_interval: int = DEFAULT_FETCH_INTERVAL,
         healthcheck_max_age: int = DEFAULT_HEALTHCHECK_MAX_AGE,
@@ -179,10 +167,11 @@ class RuntimeStore:
         max_backups: int = DEFAULT_MAX_BACKUPS,
     ) -> None:
         self.state_path = Path(state_path)
+        self.environ = environ
         self.heartbeat_path = (
             Path(heartbeat_path)
             if heartbeat_path is not None
-            else default_heartbeat_path(self.state_path)
+            else resolve_heartbeat_file(self.state_path, environ)
         )
         self.lock_timeout = float(lock_timeout)
         self.max_backups = int(max_backups)

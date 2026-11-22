@@ -181,6 +181,21 @@ def scan_all_courses(
     )
 
 
+def describe_observed_cookie_names(exc: BaseException) -> str:
+    """Render the ``Set-Cookie`` *names* a portal failure observed, for diagnostics.
+
+    Names only, never values: this string lands in logs, heartbeat details and
+    notifications. Returns ``""`` when the exception carries no names.
+    """
+    names: List[str] = []
+    for name in getattr(exc, "set_cookie_names", ()) or ():
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        return ""
+    return f" (Set-Cookie names observed: {', '.join(names)})"
+
+
 @dataclass(frozen=True)
 class CycleOptions:
     """Every knob one cycle needs, in one object.
@@ -353,8 +368,12 @@ def run_cycle(
 
         if scan_result.session_expired:
             print("[WARN] Session expired mid-scan — preserving existing baseline without saving.")
+            # ``scan_all_courses`` collected every Set-Cookie name it saw, including the
+            # ones on the response that proved the session dead. Carry them on the
+            # exception so the daemon can put cookie *names* in its diagnostic line.
             raise SessionExpiredError(
-                scan_result.session_expired_error or "Session expired mid-scan."
+                scan_result.session_expired_error or "Session expired mid-scan.",
+                set_cookie_names=tuple(scan_result.set_cookie_names),
             )
 
         outcome = compute_transition(
@@ -487,6 +506,7 @@ def run_daemon(
     store = RuntimeStore(
         state_path,
         hb_path,
+        environ=environ,
         keepalive_interval=cfg.keepalive_interval,
         fetch_interval=cfg.fetch_interval,
         healthcheck_max_age=cfg.healthcheck_max_age,
@@ -507,6 +527,7 @@ def run_daemon(
     last_fetch = 0.0
     expired_since: Optional[float] = None
     last_expired_log = 0.0
+    expired_cookie_note = ""
     consecutive_timeouts = 0
     last_ok_ts: Optional[float] = None
     last_status = "starting"
@@ -545,6 +566,7 @@ def run_daemon(
                 last_expired_log = 0.0
                 last_fetch = 0.0
                 active_anomaly = None
+                expired_cookie_note = ""
                 store.clear_session_alerted()
                 now_str = datetime.now().strftime("%H:%M:%S")
                 if env_changed:
@@ -573,6 +595,7 @@ def run_daemon(
                     last_expired_log = 0.0
                     last_fetch = 0.0
                     active_anomaly = None
+                    expired_cookie_note = ""
                     print(
                         f"[{now_str}] [INFO] Detected .env change ({change_desc}; "
                         f"SIS_SESSION_ID unchanged; source={session_src}) — re-testing session."
@@ -606,7 +629,7 @@ def run_daemon(
             now_mono = time.monotonic()
             elapsed = now_mono - expired_since
             last_status = "waiting_for_session"
-            last_detail = f"expired for {int(elapsed)}s"
+            last_detail = f"expired for {int(elapsed)}s{expired_cookie_note}"
             store.write_heartbeat(last_status, detail=last_detail, last_ok=last_ok_ts)
 
             log_interval = min(60.0, max(15.0, float(cfg.expired_poll_interval) * 4.0))
@@ -614,7 +637,8 @@ def run_daemon(
                 now_str = datetime.now().strftime("%H:%M:%S")
                 print(
                     f"[{now_str}] [WARN] Waiting for updated SIS_SESSION_ID in {env_path} "
-                    f"(expired {int(elapsed)}s / {cfg.session_expired_timeout}s)."
+                    f"(expired {int(elapsed)}s / {cfg.session_expired_timeout}s)"
+                    f"{expired_cookie_note}."
                 )
                 last_expired_log = now_mono
 
@@ -710,8 +734,12 @@ def run_daemon(
         except SessionExpiredError as exc:
             expired_since = time.monotonic()
             last_expired_log = 0.0
+            # Cookie NAMES only (never values) so the operator can tell which cookie the
+            # portal rotated. Kept for the waiting_for_session heartbeat lines too.
+            cookie_note = describe_observed_cookie_names(exc)
+            expired_cookie_note = cookie_note
             last_status = "waiting_for_session"
-            last_detail = str(exc)
+            last_detail = f"{exc}{cookie_note}"
 
             if not store.was_session_alerted(active_session_id):
                 store.mark_session_alerted(active_session_id)
@@ -721,7 +749,8 @@ def run_daemon(
                         event="session_expired",
                         title="SIS session expired",
                         message=(
-                            f"{exc}\nLog in at {cfg.base_url}/ and update SIS_SESSION_ID in .env. "
+                            f"{exc}{cookie_note}\n"
+                            f"Log in at {cfg.base_url}/ and update SIS_SESSION_ID in .env. "
                             "Tracker will auto-resume once saved."
                         ),
                         priority="urgent",
@@ -732,7 +761,8 @@ def run_daemon(
                 )
             else:
                 print(
-                    f"[WARN] Session expired ({exc}) — alert already sent for current SIS_SESSION_ID."
+                    f"[WARN] Session expired ({exc}){cookie_note} — alert already sent "
+                    "for current SIS_SESSION_ID."
                 )
 
             store.write_heartbeat(last_status, detail=last_detail, last_ok=last_ok_ts)
@@ -810,7 +840,7 @@ def main(environ: Optional[Mapping[str, str]] = None) -> int:
     if args.healthcheck:
         cfg_vals = load_env_dict(env_path, environ=environ)
         max_age_override = parse_int(cfg_vals, "HEALTHCHECK_MAX_AGE", 0, minimum=0) or None
-        store = RuntimeStore(state_path, resolve_heartbeat_file(state_path, environ))
+        store = RuntimeStore(state_path, environ=environ)
         ok, msg = store.check_healthcheck(max_age_override=max_age_override)
         print(msg)
         return 0 if ok else 1
@@ -849,7 +879,9 @@ def main(environ: Optional[Mapping[str, str]] = None) -> int:
                 return run_cycle(
                     client,
                     roster.courses,
-                    RuntimeStore(state_path, max_backups=cfg.max_state_backups),
+                    RuntimeStore(
+                        state_path, environ=environ, max_backups=cfg.max_state_backups
+                    ),
                     CycleOptions(
                         base_url=cfg.base_url,
                         track_announcements=cfg.track_announcements,
@@ -868,13 +900,14 @@ def main(environ: Optional[Mapping[str, str]] = None) -> int:
             )
             return 1 if result.anomaly else 0
         except SessionExpiredError as exc:
-            print(f"[ERROR] Session expired: {exc}")
+            cookie_note = describe_observed_cookie_names(exc)
+            print(f"[ERROR] Session expired: {exc}{cookie_note}")
             dispatch_all(
                 notifiers,
                 Notification(
                     event="session_expired",
                     title="SIS session expired",
-                    message=str(exc),
+                    message=f"{exc}{cookie_note}",
                     priority="urgent",
                     tags=("warning",),
                     url=f"{cfg.base_url}/",

@@ -243,9 +243,12 @@ def _rejection_reason(
     rollover: Optional[Tuple[str, str]],
     reset_state: bool,
 ) -> Optional[str]:
-    """Plausibility gate. Totals and rollover are passed in, never recomputed."""
-    if scan_result.session_expired:
-        return f"Session expired mid-scan: {scan_result.session_expired_error}"
+    """Plausibility gate. Totals and rollover are passed in, never recomputed.
+
+    Mid-scan session expiry is deliberately **not** handled here: ``run_cycle`` raises
+    ``SessionExpiredError`` before ``compute_transition`` is ever reached, so expiry has
+    exactly one owner (see :func:`validate_snapshot` for the standalone rule).
+    """
     if scan_result.partial:
         return (
             f"Partial scan ({len(scan_result.failed_courses)} course(s) failed: "
@@ -286,7 +289,15 @@ def validate_snapshot(
     Standalone entry point for callers that only have a scan in hand; it computes the
     totals and rollover itself. :func:`compute_transition` computes both once and calls
     the internal gate directly.
+
+    This is the **only** place expiry is treated as a rejection reason. The orchestrator
+    does not use this path for expiry: ``run_cycle`` raises ``SessionExpiredError`` before
+    calling :func:`compute_transition`, so ``state.json`` is never touched. Keeping the
+    rule here means a caller that only holds a scan (a diagnostic tool, a future
+    non-raising driver) still refuses an expired snapshot instead of persisting it.
     """
+    if scan_result.session_expired:
+        return f"Session expired mid-scan: {scan_result.session_expired_error}"
     return _rejection_reason(
         old_state,
         scan_result,
@@ -671,7 +682,18 @@ def compute_transition(
     Rollover is evaluated at most once and totals once per snapshot. Rejection rules,
     dedupe/recovery behaviour, and every notification field are unchanged from the
     pre-extraction tracker.
+
+    Precondition: ``scan.session_expired`` is false. Expiry has exactly one owner —
+    ``tracker.run_cycle`` raises ``SessionExpiredError`` before calling this function, so
+    ``state.json`` is never touched on expiry. An expired ``ScanResult`` here is a caller
+    bug, not a policy question, so it fails loudly instead of being silently persisted
+    (or turned into a second, unreachable anomaly branch).
     """
+    if scan.session_expired:
+        raise ValueError(
+            "compute_transition() received an expired scan; the orchestrator must raise "
+            "SessionExpiredError before computing a transition."
+        )
     now_iso = now.isoformat()
     scanned_totals = summarize_totals(scan.state)
     baseline_totals = (

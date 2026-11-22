@@ -25,7 +25,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import runtime_store  # noqa: E402
-from runtime_store import RuntimeStore, StateLockError, default_heartbeat_path  # noqa: E402
+from config import resolve_heartbeat_file  # noqa: E402
+from runtime_store import RuntimeStore, StateLockError  # noqa: E402
 
 UNSAFE_HTML = (
     '<html><body class="sis-portal-body">'
@@ -86,14 +87,38 @@ class RuntimeStorePathTests(unittest.TestCase):
             hb = Path(tmp) / "custom" / "hb.json"
             self.assertEqual(RuntimeStore(state_path, hb).heartbeat_path, hb)
             self.assertEqual(
-                default_heartbeat_path(state_path), state_path.with_name("heartbeat.json")
+                resolve_heartbeat_file(state_path), state_path.with_name("heartbeat.json")
             )
             self.assertEqual(
-                default_heartbeat_path(state_path, {"HEARTBEAT_FILE": "/var/run/hb.json"}),
+                resolve_heartbeat_file(state_path, {"HEARTBEAT_FILE": "/var/run/hb.json"}),
                 Path("/var/run/hb.json"),
             )
             self.assertEqual(
-                default_heartbeat_path(state_path, {"HEARTBEAT_FILE": "  "}),
+                resolve_heartbeat_file(state_path, {"HEARTBEAT_FILE": "  "}),
+                state_path.with_name("heartbeat.json"),
+            )
+
+    def test_constructor_honours_an_injected_environ_for_heartbeat(self) -> None:
+        """A3: a store built from a bare state path resolves HEARTBEAT_FILE from environ."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "data" / "state.json"
+            store = RuntimeStore(
+                state_path, environ={"HEARTBEAT_FILE": str(Path(tmp) / "hb.json")}
+            )
+            self.assertEqual(store.heartbeat_path, Path(tmp) / "hb.json")
+            # An explicitly passed heartbeat path still wins over environ.
+            explicit = Path(tmp) / "explicit.json"
+            self.assertEqual(
+                RuntimeStore(
+                    state_path,
+                    explicit,
+                    environ={"HEARTBEAT_FILE": str(Path(tmp) / "hb.json")},
+                ).heartbeat_path,
+                explicit,
+            )
+            # A store with no environ falls back to the sibling default, not a global.
+            self.assertEqual(
+                RuntimeStore(state_path).heartbeat_path,
                 state_path.with_name("heartbeat.json"),
             )
 
@@ -717,7 +742,7 @@ class RuntimeStoreImportSurfaceTests(unittest.TestCase):
     def test_module_exports_single_writer_and_lock_error(self) -> None:
         self.assertTrue(hasattr(runtime_store, "_atomic_write_text"))
         self.assertTrue(issubclass(StateLockError, RuntimeError))
-        self.assertTrue(callable(runtime_store.default_heartbeat_path))
+        self.assertTrue(callable(runtime_store.resolve_heartbeat_file))
 
 
 if __name__ == "__main__":
