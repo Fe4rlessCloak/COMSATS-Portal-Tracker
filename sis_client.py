@@ -1530,7 +1530,7 @@ class SisClient:
             page = self.fetch_page(path)
         except (SessionExpiredError, PortalHttpError) as exc:
             raise _with_observed_cookies(exc, observed)
-        observed.extend(page.set_cookie_names)
+        observed[:] = _dedupe_names(observed, page.set_cookie_names)
         return page
 
     def _fetch_verified(
