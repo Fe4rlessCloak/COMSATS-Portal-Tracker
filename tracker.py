@@ -24,7 +24,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, TypeVar
 
 from config import (
     EnvWatcher,
@@ -39,19 +39,12 @@ from config import (
 from notifiers import BaseNotifier, Notification, build_notifiers, dispatch_all
 from runtime_store import RuntimeStore, StateLockError
 from sis_client import (
-    AnnouncementItem,
     Course,
-    CourseMismatchError,
     DEFAULT_BASE_URL,
     DEFAULT_USER_AGENT,
-    MarkItem,
     PortalHttpError,
-    PortalParseError,
-    ResourceItem,
     SessionExpiredError,
     SisClient,
-    extract_diagnostic_text,
-    parse_announcements,
 )
 
 T = TypeVar("T")
@@ -77,6 +70,7 @@ class ScanResult:
     session_expired: bool = False
     session_expired_error: Optional[str] = None
     sample_marks_html: str = ""
+    sample_marks_preview: str = ""
     sample_marks_course: str = ""
     set_cookie_names: List[str] = field(default_factory=list)
 
@@ -99,9 +93,7 @@ def scan_all_courses(
 ) -> ScanResult:
     """Iterate through all courses and capture current marks, resources, and optional announcements."""
     snapshot: Dict[str, Any] = {"courses": {}}
-    effective_semester = (semester or "").strip() or (
-        getattr(client, "last_semester", "") or ""
-    ).strip()
+    effective_semester = (semester or "").strip()
     if effective_semester:
         snapshot["semester"] = effective_semester
     prev_courses = (previous_state or {}).get("courses", {})
@@ -110,14 +102,14 @@ def scan_all_courses(
     seen_cookie_names: List[str] = []
     sample_marks_html = ""
     sample_marks_course = ""
+    sample_marks_preview = ""
     sample_from_prior_marks = False
 
-    def _collect_cookies(exc: Optional[BaseException] = None) -> None:
-        names: List[str] = []
+    def _collect_cookies(exc: Optional[BaseException] = None, names: Iterable[str] = ()) -> None:
+        candidates: List[str] = list(names)
         if exc is not None:
-            names.extend(getattr(exc, "set_cookie_names", ()) or ())
-        names.extend(getattr(client, "last_set_cookie_names", None) or ())
-        for name in names:
+            candidates.extend(getattr(exc, "set_cookie_names", ()) or ())
+        for name in candidates:
             if name not in seen_cookie_names:
                 seen_cookie_names.append(name)
 
@@ -137,32 +129,29 @@ def scan_all_courses(
             break
 
         try:
-            ann_html = client.select_course(course.course_id, expected_course=course)
-            _collect_cookies()
-            marks = client.get_marks_summary(expected_course=course)
-            _collect_cookies()
-            if len(marks) == 0:
-                marks_html = getattr(client, "last_marks_html", "") or ""
-                if marks_html:
-                    prev_had_marks = bool(prev_courses.get(course.course_id, {}).get("marks"))
-                    if not sample_marks_html or (prev_had_marks and not sample_from_prior_marks):
-                        sample_marks_html = marks_html
-                        sample_marks_course = course.label
-                        sample_from_prior_marks = prev_had_marks
-
-            resources = client.get_learning_resources(expected_course=course)
-            _collect_cookies()
+            course_snapshot = client.fetch_course_snapshot(
+                course, include_announcements=track_announcements
+            )
+            _collect_cookies(names=course_snapshot.set_cookie_names)
+            if not course_snapshot.marks and course_snapshot.diagnostic_html:
+                prev_had_marks = bool(prev_courses.get(course.course_id, {}).get("marks"))
+                if not sample_marks_html or (prev_had_marks and not sample_from_prior_marks):
+                    sample_marks_html = course_snapshot.diagnostic_html
+                    sample_marks_preview = course_snapshot.diagnostic_preview
+                    sample_marks_course = course.label
+                    sample_from_prior_marks = prev_had_marks
 
             course_entry: Dict[str, Any] = {
                 "code": course.code,
                 "name": course.name,
                 "label": course.label,
-                "marks": {m.key: m.to_dict() for m in marks},
-                "resources": {r.key: r.to_dict() for r in resources},
+                "marks": {m.key: m.to_dict() for m in course_snapshot.marks},
+                "resources": {r.key: r.to_dict() for r in course_snapshot.resources},
             }
             if track_announcements:
-                anns = parse_announcements(ann_html)
-                course_entry["announcements"] = {a.key: a.to_dict() for a in anns}
+                course_entry["announcements"] = {
+                    a.key: a.to_dict() for a in (course_snapshot.announcements or [])
+                }
 
             snapshot["courses"][course.course_id] = course_entry
             if on_progress is not None:
@@ -179,6 +168,7 @@ def scan_all_courses(
                 session_expired=True,
                 session_expired_error=str(exc),
                 sample_marks_html=sample_marks_html,
+                sample_marks_preview=sample_marks_preview,
                 sample_marks_course=sample_marks_course,
                 set_cookie_names=seen_cookie_names,
             )
@@ -194,6 +184,7 @@ def scan_all_courses(
         partial=partial,
         failed_courses=failed_courses,
         sample_marks_html=sample_marks_html,
+        sample_marks_preview=sample_marks_preview,
         sample_marks_course=sample_marks_course,
         set_cookie_names=seen_cookie_names,
     )
@@ -552,7 +543,9 @@ def run_cycle(
                     marks_html=scan_result.sample_marks_html,
                 )
 
-            preview = extract_diagnostic_text(scan_result.sample_marks_html, max_chars=240)
+            preview = scan_result.sample_marks_preview
+            if len(preview) > 240:
+                preview = preview[:237].rstrip() + "..."
             dedup_note = (
                 " (duplicate alert suppressed)"
                 if (not should_notify and notify_anomaly)
@@ -997,7 +990,8 @@ def run_daemon(
 
             def _do_tick() -> None:
                 nonlocal last_fetch, last_ok_ts, last_status, last_detail, active_anomaly
-                courses = client.get_courses()
+                roster = client.fetch_roster()
+                courses = roster.courses
                 if cancel_event.is_set():
                     return
                 store.clear_session_alerted()
@@ -1018,7 +1012,7 @@ def run_daemon(
                         notifier_timeout=cfg.notifier_timeout,
                         cancel_event=cancel_event,
                         on_progress=_touch_scan_heartbeat,
-                        semester=cfg.semester,
+                        semester=cfg.semester or roster.semester,
                     )
                     last_fetch = time.monotonic()
                     if result.anomaly:
@@ -1194,10 +1188,10 @@ def main(environ: Optional[Mapping[str, str]] = None) -> int:
         )
         try:
             def _once_tick() -> CycleResult:
-                courses = client.get_courses()
+                roster = client.fetch_roster()
                 return run_cycle(
                     client,
-                    courses,
+                    roster.courses,
                     state_path=state_path,
                     base_url=cfg.base_url,
                     track_announcements=cfg.track_announcements,
@@ -1207,7 +1201,7 @@ def main(environ: Optional[Mapping[str, str]] = None) -> int:
                     max_backups=cfg.max_state_backups,
                     notifier_timeout=cfg.notifier_timeout,
                     cancel_event=cancel_event,
-                    semester=cfg.semester,
+                    semester=cfg.semester or roster.semester,
                     reset_state=args.reset_state,
                 )
 
