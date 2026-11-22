@@ -334,11 +334,6 @@ def env_file_signature(env_path: Path, raw: Any = _UNREAD) -> EnvFileSignature:
     )
 
 
-def read_env_signature(env_path: Path) -> EnvFileSignature:
-    """Read stat + SHA-256 signature fresh by path so inode replacements are detected."""
-    return env_file_signature(env_path)
-
-
 def _describe_change(prev: EnvFileSignature, cur: EnvFileSignature) -> str:
     if cur == prev:
         return ""
@@ -381,11 +376,6 @@ class EnvWatcher:
         desc = _describe_change(prev, cur)
         self._last_sig = cur
         return cur, bool(desc), desc
-
-    def check_changed(self) -> Tuple[bool, str]:
-        """Single-read change check returning ``(changed, human readable description)``."""
-        _, changed, desc = self._observe(read_env_bytes(self.env_path))
-        return changed, desc
 
     def check(
         self,
@@ -509,10 +499,6 @@ def resolve_heartbeat_file(
     """Resolve HEARTBEAT_FILE from the injected/process environment, else beside state."""
     raw = (_environ(environ).get("HEARTBEAT_FILE") or "").strip()
     return Path(raw) if raw else Path(state_path).with_name("heartbeat.json")
-
-
-# Backward-compatible name used by tracker.py callers.
-default_heartbeat_path = resolve_heartbeat_file
 
 
 def load_config(

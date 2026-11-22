@@ -617,29 +617,25 @@ class RuntimeStoreHeartbeatTests(unittest.TestCase):
             self.assertEqual(payload["fetch_interval"], 40)
             self.assertEqual(payload["healthcheck_max_age"], 60)
 
-    def test_legacy_keyword_wrapper_still_accepted(self) -> None:
+    def test_per_call_timing_overrides_are_gone(self) -> None:
+        """B2: timing is bound state; write_heartbeat takes no timing kwargs."""
         with tempfile.TemporaryDirectory() as tmp:
             hb = Path(tmp) / "heartbeat.json"
             store = RuntimeStore(Path(tmp) / "state.json", hb, keepalive_interval=45)
-            store.write_heartbeat(
-                "ok",
-                keepalive_interval=60,
-                fetch_interval=480,
-                healthcheck_max_age=30,
-                detail="override",
-                last_ok_ts=1234.5,
-            )
+            with self.assertRaises(TypeError):
+                store.write_heartbeat(  # type: ignore[call-arg]
+                    "ok",
+                    **{"keepalive_interval": 60, "last_ok_ts": 1234.5},
+                )
+            # bind_heartbeat() is the only way to change timing.
+            store.bind_heartbeat(keepalive_interval=60, fetch_interval=240)
+            store.write_heartbeat("ok", detail="after bind", last_ok=1234.5)
             payload = json.loads(hb.read_text(encoding="utf-8"))
             self.assertEqual(payload["keepalive_interval"], 60)
-            self.assertEqual(payload["fetch_interval"], 480)
-            self.assertEqual(payload["healthcheck_max_age"], 30)
-            self.assertEqual(payload["detail"], "override")
+            self.assertEqual(payload["fetch_interval"], 240)
+            self.assertEqual(payload["detail"], "after bind")
             self.assertEqual(payload["last_ok_timestamp"], 1234.5)
-
-            # The bound value is untouched by a one-off override.
-            store.write_heartbeat("ok")
-            payload = json.loads(hb.read_text(encoding="utf-8"))
-            self.assertEqual(payload["keepalive_interval"], 45)
+            self.assertEqual(set(payload), self.HEARTBEAT_KEYS)
 
 
 class RuntimeStoreHealthcheckTests(unittest.TestCase):

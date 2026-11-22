@@ -680,24 +680,22 @@ class CycleIntegrationTests(unittest.TestCase):
         self.assertTrue(res.saved)
         self.assertEqual(order, ["load_state", "scan_all_courses"])
 
-    def test_cycle_options_and_legacy_kwargs_are_mutually_exclusive(self) -> None:
+    def test_cycle_options_surface_is_the_only_form(self) -> None:
+        """B1: the legacy keyword shim is gone; only CycleOptions is accepted."""
         with self.assertRaises(TypeError):
             run_cycle(
-                None,  # type: ignore[arg-type]
+                None,
                 [self.course],
                 self.store,
-                CycleOptions(base_url=self.BASE),
-                [],
-                base_url=self.BASE,
+                **{"state_path": self.state_path, "base_url": self.BASE},  # type: ignore[arg-type]
             )
-        with self.assertRaises(TypeError):
-            run_cycle(None, [self.course], self.store, None, [], base_url=self.BASE,
-                      not_a_real_option=1)
+        # CycleOptions no longer carries a state_path field at all.
+        self.assertFalse(hasattr(CycleOptions(base_url=self.BASE), "state_path"))
 
-    def test_a_positional_string_in_place_of_options_is_rejected_loudly(self) -> None:
+    def test_a_string_in_place_of_options_is_rejected_loudly(self) -> None:
         # The old 6-argument positional signature would land base_url here; failing loudly
         # beats silently scanning with the wrong policy.
-        with self.assertRaises(TypeError) as ctx:
+        with self.assertRaises(AttributeError):
             run_cycle(
                 portal_client(self.portal(marks=[])),
                 [self.course],
@@ -705,17 +703,14 @@ class CycleIntegrationTests(unittest.TestCase):
                 self.BASE,  # type: ignore[arg-type]
                 [],
             )
-        self.assertIn("CycleOptions", str(ctx.exception))
 
-    def test_legacy_keyword_call_style_still_works(self) -> None:
+    def test_positional_call_style_is_the_supported_form(self) -> None:
         res = run_cycle(
             portal_client(self.portal(marks=[])),
             [self.course],
-            state_path=self.state_path,
-            base_url=self.BASE,
-            track_announcements=False,
-            notifiers=[self.notifier],
-            semester="Fall 2026",
+            RuntimeStore(self.state_path),
+            CycleOptions(base_url=self.BASE, semester="Fall 2026"),
+            [self.notifier],
         )
         self.assertTrue(res.saved)
         self.assertEqual(self.events(), ["baseline_saved"])

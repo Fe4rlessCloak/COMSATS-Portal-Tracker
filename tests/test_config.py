@@ -396,46 +396,47 @@ class WatcherTests(unittest.TestCase):
                 self.assertIn("inode", reload3.description)
                 self.assertIn("content unchanged", reload3.description)
 
-    def test_check_changed_in_place_and_inode_swap(self) -> None:
+    def test_check_in_place_and_inode_swap(self) -> None:
+        """B3: check() is the only watcher surface (check_changed was dead)."""
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / ".env"
             env_path.write_text("SIS_SESSION_ID=cookie_same\n", encoding="utf-8")
             watcher = EnvWatcher(env_path, environ={})
-            self.assertEqual(watcher.check_changed(), (False, ""))
+            first = watcher.check(environ={})
+            self.assertFalse(first.changed)
+            self.assertEqual(first.description, "")
 
             tmp_env = Path(tmp) / ".env.tmp"
             tmp_env.write_text("SIS_SESSION_ID=cookie_same\n", encoding="utf-8")
             os.replace(tmp_env, env_path)
-            changed, desc = watcher.check_changed()
-            self.assertTrue(changed)
-            self.assertIn("inode", desc)
-            self.assertIn("content unchanged", desc)
+            reload = watcher.check(environ={})
+            self.assertTrue(reload.changed)
+            self.assertIn("inode", reload.description)
+            self.assertIn("content unchanged", reload.description)
 
             env_path.write_text("SIS_SESSION_ID=cookie_new\n", encoding="utf-8")
-            changed2, desc2 = watcher.check_changed()
-            self.assertTrue(changed2)
-            self.assertIn("content changed", desc2)
-            self.assertEqual(
-                config.load_config(env_path, environ={}).session_id, "cookie_new"
-            )
+            reload2 = watcher.check(environ={})
+            self.assertTrue(reload2.changed)
+            self.assertIn("content changed", reload2.description)
+            self.assertEqual(reload2.config.session_id, "cookie_new")
 
     def test_watcher_reports_creation_and_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / ".env"
             watcher = EnvWatcher(env_path, environ={})
-            self.assertFalse(watcher.check_changed()[0])
+            self.assertFalse(watcher.check(environ={}).changed)
 
             env_path.write_text("SIS_SESSION_ID=created\n", encoding="utf-8")
-            changed, desc = watcher.check_changed()
-            self.assertTrue(changed)
-            self.assertIn("created", desc)
+            reload = watcher.check(environ={})
+            self.assertTrue(reload.changed)
+            self.assertIn("created", reload.description)
 
             env_path.unlink()
-            changed2, desc2 = watcher.check_changed()
-            self.assertTrue(changed2)
-            self.assertIn("deleted", desc2)
-            reload = watcher.check(environ={})
-            self.assertFalse(reload.config.session_id)
+            reload2 = watcher.check(environ={})
+            self.assertTrue(reload2.changed)
+            self.assertIn("deleted", reload2.description)
+            self.assertFalse(reload2.config.session_id)
+            self.assertFalse(hasattr(watcher, "check_changed"))
 
     def test_watcher_reload_uses_injected_environ(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

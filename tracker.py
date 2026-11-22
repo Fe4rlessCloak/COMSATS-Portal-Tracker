@@ -198,11 +198,7 @@ def describe_observed_cookie_names(exc: BaseException) -> str:
 
 @dataclass(frozen=True)
 class CycleOptions:
-    """Every knob one cycle needs, in one object.
-
-    Field names intentionally match the historical ``run_cycle`` keyword arguments, so
-    the compatibility shim below can build one straight from legacy call sites.
-    """
+    """Every knob one cycle needs, in one object."""
 
     base_url: str
     track_announcements: bool = False
@@ -215,9 +211,6 @@ class CycleOptions:
     lock_timeout: float = 30.0
     cancel_event: Optional[threading.Event] = None
     on_progress: Optional[Callable[[], None]] = None
-    # Only used to build a RuntimeStore when the caller passed a path instead of a store;
-    # a real store passed positionally always wins, exactly as before.
-    state_path: Optional[Path] = None
 
     def transition_options(self) -> TransitionOptions:
         return TransitionOptions(
@@ -226,67 +219,6 @@ class CycleOptions:
             reset_state=self.reset_state,
             notify_anomaly=self.notify_anomaly,
         )
-
-
-# Backwards-compatible keyword names still accepted by ``run_cycle``. Each maps onto a
-# ``CycleOptions`` field.
-_LEGACY_CYCLE_KWARGS = frozenset(
-    {
-        "state_path",
-        "base_url",
-        "track_announcements",
-        "dry_run",
-        "max_backups",
-        "notifier_timeout",
-        "cancel_event",
-        "on_progress",
-        "lock_timeout",
-        "notify_anomaly",
-        "semester",
-        "reset_state",
-    }
-)
-
-
-def _cycle_options_from_legacy(**kwargs: Any) -> CycleOptions:
-    """Build ``CycleOptions`` from the pre-refactor ``run_cycle`` keyword arguments."""
-    unknown = set(kwargs) - _LEGACY_CYCLE_KWARGS
-    if unknown:
-        raise TypeError(
-            f"run_cycle() got unexpected keyword argument(s): {', '.join(sorted(unknown))}"
-        )
-    base_url = kwargs.get("base_url")
-    if not base_url:
-        raise TypeError("run_cycle() requires base_url (directly or via CycleOptions)")
-    return CycleOptions(
-        base_url=str(base_url),
-        track_announcements=bool(kwargs.get("track_announcements", False)),
-        reset_state=bool(kwargs.get("reset_state", False)),
-        notify_anomaly=bool(kwargs.get("notify_anomaly", True)),
-        semester=kwargs.get("semester"),
-        dry_run=bool(kwargs.get("dry_run", False)),
-        max_backups=kwargs.get("max_backups"),
-        notifier_timeout=kwargs.get("notifier_timeout"),
-        lock_timeout=float(
-            kwargs["lock_timeout"] if kwargs.get("lock_timeout") is not None else 30.0
-        ),
-        cancel_event=kwargs.get("cancel_event"),
-        on_progress=kwargs.get("on_progress"),
-        state_path=kwargs.get("state_path"),
-    )
-
-
-def _resolve_cycle_store(
-    store: Optional[RuntimeStore], state_path: Optional[Path]
-) -> RuntimeStore:
-    """Return the store to use, accepting a bare path for either argument."""
-    if isinstance(store, RuntimeStore):
-        return store
-    if store is not None and state_path is None:
-        state_path = Path(store)  # type: ignore[arg-type]
-    if state_path is None:
-        raise TypeError("run_cycle() requires a RuntimeStore or state_path")
-    return RuntimeStore(Path(state_path))
 
 
 def _log_transition(outcome: TransitionOutcome) -> None:
@@ -317,38 +249,17 @@ def _log_transition(outcome: TransitionOutcome) -> None:
 def run_cycle(
     client: Optional[SisClient],
     courses: List[Course],
-    store: Optional[RuntimeStore] = None,
-    options: Optional[CycleOptions] = None,
-    notifiers: Optional[List[BaseNotifier]] = None,
-    **legacy_kwargs: Any,
+    store: RuntimeStore,
+    options: CycleOptions,
+    notifiers: List[BaseNotifier],
 ) -> CycleResult:
     """Run one locked load -> multi-course fetch -> transition -> commit + notify cycle.
 
-    ``run_cycle(client, courses, store, options, notifiers)`` is the current surface.
-    Every pre-refactor keyword argument still works through ``legacy_kwargs``; mixing
-    ``options`` with them raises ``TypeError`` so a caller can never half-migrate.
+    This is the only cycle surface: ``(client, courses, store, options, notifiers)``.
+    The pre-refactor keyword form is gone — there is no compatibility shim.
     """
-    if options is None:
-        options = _cycle_options_from_legacy(**legacy_kwargs)
-    elif legacy_kwargs:
-        raise TypeError(
-            "run_cycle() accepts either CycleOptions or the legacy keyword arguments, "
-            f"not both (got: {', '.join(sorted(legacy_kwargs))})"
-        )
-    elif not isinstance(options, CycleOptions):
-        raise TypeError(
-            "run_cycle() positional arguments are "
-            "(client, courses, store, options, notifiers); got "
-            f"options={options!r}. Pass a CycleOptions, or use the legacy keyword form "
-            "run_cycle(client, courses, state_path=..., base_url=..., notifiers=[...])."
-        )
-    if notifiers is not None and isinstance(notifiers, (str, bytes)):
-        raise TypeError(
-            "run_cycle() expects a sequence of notifiers, not a bare string; "
-            "the legacy 6-argument positional form is no longer supported — use keywords."
-        )
-    active_notifiers: List[BaseNotifier] = list(notifiers or ())
-    runtime_store = _resolve_cycle_store(store, options.state_path)
+    active_notifiers: List[BaseNotifier] = list(notifiers)
+    runtime_store = store
 
     # Load + scan happen under the exclusive lock, baseline first (unchanged ordering).
     with runtime_store.lock(timeout=options.lock_timeout):

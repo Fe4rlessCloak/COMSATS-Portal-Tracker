@@ -1196,10 +1196,9 @@ class PortalSecretScrubbingSeamTests(unittest.TestCase):
             tracker.run_cycle(
                 client,
                 [_intro_course()],
-                state_path=state_path,
-                base_url=BASE,
-                track_announcements=False,
-                notifiers=[],
+                RuntimeStore(state_path),
+                tracker.CycleOptions(base_url=BASE, track_announcements=False),
+                [],
             )
             diagnostics = (state_path.parent / "last_anomaly.json").read_text(encoding="utf-8")
             saved_html = (state_path.parent / "last_anomaly_marks.html").read_text(

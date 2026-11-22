@@ -313,35 +313,21 @@ class RuntimeStore:
         status: str,
         detail: Optional[str] = None,
         last_ok: Optional[float] = None,
-        **legacy: Any,
     ) -> None:
         """Write the liveness payload using the bound timing parameters.
 
-        Legacy per-call timing keywords (``keepalive_interval``, ``fetch_interval``,
-        ``healthcheck_max_age``, ``last_ok_ts``) are still accepted for readability
-        at ad-hoc call sites; the daemon uses the short form.
+        Timing lives on the store: set it in the constructor or with
+        :meth:`bind_heartbeat`. There are no per-call timing overrides.
         """
-        keepalive = int(legacy.pop("keepalive_interval", self._keepalive_interval))
-        fetch = int(legacy.pop("fetch_interval", self._fetch_interval))
-        max_age = int(legacy.pop("healthcheck_max_age", self._healthcheck_max_age))
-        legacy_last_ok = legacy.pop("last_ok_ts", None)
-        if last_ok is None:
-            last_ok = legacy_last_ok
-        if legacy:
-            raise TypeError(
-                "write_heartbeat() got unexpected keyword arguments: "
-                f"{sorted(legacy)}"
-            )
-
         now_ts = time.time()
         payload = {
             "timestamp": now_ts,
             "iso": datetime.now(timezone.utc).isoformat(),
             "pid": os.getpid(),
             "status": status,
-            "keepalive_interval": keepalive,
-            "fetch_interval": fetch,
-            "healthcheck_max_age": max_age,
+            "keepalive_interval": self._keepalive_interval,
+            "fetch_interval": self._fetch_interval,
+            "healthcheck_max_age": self._healthcheck_max_age,
             "detail": "" if detail is None else str(detail),
             "last_ok_timestamp": last_ok,
         }
