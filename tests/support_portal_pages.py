@@ -108,6 +108,13 @@ def marks_page(course: Course, marks: Iterable[MarkItem]) -> str:
     for mark in marks:
         sections.setdefault(mark.section, []).append(mark)
 
+    if not sections:
+        return auth_shell(
+            '<div class="sis-marks-summary"><p class="sis-marks-empty">'
+            "No marks available.</p></div>",
+            course=course,
+        )
+
     blocks = []
     for section, items in sections.items():
         prefix = f"{section}:"
@@ -128,18 +135,6 @@ def marks_page(course: Course, marks: Iterable[MarkItem]) -> str:
         '<div class="sis-marks-summary table-responsive quiz_listing">'
         + "".join(blocks)
         + "</div>",
-        course=course,
-    )
-
-
-def empty_marks_page(course: Course, secret_shell: str = "") -> str:
-    """MarksSummary page with no rows (the degenerate-scan shape)."""
-    return auth_shell(
-        secret_shell
-        + '<div class="main_body"><div class="content_area">'
-        '<div class="sis-marks-summary">'
-        '<p class="sis-marks-empty">No marks available.</p>'
-        "</div></div></div>",
         course=course,
     )
 

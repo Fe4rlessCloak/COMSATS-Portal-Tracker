@@ -28,7 +28,6 @@ import probe  # noqa: E402
 import tracker  # noqa: E402
 from notifiers import BaseNotifier, Notification, _latin1_safe, dispatch_all  # noqa: E402
 from sis_client import (  # noqa: E402
-    AnnouncementItem,
     Course,
     CourseMismatchError,
     MarkItem,
@@ -49,15 +48,7 @@ from sis_client import (  # noqa: E402
     verify_active_course,
 )
 from runtime_store import RuntimeStore, StateLockError  # noqa: E402
-from support_portal_pages import (  # noqa: E402
-    SimulatedPortal,
-    announcements_page,
-    auth_shell,
-    courses_page,
-    empty_marks_page,
-    marks_page,
-    resources_page,
-)
+from support_portal_pages import SimulatedPortal  # noqa: E402
 from support_stub_transport import StubResponse, StubTransport, StubTransportError  # noqa: E402
 from tracker import (  # noqa: E402
     CycleTimeoutError,
