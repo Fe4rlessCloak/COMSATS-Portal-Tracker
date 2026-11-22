@@ -31,7 +31,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, ContextManager, Dict, Iterator, List, Optional, Tuple
 
 try:
     import fcntl
@@ -205,7 +205,7 @@ class RuntimeStore:
 
     # ------------------------------------------------------------------- lock
 
-    def lock(self, timeout: Optional[float] = None) -> "contextlib.AbstractContextManager[None]":
+    def lock(self, timeout: Optional[float] = None) -> ContextManager[None]:
         """Exclusive ``fcntl.flock`` on the lock file; ``StateLockError`` on timeout."""
         effective = self.lock_timeout if timeout is None else float(timeout)
         return state_lock(self.state_path, timeout=effective)
