@@ -616,6 +616,45 @@ class ProductionTransportTests(unittest.TestCase):
         client = SisClient("sid", request_delay=0.0)
         self.assertIsInstance(client.transport, UrllibTransport)
 
+    def test_urllib_adapter_commits_cookies_from_a_real_200_response(self) -> None:
+        cookies_seen: list[str] = []
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - http.server naming
+                cookies_seen.append(self.headers.get("Cookie", ""))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                if len(cookies_seen) == 1:
+                    self.send_header("Set-Cookie", "ARRAffinity=node1; Path=/; HttpOnly")
+                    self.send_header("Set-Cookie", "PortalAffinity=edge2; Path=/")
+                body = DASH.encode("utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - http.server API
+                """Keep test output quiet."""
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            client = SisClient("sid", base_url=f"http://127.0.0.1:{port}", request_delay=0.0)
+            response = client.get_html("/Courses")
+            self.assertEqual(client.last_set_cookie_names, ["ARRAffinity", "PortalAffinity"])
+            client.get_html("/Courses")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5.0)
+
+        self.assertEqual(response, DASH)
+        self.assertEqual(cookies_seen[0], "ASP.NET_SessionId=sid")
+        self.assertEqual(
+            cookies_seen[1], "ASP.NET_SessionId=sid; ARRAffinity=node1; PortalAffinity=edge2"
+        )
+
     def test_urllib_adapter_returns_redirect_instead_of_following_it(self) -> None:
         hits: list[str] = []
 

@@ -29,7 +29,6 @@ from sis_client import (  # noqa: E402
     CourseMismatchError,
     PortalHttpError,
     SessionExpiredError,
-    SisClient,
     detect_login_page,
     extract_diagnostic_text,
     has_authenticated_shell,
