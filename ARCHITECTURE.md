@@ -11,7 +11,7 @@ Zero external packages — **Python 3.9+ standard library only** (`urllib`, `htm
 | File | Role |
 | :--- | :--- |
 | `config.py` | **Leaf** config module (no project imports): `.env` byte decoding (UTF-8/16/32 BOMs + cp1252 fallback), text parsing (`export`, quotes/escapes, inline `#`), `SIS_SESSION_ID` normalization + placeholder rejection, secret-free missing-session diagnostics, process-env vs. file precedence with per-key provenance, single-read `.env` fingerprint watching, path resolution (`ENV_FILE`/`STATE_FILE`/`HEARTBEAT_FILE`), typed `TrackerConfig`, and the one canonical `NOTIFIER_TIMEOUT` rule. Every entry point takes an optional `environ` mapping. |
-| `tracker.py` | **Orchestration / CLI** — daemon loop, warm-up + keep-alive cadence, watchdog timeouts, and the CLI (`--once`, `--dry-run`, `--reset-state`, `--test-notify`, `--healthcheck`). Owns `scan_all_courses()`, `run_cycle()`, `run_with_timeout()`, `run_daemon()`, and `main()`; consumes only *typed* Portal results (never raw HTML) and persists everything through `RuntimeStore`. `ScanResult`/`CycleResult` and every policy decision come from `snapshot_transition`. |
+| `tracker.py` | **Orchestration / CLI** — daemon loop, warm-up + keep-alive cadence, watchdog timeouts, and the CLI (`--once`, `--dry-run`, `--reset-state`, `--test-notify`, `--healthcheck`). Owns `ScanResult` production (`scan_all_courses()`), `run_cycle()` behind a compact `CycleOptions` object, `run_with_timeout()`, `run_daemon()`, and `main()`; consumes only *typed* Portal results (never raw HTML) and persists everything through `RuntimeStore`. `ScanResult`/`CycleResult` and every policy decision come from `snapshot_transition`. |
 | `snapshot_transition.py` | **Snapshot Transition (pure)** — zero network/filesystem/locking/logging/dispatch. Owns `compute_transition(previous_state, scan, prior_anomaly, now, options) -> TransitionOutcome` plus the policy primitives `normalize_semester()`, `detect_semester_rollover()`, `validate_snapshot()`, `diff_states()`, `summarize_totals()` and the carrier dataclasses `ScanResult`/`CycleResult`/`TransitionOptions`/`TransitionOutcome`/`AnomalyAction`. Computes rollover once and totals once per snapshot, and returns the state to commit, the anomaly action, and the ordered notifications. |
 | `runtime_store.py` | **Runtime Store** — single owner of all eight `data/` runtime files: exclusive `fcntl.flock` locking, atomic state saves with rolling backups + corrupt fallback, heartbeat writing/`--healthcheck` evaluation, SHA-256 session-expiry marker, anomaly marker, and scrubbed anomaly diagnostics. One atomic temp-file+`os.replace` writer with guaranteed temp cleanup. |
 | `sis_client.py` | **Portal module** — HTTP client (`SisClient`) behind a single injectable HTTP transport adapter (`PortalTransport`, production `UrllibTransport`), with `ASP.NET_SessionId` + authenticated `Set-Cookie` handling, explicit `reconfigure()` for connection settings, login/expiry detection, and two typed operations that own the ASP.NET quirks: `fetch_roster() -> RosterResult` and `fetch_course_snapshot(course, include_announcements) -> CourseSnapshotResult`. Diagnostic HTML is scrubbed *inside* the module before it is returned. |
@@ -207,6 +207,25 @@ notifies (unless `notify_anomaly` is off).
 The two policy primitives `validate_snapshot()` and `detect_semester_rollover()` remain
 directly callable for callers that only hold a snapshot, and `diff_states()` remains the
 public diff entry point — all three live here now, not in `tracker.py`.
+
+### Cycle orchestration
+
+`run_cycle(client, courses, store, options, notifiers)` takes a real `RuntimeStore` and one
+`CycleOptions` (field names match the old keyword arguments, so every pre-refactor call site
+still works through a compatibility shim):
+
+```python
+CycleOptions(base_url, track_announcements=False, reset_state=False, notify_anomaly=True,
+             semester=None, dry_run=False, max_backups=None, notifier_timeout=None,
+             lock_timeout=30.0, cancel_event=None, on_progress=None, state_path=None)
+```
+
+The body is one straight line with a single tail: `store.lock()` -> `store.load_state()` ->
+`scan_all_courses()` -> cancel check -> mid-scan `SessionExpiredError` re-raise (state untouched)
+-> `store.load_anomaly()` -> `compute_transition()` -> `_log_transition()` -> cancel check ->
+dry-run gate -> `store.save_state()` / `save_anomaly()`+`write_anomaly_diagnostics()` /
+`clear_anomaly()` -> `dispatch_all()` per notification. Baseline, rollover, and diff no longer
+have separate tails, so lifecycle fixes cannot diverge between them.
 
 ---
 
