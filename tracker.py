@@ -30,7 +30,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, TypeVar
 
 try:
     import fcntl
@@ -1112,18 +1112,12 @@ def _write_anomaly_diagnostics(
         print(f"[WARN] Could not write anomaly diagnostics: {exc}")
 
 
-def _reload_from_bytes(
-    env_path: Path, raw: Optional[bytes], require_session: bool
-) -> TrackerConfig:
-    """Parse an already-read .env snapshot so the daemon reads the file only once."""
-    return load_config(env_path, require_session=require_session, raw=raw)
-
-
 def run_daemon(
     env_path: Path,
     state_path: Path,
     dry_run: bool = False,
     heartbeat_path: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
 ) -> int:
     stop = False
     stop_event = threading.Event()
@@ -1139,7 +1133,7 @@ def run_daemon(
     signal.signal(signal.SIGINT, _handle_sig)
     signal.signal(signal.SIGTERM, _handle_sig)
 
-    cfg = load_config(env_path, require_session=True)
+    cfg = load_config(env_path, require_session=True, environ=environ)
     notifiers = build_notifiers(cfg.raw, timeout=cfg.notifier_timeout)
     client = SisClient(
         session_id=cfg.session_id,
@@ -1148,8 +1142,18 @@ def run_daemon(
         request_delay=cfg.request_delay,
     )
 
-    hb_path = heartbeat_path or default_heartbeat_path(state_path)
-    env_watcher = EnvWatcher(env_path)
+    hb_path = heartbeat_path or default_heartbeat_path(state_path, environ)
+    env_watcher = EnvWatcher(env_path, environ)
+
+    def _load_env_snapshot(
+        env_file: Path, raw: Optional[bytes], require_session: bool
+    ) -> TrackerConfig:
+        """Parse an already-read .env snapshot so the daemon reads the file only once."""
+        if environ is None:
+            return load_config(env_file, require_session=require_session, raw=raw)
+        return load_config(
+            env_file, require_session=require_session, raw=raw, environ=environ
+        )
 
     last_fetch = 0.0
     expired_since: Optional[float] = None
@@ -1180,7 +1184,9 @@ def run_daemon(
     while not stop:
         # Hot-reload .env: ONE read per check, reused for fingerprint + parsing.
         try:
-            reload = env_watcher.check(require_session=False, loader=_reload_from_bytes)
+            reload = env_watcher.check(
+                require_session=False, environ=environ, loader=_load_env_snapshot
+            )
             env_changed, change_desc = reload.changed, reload.description
             fresh_cfg = reload.config
             session_src = fresh_cfg.sources.get("SIS_SESSION_ID", "unknown")
@@ -1481,7 +1487,7 @@ def run_daemon(
     return 0
 
 
-def main() -> int:
+def main(environ: Optional[Mapping[str, str]] = None) -> int:
     ap = argparse.ArgumentParser(description="COMSATS CUOnline Portal Tracker")
     ap.add_argument("--once", action="store_true", help="Run a single full scan and exit")
     ap.add_argument(
@@ -1511,19 +1517,19 @@ def main() -> int:
         return 1
 
     root = Path(__file__).resolve().parent
-    env_path = resolve_env_file(root)
-    state_path = resolve_state_file(root)
+    env_path = resolve_env_file(root, environ)
+    state_path = resolve_state_file(root, environ)
 
     if args.healthcheck:
-        cfg_vals = load_env_dict(env_path)
+        cfg_vals = load_env_dict(env_path, environ=environ)
         max_age_override = parse_int(cfg_vals, "HEALTHCHECK_MAX_AGE", 0, minimum=0) or None
-        hb_path = resolve_heartbeat_file(state_path)
+        hb_path = resolve_heartbeat_file(state_path, environ)
         ok, msg = check_healthcheck(hb_path, max_age_override=max_age_override)
         print(msg)
         return 0 if ok else 1
 
     if args.test_notify:
-        cfg = load_config(env_path, require_session=False)
+        cfg = load_config(env_path, require_session=False, environ=environ)
         notifiers = build_notifiers(cfg.raw)
         dispatch_all(
             notifiers,
@@ -1540,7 +1546,7 @@ def main() -> int:
         return 0
 
     if args.once:
-        cfg = load_config(env_path, require_session=True)
+        cfg = load_config(env_path, require_session=True, environ=environ)
         notifiers = build_notifiers(cfg.raw)
         cancel_event = threading.Event()
         client = SisClient(
@@ -1591,7 +1597,7 @@ def main() -> int:
             print(f"[ERROR] Scan failed: {exc}")
             return 1
 
-    return run_daemon(env_path, state_path, dry_run=args.dry_run)
+    return run_daemon(env_path, state_path, dry_run=args.dry_run, environ=environ)
 
 
 if __name__ == "__main__":

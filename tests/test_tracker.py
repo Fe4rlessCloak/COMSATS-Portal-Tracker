@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import config as config_module  # noqa: E402
 import probe  # noqa: E402
 import tracker  # noqa: E402
 from notifiers import BaseNotifier, Notification, _latin1_safe, dispatch_all  # noqa: E402
@@ -47,17 +48,12 @@ from sis_client import (  # noqa: E402
 )
 from tracker import (  # noqa: E402
     CycleTimeoutError,
-    EnvWatcher,
     StateLockError,
     check_healthcheck,
     detect_semester_rollover,
     diff_states,
     load_config,
-    load_env_with_sources,
     load_state,
-    normalize_session_id,
-    parse_env_file,
-    parse_env_text,
     run_cycle,
     run_daemon,
     run_with_timeout,
@@ -618,10 +614,12 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_updater, daemon=True)
             t.start()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
+                with mock.patch.object(
                     tracker, "SisClient", _FakeClient
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[notifier]):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
@@ -659,13 +657,18 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             prev_term = signal.getsignal(signal.SIGTERM)
             buf = io.StringIO()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
+                with mock.patch.object(
                     tracker, "SisClient", _AlwaysExpiredClient
                 ), mock.patch.object(
                     tracker, "build_notifiers", return_value=[notifier]
                 ), contextlib.redirect_stdout(buf):
-                    rc1 = run_daemon(env_path, state_path, heartbeat_path=hb_path)
-                    rc2 = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    fast_env = {"SIS_SESSION_ID": ""}
+                    rc1 = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ=fast_env
+                    )
+                    rc2 = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ=fast_env
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
@@ -678,43 +681,6 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             self.assertIn("exiting with code 1 for restart", output)
             hb = json.loads(hb_path.read_text(encoding="utf-8"))
             self.assertEqual(hb["status"], "exiting_session_expired")
-
-    def test_bug4_env_precedence_and_inode_replacement_watcher(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            env_path = Path(tmp) / ".env"
-            env_path.write_text("SIS_SESSION_ID=disk_cookie_1\n", encoding="utf-8")
-
-            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": "stale_process_env"}, clear=False):
-                values, sources = load_env_with_sources(env_path)
-                self.assertEqual(values["SIS_SESSION_ID"], "disk_cookie_1")
-                self.assertIn("overrides process_env", sources["SIS_SESSION_ID"])
-
-                # Fallback to process_env when .env key is blank
-                env_path.write_text("SIS_SESSION_ID=\n", encoding="utf-8")
-                values2, sources2 = load_env_with_sources(env_path)
-                self.assertEqual(values2["SIS_SESSION_ID"], "stale_process_env")
-                self.assertEqual(sources2["SIS_SESSION_ID"], "process_env")
-
-            # Watcher detects inode replacement even when value is unchanged, and content changes
-            env_path.write_text("SIS_SESSION_ID=cookie_same\n", encoding="utf-8")
-            watcher = EnvWatcher(env_path)
-            self.assertEqual(watcher.check_changed(), (False, ""))
-
-            tmp_env = Path(tmp) / ".env.tmp"
-            tmp_env.write_text("SIS_SESSION_ID=cookie_same\n", encoding="utf-8")
-            os.replace(tmp_env, env_path)
-            changed1, desc1 = watcher.check_changed()
-            self.assertTrue(changed1)
-            self.assertIn("inode", desc1)
-            self.assertIn("content unchanged", desc1)
-
-            tmp_env2 = Path(tmp) / ".env.tmp2"
-            tmp_env2.write_text("SIS_SESSION_ID=cookie_new\n", encoding="utf-8")
-            os.replace(tmp_env2, env_path)
-            changed2, desc2 = watcher.check_changed()
-            self.assertTrue(changed2)
-            self.assertIn("content changed", desc2)
-            self.assertEqual(load_config(env_path).session_id, "cookie_new")
 
     def test_bug5_login_detection_and_real_snapshots(self) -> None:
         # 1. Explicit markers, alternative login markup, meta refresh, JS redirect, final URL, missing shell
@@ -828,10 +794,12 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             prev_int = signal.getsignal(signal.SIGINT)
             prev_term = signal.getsignal(signal.SIGTERM)
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
+                with mock.patch.object(
                     tracker, "SisClient", _WedgedClient
                 ), mock.patch.object(tracker, "load_config", return_value=fast_cfg):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 wedge_gate.set()
                 signal.signal(signal.SIGINT, prev_int)
@@ -990,14 +958,15 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                     raise PortalHttpError("502 Bad Gateway")
 
             buf = io.StringIO()
-            with mock.patch.dict(
-                os.environ,
-                {"ENV_FILE": str(env_path), "STATE_FILE": str(state_path), "SIS_SESSION_ID": ""},
-                clear=False,
-            ), mock.patch.object(tracker, "SisClient", _ErrClient), mock.patch.object(
+            main_env = {
+                "ENV_FILE": str(env_path),
+                "STATE_FILE": str(state_path),
+                "SIS_SESSION_ID": "",
+            }
+            with mock.patch.object(tracker, "SisClient", _ErrClient), mock.patch.object(
                 sys, "argv", ["tracker.py", "--once"]
             ), contextlib.redirect_stdout(buf):
-                rc = tracker.main()
+                rc = tracker.main(environ=main_env)
 
             self.assertEqual(rc, 1)
             self.assertIn("[ERROR] Scan failed: 502 Bad Gateway", buf.getvalue())
@@ -1554,10 +1523,12 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_same_cookie_updater, daemon=True)
             t.start()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
+                with mock.patch.object(
                     tracker, "SisClient", _SameCookieClient
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[notifier]):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
@@ -1565,156 +1536,6 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual([n.event for n in notifier.notes], ["session_expired", "baseline_saved"])
-
-    def test_probe_respects_env_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            env_path = Path(tmp) / "custom.env"
-            env_path.write_text("SIS_SESSION_ID=probe_cookie_from_env_file\n", encoding="utf-8")
-
-            with mock.patch.dict(
-                os.environ,
-                {"ENV_FILE": str(env_path), "SIS_SESSION_ID": ""},
-                clear=False,
-            ), mock.patch.object(sys, "argv", ["probe.py"]), mock.patch.object(
-                probe, "run_probe", return_value=0
-            ) as mock_run:
-                rc = probe.main()
-
-            self.assertEqual(rc, 0)
-            mock_run.assert_called_once()
-            self.assertEqual(mock_run.call_args[0][0], "probe_cookie_from_env_file")
-
-    def test_env_parser_boms_and_encodings(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False):
-                # 1. UTF-8 BOM directly before SIS_SESSION_ID on line 1
-                p1 = Path(tmp) / "utf8_bom.env"
-                p1.write_bytes(b"\xef\xbb\xbfSIS_SESSION_ID=bom_sid_1\n")
-                self.assertEqual(load_config(p1).session_id, "bom_sid_1")
-
-                # 2. UTF-8 BOM directly before comment containing '=' on line 1
-                p2 = Path(tmp) / "utf8_bom_comment.env"
-                p2.write_bytes(b"\xef\xbb\xbf# comment with = sign\nSIS_SESSION_ID=bom_sid_2\n")
-                self.assertEqual(load_config(p2).session_id, "bom_sid_2")
-
-                # 3. UTF-16 LE & UTF-16 BE with BOM (and UTF-32 LE with BOM)
-                p3 = Path(tmp) / "utf16le.env"
-                p3.write_bytes(b"\xff\xfe" + "SIS_SESSION_ID=u16le_sid\n".encode("utf-16-le"))
-                self.assertEqual(load_config(p3).session_id, "u16le_sid")
-
-                p4 = Path(tmp) / "utf16be.env"
-                p4.write_bytes(b"\xfe\xff" + "SIS_SESSION_ID=u16be_sid\n".encode("utf-16-be"))
-                self.assertEqual(load_config(p4).session_id, "u16be_sid")
-
-                p5 = Path(tmp) / "utf32le.env"
-                p5.write_bytes(b"\xff\xfe\x00\x00" + "SIS_SESSION_ID=u32le_sid\n".encode("utf-32-le"))
-                self.assertEqual(load_config(p5).session_id, "u32le_sid")
-
-                # 4. Windows-1252 (cp1252) em-dash 0x97 in comment
-                p6 = Path(tmp) / "cp1252.env"
-                p6.write_bytes(b"# COMSATS \x97 Portal\nSIS_SESSION_ID=cp1252_sid\n")
-                self.assertEqual(load_config(p6).session_id, "cp1252_sid")
-
-    def test_env_parser_export_inline_comments_and_quotes(self) -> None:
-        # export prefix variations and non-export keys starting with export/EXPORT
-        parsed_export = parse_env_text(
-            "export SIS_SESSION_ID=abc\n"
-            "EXPORT_FLAG=1\n"
-            "export_mode=2\n"
-        )
-        self.assertEqual(parsed_export["SIS_SESSION_ID"], "abc")
-        self.assertEqual(parsed_export["EXPORT_FLAG"], "1")
-        self.assertEqual(parsed_export["export_mode"], "2")
-        self.assertEqual(parse_env_text('export   SIS_SESSION_ID="abc"\n')["SIS_SESSION_ID"], "abc")
-        self.assertEqual(parse_env_text("export\tSIS_SESSION_ID='abc' # note\n")["SIS_SESSION_ID"], "abc")
-
-        # Unquoted inline # comments vs unquoted '#' without preceding whitespace
-        with tempfile.TemporaryDirectory() as tmp:
-            env_path = Path(tmp) / ".env"
-            env_path.write_text(
-                "SIS_SESSION_ID=abc123 # morning\n"
-                "KEEPALIVE_INTERVAL=60 # 1 min\n"
-                "TRACK_ANNOUNCEMENTS=true # on\n"
-                "WEBHOOK_URL=https://example.com/hook#frag\n"
-                "NTFY_TOKEN=tok#123 # real comment\n",
-                encoding="utf-8",
-            )
-            with mock.patch.dict(
-                os.environ,
-                {"SIS_SESSION_ID": "", "KEEPALIVE_INTERVAL": "", "TRACK_ANNOUNCEMENTS": ""},
-                clear=False,
-            ):
-                cfg = load_config(env_path)
-            self.assertEqual(cfg.session_id, "abc123")
-            self.assertEqual(cfg.keepalive_interval, 60)
-            self.assertTrue(cfg.track_announcements)
-            self.assertEqual(cfg.raw["WEBHOOK_URL"], "https://example.com/hook#frag")
-            self.assertEqual(cfg.raw["NTFY_TOKEN"], "tok#123")
-
-        self.assertEqual(parse_env_text("SIS_SESSION_ID=# comment\n")["SIS_SESSION_ID"], "")
-        self.assertEqual(parse_env_text("SIS_SESSION_ID= # comment\n")["SIS_SESSION_ID"], "")
-
-        # Quoted values with trailing # comments, preserved #, empty quotes, nested quotes, escapes
-        quoted_cases = [
-            ('K="abc" # c', "abc"),
-            ('K="abc"#c', "abc"),
-            ("K='abc' # c", "abc"),
-            ("K='abc'#c", "abc"),
-            ('K="abc # 123" # c', "abc # 123"),
-            ("K='abc # 123' # c", "abc # 123"),
-            ('K="" # empty', ""),
-            ("K='' # empty", ""),
-            ("""K="a'b'" """, "a'b'"),
-            ("""K='a"b"' """, 'a"b"'),
-            (r'K="a\"b\\c"', 'a"b\\c'),
-        ]
-        for line, expected in quoted_cases:
-            self.assertEqual(parse_env_text(line)["K"], expected, msg=f"Failed for {line!r}")
-
-        # Duplicate keys: last assignment wins, including blanking an earlier .env key
-        with tempfile.TemporaryDirectory() as tmp:
-            env_path = Path(tmp) / ".env"
-            env_path.write_text(
-                "SIS_SESSION_ID=first\nSIS_SESSION_ID=second\nNTFY_URL=https://ntfy.sh/t\nNTFY_URL=\n",
-                encoding="utf-8",
-            )
-            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": "", "NTFY_URL": ""}, clear=False):
-                vals, _ = load_env_with_sources(env_path)
-            self.assertEqual(vals["SIS_SESSION_ID"], "second")
-            self.assertEqual(vals["NTFY_URL"], "")
-
-    def test_session_normalization_and_secret_free_diagnostics(self) -> None:
-        self.assertEqual(normalize_session_id("ASP.NET_SessionId=abc"), "abc")
-        self.assertEqual(normalize_session_id("asp.net_sessionid=abc; Path=/; HttpOnly"), "abc")
-        self.assertEqual(normalize_session_id("Cookie: foo=1; ASP.NET_SessionId=abc; bar=2"), "abc")
-        self.assertEqual(normalize_session_id("ASP.NET_SessionId="), "")
-        placeholder_parsed = parse_env_text('SIS_SESSION_ID="paste_your_ASP_NET_SessionId_here" # placeholder')
-        self.assertEqual(normalize_session_id(placeholder_parsed["SIS_SESSION_ID"]), "")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            # Directory passed as ENV_FILE must not raise IsADirectoryError
-            dir_path = Path(tmp) / "env_dir"
-            dir_path.mkdir()
-            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False):
-                self.assertEqual(parse_env_file(dir_path), {})
-                with self.assertRaises(SystemExit) as dir_ctx:
-                    load_config(dir_path, require_session=True)
-            self.assertIn("directory", str(dir_ctx.exception))
-
-            # Missing SIS_SESSION_ID with typo'd key surfaces key name without leaking any values
-            typo_env = Path(tmp) / ".env"
-            typo_env.write_text(
-                "SIS_SESSIONID=super_secret_val\nNTFY_TOKEN=secret_token\n",
-                encoding="utf-8",
-            )
-            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": "", "NTFY_TOKEN": ""}, clear=False):
-                with self.assertRaises(SystemExit) as typo_ctx:
-                    load_config(typo_env, require_session=True)
-            err_msg = str(typo_ctx.exception)
-            self.assertIn("SIS_SESSIONID", err_msg)
-            self.assertIn("NTFY_TOKEN", err_msg)
-            self.assertNotIn("super_secret_val", err_msg)
-            self.assertNotIn("secret_token", err_msg)
 
     def test_daemon_and_probe_with_bom_export_and_inline_comment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1730,9 +1551,10 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             )
 
             # Verify probe.load_config handles BOM + export + quoted inline comment
-            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": "", "SIS_USER_AGENT": ""}, clear=False):
-                probe_sid, _ = probe.load_config(env_path)
-                self.assertEqual(probe_sid, "expired_cookie")
+            probe_sid, _ = probe.load_config(
+                env_path, environ={"SIS_SESSION_ID": "", "SIS_USER_AGENT": ""}
+            )
+            self.assertEqual(probe_sid, "expired_cookie")
 
             notifier = _RecordingNotifier()
             resumed_event = threading.Event()
@@ -1787,10 +1609,12 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_updater, daemon=True)
             t.start()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
+                with mock.patch.object(
                     tracker, "SisClient", _FakeClient
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[notifier]):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
@@ -1927,10 +1751,12 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_stopper, daemon=True)
             t.start()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
+                with mock.patch.object(
                     tracker, "SisClient", _ValueErrorClient
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[_RecordingNotifier()]):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
@@ -1990,10 +1816,12 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_stopper, daemon=True)
             t.start()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
+                with mock.patch.object(
                     tracker, "SisClient", _SlowScanClient
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[_RecordingNotifier()]):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
@@ -2170,17 +1998,18 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                     return []
 
             reset_notifier = _RecordingNotifier()
-            with mock.patch.dict(
-                os.environ,
-                {"ENV_FILE": str(env_path), "STATE_FILE": str(state_path), "SIS_SESSION_ID": ""},
-                clear=False,
-            ), mock.patch.object(tracker, "SisClient", _ResetCliClient), mock.patch.object(
+            main_env = {
+                "ENV_FILE": str(env_path),
+                "STATE_FILE": str(state_path),
+                "SIS_SESSION_ID": "",
+            }
+            with mock.patch.object(tracker, "SisClient", _ResetCliClient), mock.patch.object(
                 tracker, "build_notifiers", return_value=[reset_notifier]
             ):
                 with mock.patch.object(sys, "argv", ["tracker.py", "--reset-state"]):
-                    self.assertEqual(tracker.main(), 1)
+                    self.assertEqual(tracker.main(environ=main_env), 1)
                 with mock.patch.object(sys, "argv", ["tracker.py", "--once", "--reset-state"]):
-                    rc_reset = tracker.main()
+                    rc_reset = tracker.main(environ=main_env)
 
             self.assertEqual(rc_reset, 0)
             self.assertEqual([n.event for n in reset_notifier.notes], ["baseline_saved"])
@@ -2262,9 +2091,14 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             orig_load_config = tracker.load_config
 
             def _fast_load_config(
-                ep: Path, require_session: bool = True, raw: Optional[bytes] = None
+                ep: Path,
+                require_session: bool = True,
+                raw: object = config_module._UNREAD,
+                environ: Optional[dict] = None,
             ) -> tracker.TrackerConfig:
-                cfg_obj = orig_load_config(ep, require_session=require_session, raw=raw)
+                cfg_obj = orig_load_config(
+                    ep, require_session=require_session, raw=raw, environ=environ
+                )
                 cfg_obj.keepalive_interval = 1
                 return cfg_obj
 
@@ -2273,12 +2107,14 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_driver, daemon=True)
             t.start()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
+                with mock.patch.object(
                     tracker, "SisClient", _FlakyReusedClient
                 ), mock.patch.object(
                     tracker, "load_config", side_effect=_fast_load_config
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[notifier]):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)

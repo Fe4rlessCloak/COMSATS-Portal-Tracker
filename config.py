@@ -74,6 +74,10 @@ NOTIFIER_ENV_KEYS = (
     "TELEGRAM_CHAT_ID",
 )
 
+# Sentinel: distinguishes "caller already read the file (None = absent)" from
+# "no bytes supplied, read the file now".
+_UNREAD = object()
+
 _EXPORT_PREFIX_RE = re.compile(r"^export[ \t]+")
 _INLINE_COMMENT_RE = re.compile(r"(?:^|\s+)#.*$")
 _SESSION_COOKIE_RE = re.compile(r"(?:^|;\s*)asp\.net_sessionid\s*=\s*([^;]*)", re.IGNORECASE)
@@ -260,12 +264,12 @@ def normalize_session_id(raw_value: str) -> str:
 def load_env_with_sources(
     env_path: Path,
     environ: Optional[Mapping[str, str]] = None,
-    raw: Optional[bytes] = None,
+    raw: Any = _UNREAD,
 ) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Load settings from process environment overridden by non-empty values in .env.
 
-    ``raw`` may carry already-read file bytes so callers (e.g. the watcher) never
-    read the file twice for one check.
+    ``raw`` may carry already-read file bytes (``None`` meaning "absent") so callers
+    such as the watcher never read the file twice for one check.
     """
     env = _environ(environ)
     values: Dict[str, str] = {}
@@ -277,7 +281,10 @@ def load_env_with_sources(
             values[key] = env_val
             sources[key] = "process_env"
 
-    file_values = parse_env_bytes(raw) if raw is not None else parse_env_file(env_path)
+    if raw is _UNREAD:
+        file_values = parse_env_file(env_path)
+    else:
+        file_values = parse_env_bytes(raw) if raw is not None else {}
     for key, val in file_values.items():
         if val.strip() != "":
             had_proc_env = bool((env.get(key) or "").strip())
@@ -297,16 +304,16 @@ def load_env_with_sources(
 def load_env_dict(
     env_path: Path,
     environ: Optional[Mapping[str, str]] = None,
-    raw: Optional[bytes] = None,
+    raw: Any = _UNREAD,
 ) -> Dict[str, str]:
     """Load key=value settings from process environment overridden by .env on disk."""
     values, _ = load_env_with_sources(env_path, environ=environ, raw=raw)
     return values
 
 
-def env_file_signature(env_path: Path, raw: Optional[bytes] = None) -> EnvFileSignature:
+def env_file_signature(env_path: Path, raw: Any = _UNREAD) -> EnvFileSignature:
     """Fingerprint the .env path, reusing already-read bytes when supplied."""
-    if raw is None:
+    if raw is _UNREAD:
         raw = read_env_bytes(env_path)
     if raw is None:
         return EnvFileSignature(
@@ -390,16 +397,15 @@ class EnvWatcher:
         raw = read_env_bytes(self.env_path)
         _, changed, desc = self._observe(raw)
         env = self.environ if environ is None else environ
-        file_bytes = raw if raw is not None else b""
         if loader is None:
             cfg = load_config(
                 self.env_path,
                 require_session=require_session,
                 environ=env,
-                raw=file_bytes,
+                raw=raw,
             )
         else:
-            cfg = loader(self.env_path, file_bytes, require_session)
+            cfg = loader(self.env_path, raw, require_session)
         return EnvReload(changed=changed, description=desc, config=cfg)
 
 
@@ -513,7 +519,7 @@ def load_config(
     env_path: Path,
     require_session: bool = True,
     environ: Optional[Mapping[str, str]] = None,
-    raw: Optional[bytes] = None,
+    raw: Any = _UNREAD,
 ) -> TrackerConfig:
     """Build typed configuration from process env + .env (reusing raw bytes if given)."""
     values, sources = load_env_with_sources(env_path, environ=environ, raw=raw)

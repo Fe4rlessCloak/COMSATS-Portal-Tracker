@@ -443,7 +443,7 @@ def run_keepalive(
     return 0
 
 
-def main() -> int:
+def main(environ: Optional[Dict[str, str]] = None) -> int:
     ap = argparse.ArgumentParser(description="COMSATS SIS Portal Prober & Keep-Alive Tester")
     ap.add_argument(
         "--keepalive",
@@ -475,8 +475,8 @@ def main() -> int:
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parent
-    env_path = resolve_env_file(root)
-    session_id, user_agent = load_config(env_path)
+    env_path = resolve_env_file(root, environ)
+    session_id, user_agent = load_config(env_path, environ)
     if args.keepalive:
         return run_keepalive(session_id, user_agent, args.interval, args.duration, args.path)
     return run_probe(session_id, user_agent, root / "snapshots", args.course)
