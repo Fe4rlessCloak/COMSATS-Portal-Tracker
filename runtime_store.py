@@ -56,17 +56,30 @@ def _temp_path_for(path: Path) -> Path:
     return path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
 
 
+def _discard_temps(*paths: Path) -> None:
+    """Best-effort removal of staged temp files; never masks the original error."""
+    for path in paths:
+        with contextlib.suppress(OSError):
+            if path.exists():
+                path.unlink()
+
+
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write ``data`` to ``path`` atomically, cleaning up the temp on any failure."""
+    """Write ``data`` to ``path`` atomically, cleaning up the temp on any failure.
+
+    This is the single writer behind every one of the eight runtime files: the
+    parent directory is created, the payload is staged to a sibling temp file, and
+    ``os.replace`` commits it. If anything raises -- including ``BaseException``
+    such as ``KeyboardInterrupt`` -- the staged temp file is removed before the
+    exception propagates, so no half-written file or ``*.tmp*`` litter survives.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = _temp_path_for(path)
     try:
         tmp_path.write_bytes(data)
         os.replace(tmp_path, path)
     except BaseException:
-        with contextlib.suppress(OSError):
-            if tmp_path.exists():
-                tmp_path.unlink()
+        _discard_temps(tmp_path)
         raise
 
 
@@ -106,7 +119,12 @@ def _state_backup_paths(state_path: Path) -> List[Path]:
 def default_heartbeat_path(
     state_path: Path, environ: Optional[Dict[str, str]] = None
 ) -> Path:
-    """Resolve the heartbeat path: ``HEARTBEAT_FILE`` if set, else next to state."""
+    """Resolve the heartbeat path: ``HEARTBEAT_FILE`` if set, else next to state.
+
+    ``environ`` defaults to the process environment to preserve the original
+    behaviour; callers that already hold a resolved configuration should pass the
+    mapping explicitly instead of relying on ``os.environ``.
+    """
     values = os.environ if environ is None else environ
     env_hb = str(values.get("HEARTBEAT_FILE") or "").strip()
     return Path(env_hb) if env_hb else state_path.with_name("heartbeat.json")
@@ -233,19 +251,37 @@ class RuntimeStore:
     def save_state(
         self, state: Dict[str, Any], max_backups: Optional[int] = None
     ) -> None:
-        """Atomically persist ``state``, rotating bounded rolling backups first."""
+        """Persist ``state`` atomically, rotating bounded rolling backups.
+
+        Ordering (unchanged from the original implementation): older backups are
+        shifted ``.bak -> .bak.2 -> ...``, the outgoing primary's bytes are written
+        to ``state.json.bak``, and only then is the new primary committed. Every
+        one of those three writes goes through the module's single atomic writer.
+        Rotation is skipped entirely when the current primary is corrupt JSON, so
+        corrupt state can never be rotated over a healthy backup chain.
+        """
         keep = self.max_backups if max_backups is None else int(max_backups)
         text = json.dumps(state, indent=2, ensure_ascii=False)
 
+        rotate = False
         if self.state_path.exists() and keep >= 1:
             if _read_json_dict(self.state_path) is not None:
-                self._rotate_backups(keep)
+                rotate = True
             else:
                 print(
                     f"[WARN] Skipping backup rotation of corrupt {self.state_path}; "
                     "preserving existing backups."
                 )
 
+        if not rotate:
+            _atomic_write_text(self.state_path, text)
+            return
+
+        # The backup receives the outgoing primary's bytes, so read them before the
+        # new primary replaces them.
+        outgoing = self.state_path.read_bytes()
+        self._rotate_backups(keep)
+        _atomic_write_bytes(self.backup_path, outgoing)
         _atomic_write_text(self.state_path, text)
 
     def _rotate_backups(self, max_backups: int) -> None:
@@ -258,7 +294,6 @@ class RuntimeStore:
             dst = self.state_path.with_name(f"{self.state_path.name}.bak.{idx}")
             if src.exists():
                 os.replace(src, dst)
-        _atomic_write_bytes(self.backup_path, self.state_path.read_bytes())
 
     # -------------------------------------------------------------- heartbeat
 
