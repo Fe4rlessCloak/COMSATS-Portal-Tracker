@@ -662,6 +662,19 @@ class CycleIntegrationTests(unittest.TestCase):
             run_cycle(None, [self.course], self.store, None, [], base_url=self.BASE,
                       not_a_real_option=1)
 
+    def test_a_positional_string_in_place_of_options_is_rejected_loudly(self) -> None:
+        # The old 6-argument positional signature would land base_url here; failing loudly
+        # beats silently scanning with the wrong policy.
+        with self.assertRaises(TypeError) as ctx:
+            run_cycle(
+                portal_client(self.portal(marks=[])),
+                [self.course],
+                self.store,
+                self.BASE,  # type: ignore[arg-type]
+                [],
+            )
+        self.assertIn("CycleOptions", str(ctx.exception))
+
     def test_legacy_keyword_call_style_still_works(self) -> None:
         res = run_cycle(
             portal_client(self.portal(marks=[])),

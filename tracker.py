@@ -318,6 +318,18 @@ def run_cycle(
             "run_cycle() accepts either CycleOptions or the legacy keyword arguments, "
             f"not both (got: {', '.join(sorted(legacy_kwargs))})"
         )
+    elif not isinstance(options, CycleOptions):
+        raise TypeError(
+            "run_cycle() positional arguments are "
+            "(client, courses, store, options, notifiers); got "
+            f"options={options!r}. Pass a CycleOptions, or use the legacy keyword form "
+            "run_cycle(client, courses, state_path=..., base_url=..., notifiers=[...])."
+        )
+    if notifiers is not None and isinstance(notifiers, (str, bytes)):
+        raise TypeError(
+            "run_cycle() expects a sequence of notifiers, not a bare string; "
+            "the legacy 6-argument positional form is no longer supported — use keywords."
+        )
     active_notifiers: List[BaseNotifier] = list(notifiers or ())
     runtime_store = _resolve_cycle_store(store, options.state_path)
 
