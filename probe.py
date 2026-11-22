@@ -12,7 +12,6 @@ Zero external dependencies (Python 3 stdlib only).
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import signal
 import sys

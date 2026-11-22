@@ -43,7 +43,7 @@ from config import (  # noqa: E402
     resolve_state_file,
 )
 from notifiers import BaseNotifier, build_notifiers  # noqa: E402
-from sis_client import Course, SessionExpiredError  # noqa: E402
+from sis_client import Course  # noqa: E402
 
 NO_ENV: Dict[str, str] = {}
 

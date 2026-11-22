@@ -10,13 +10,15 @@ Zero external packages — **Python 3.9+ standard library only** (`urllib`, `htm
 
 | File | Role |
 | :--- | :--- |
-| `tracker.py` | Main daemon loop, `.env` watcher, state locking, backups, snapshot validation, diffing, watchdog timeouts, heartbeat & `--healthcheck` CLI. |
+| `config.py` | **Leaf** config module (no project imports): `.env` byte decoding (UTF-8/16/32 BOMs + cp1252 fallback), text parsing (`export`, quotes/escapes, inline `#`), `SIS_SESSION_ID` normalization + placeholder rejection, secret-free missing-session diagnostics, process-env vs. file precedence with per-key provenance, single-read `.env` fingerprint watching, path resolution (`ENV_FILE`/`STATE_FILE`/`HEARTBEAT_FILE`), typed `TrackerConfig`, and the one canonical `NOTIFIER_TIMEOUT` rule. Every entry point takes an optional `environ` mapping. |
+| `tracker.py` | Main daemon loop, state locking, backups, snapshot validation, diffing, watchdog timeouts, heartbeat & `--healthcheck` CLI. Imports env/config/watch behaviour from `config.py`. |
 | `sis_client.py` | HTTP client (`SisClient`) with `ASP.NET_SessionId` + authenticated `Set-Cookie` handling, login/expiry detection, page-marker validation, active-course verification, diagnostic HTML scrubbing, and HTML parsers. |
-| `notifiers.py` | Pluggable push backends (`ConsoleNotifier`, `NtfyNotifier`, `WebhookNotifier`, `DiscordNotifier`, `TelegramNotifier`) with threaded, timeout-bounded `dispatch_all`. |
-| `probe.py` | Standalone diagnostic CLI (respects `ENV_FILE`) to inspect raw portal HTML endpoints and test keep-alive timing. |
-| `Dockerfile` | `python:3.13-slim` container running `python3 -u tracker.py` with `HEALTHCHECK` calling `python3 tracker.py --healthcheck`. |
+| `notifiers.py` | Pluggable push backends (`ConsoleNotifier`, `NtfyNotifier`, `WebhookNotifier`, `DiscordNotifier`, `TelegramNotifier`) with threaded, timeout-bounded `dispatch_all`. `build_notifiers()` takes the unified timeout from `config.py`. |
+| `probe.py` | Standalone diagnostic CLI (respects `ENV_FILE`) to inspect raw portal HTML endpoints and test keep-alive timing. Imports env loading + session normalization from `config`, never from `tracker`. |
+| `Dockerfile` | `python:3.13-slim` container running `python3 -u tracker.py` with `HEALTHCHECK` calling `python3 tracker.py --healthcheck`. Copies every top-level module (`config.py`, `sis_client.py`, `notifiers.py`, `tracker.py`, `probe.py`). |
 | `docker-compose.yml` | Runs `comsats-portal-tracker` with `restart: unless-stopped`, directory-mounted config (`./:/app/config:ro`), and persistent `./data:/app/data`. |
-| `tests/test_tracker.py` | Offline unit tests (`python3 -m unittest discover -s tests -v`) covering parsers, diffing, real HTML snapshots, and every failure fallback. |
+| `tests/test_tracker.py` | Offline unit tests (`python3 -m unittest discover -s tests -v`) covering parsers, diffing, real HTML snapshots, daemon behaviour, and every failure fallback. |
+| `tests/test_config.py` | Offline tests for the leaf Config module: encodings, parsing, session normalization, precedence/provenance, diagnostics, unified `NOTIFIER_TIMEOUT`, single-read watching, notifier-change detection, and prober loading — all via injected `environ` mappings and real temp `.env` files. |
 
 ---
 
@@ -31,10 +33,13 @@ The COMSATS ASP.NET portal kills idle sessions after ~4–5 minutes. Because scr
   startup (load_config, EnvWatcher, initial heartbeat)
      │
      ▼
- ┌─▶ 1. Hot-reload check: EnvWatcher.check_changed() + load_config()
+ ┌─▶ 1. Hot-reload check: EnvWatcher.check() — ONE read of .env per tick
+ │      ├─ same bytes used for the fingerprint (inode/mtime/size/sha256) AND parsing
+ │      ├─ returns (changed, description, freshly parsed TrackerConfig)
  │      ├─ .env non-empty values override process_env
- │      └─ New SIS_SESSION_ID? -> swap cookie in memory, clear expiry state, force immediate scan
- │
+ │      ├─ New SIS_SESSION_ID? -> swap cookie in memory, clear expiry state, force immediate scan
+ │      └─ Notifier instances rebuilt ONLY when cfg.notifier_key changes
+ │         (NOTIFIER_TIMEOUT / notifier URLs / tokens), never on plain ticks
  │   2. Waiting on expired session? (expired_since set or empty SIS_SESSION_ID)
  │      ├─ Write heartbeat status="waiting_for_session" (healthcheck fails)
  │      ├─ Log rate-limited wait status
@@ -92,8 +97,8 @@ Future sessions editing `sis_client.py` should keep these portal behaviors in mi
 | **Silent deletions on the portal** | `diff_states()` compares both directions (`new - old` and `old - new`), emitting `marks_removed`, `resource_removed`, `announcement_removed`, and `course_removed`. Legitimate small removals (e.g. `2 -> 1` marks) pass plausibility checks, update state, and notify. |
 | **Corrupt `state.json` or concurrent `--once` + daemon race** | `state_lock()` acquires an exclusive `fcntl.flock` on `data/state.json.lock` **before** `load_state()` so old state is always read prior to scanning. `save_state()` writes a PID/thread-scoped temp file (cleaning up temps on error), skips rotating `.bak*` if `state.json` on disk is corrupt JSON, and otherwise atomically rotates `state.json.bak`..`.bak.5` before `os.replace`ing `state.json`. If `state.json` is corrupt JSON, `load_state()` falls back across `state.json.bak` through `state.json.bak.N`. |
 | **Session expiry & restart alert spam** | `run_daemon()` hashes the expired cookie into `data/.session_alerted` so it sends **one** `session_expired` notification (even across container restarts while still expired). It polls `.env` every `EXPIRED_POLL_INTERVAL` (`15s`) and exits with code `1` once `SESSION_EXPIRED_TIMEOUT` (`300s`) elapses so Docker's `restart: unless-stopped` recycles the container. Any `.env` save while waiting immediately re-tests the session, and any successful `get_courses()` clears `.session_alerted` immediately (even if the subsequent full scan hits an anomaly). |
-| **`.env` edits with inode replacement, BOM/shell formats, or `env_file:` overrides** | `docker-compose.yml` mounts `./:/app/config:ro` (`ENV_FILE=/app/config/.env`) instead of a single-file `.env` mount, so atomic-save editors (`vim`, VS Code, `sed -i`) are visible immediately. `parse_env_file()` / `parse_env_text()` supports UTF-8/UTF-16/UTF-32 BOMs (with cp1252 fallback), POSIX `export KEY=VALUE` lines, single/double quotes with escape handling, inline `#` comments (both unquoted and after quoted values), and `Cookie:` / `ASP.NET_SessionId=` normalization. `load_env_with_sources()` lets non-empty `.env` keys override `os.environ` (falling back to `os.environ` if `.env` leaves a key blank) and logs the winning source. `EnvWatcher` hashes and stats `.env` fresh by path on every iteration. |
-| **Hung HTTP request, unsafe redirect, header error, or shutdown mid-scan** | `SisClient.get_html()` sanitizes `User-Agent`/`Referer`, catches `URLError`, `TimeoutError`, `http.client.HTTPException`, `OSError`, and `ValueError`/`UnicodeEncodeError`, refuses cross-host or HTTPS-to-HTTP downgrade redirects (`_is_safe_redirect_target()` in `sis_client.py` and `probe.py`), and supports cooperative `cancel_event`. `dispatch_all()` sends each non-console notifier in a daemon thread bounded by `NOTIFIER_TIMEOUT` (`20s` in `tracker.py`, `15s` per notifier default). The whole daemon tick runs inside `run_with_timeout(CYCLE_TIMEOUT = 120s)` with `stop_event` support so `SIGTERM`/`SIGINT` cancels in-flight scans cleanly without waiting for Docker `SIGKILL`; if a thread stays wedged past the 2s grace window (or times out 3 times in a row), `run_daemon` exits `1`. |
+| **`.env` edits with inode replacement, BOM/shell formats, or `env_file:` overrides** | `docker-compose.yml` mounts `./:/app/config:ro` (`ENV_FILE=/app/config/.env`) instead of a single-file `.env` mount, so atomic-save editors (`vim`, VS Code, `sed -i`) are visible immediately. `config.parse_env_bytes()` / `config.parse_env_text()` support UTF-8/UTF-16/UTF-32 BOMs (with cp1252 fallback), POSIX `export KEY=VALUE` lines, single/double quotes with escape handling, inline `#` comments (both unquoted and after quoted values), and `Cookie:` / `ASP.NET_SessionId=` normalization (`config.normalize_session_id()` also rejects the `paste_your_ASP_NET_SessionId_here` placeholder). `config.load_env_with_sources()` lets non-empty `.env` keys override the environment mapping (falling back to it if `.env` leaves a key blank) and records the winning source per key. `config.EnvWatcher.check()` reads `.env` **at most once per check** and reuses those bytes for both the fingerprint (existence, inode, mtime, size, SHA-256) and the newly parsed `TrackerConfig`, returning `(changed, description, config)` together. Every config entry point takes an optional `environ` mapping (defaulting to `os.environ`) so callers and tests never mutate global environment state. |
+| **Hung HTTP request, unsafe redirect, header error, or shutdown mid-scan** | `SisClient.get_html()` sanitizes `User-Agent`/`Referer`, catches `URLError`, `TimeoutError`, `http.client.HTTPException`, `OSError`, and `ValueError`/`UnicodeEncodeError`, refuses cross-host or HTTPS-to-HTTP downgrade redirects (`_is_safe_redirect_target()` in `sis_client.py` and `probe.py`), and supports cooperative `cancel_event`. `dispatch_all()` sends each non-console notifier in a daemon thread bounded by `NOTIFIER_TIMEOUT` (one rule in `config.py`: default `20s`, minimum `1s`, passed into `build_notifiers()`; per-notifier HTTP default is also `20s`). The whole daemon tick runs inside `run_with_timeout(CYCLE_TIMEOUT = 120s)` with `stop_event` support so `SIGTERM`/`SIGINT` cancels in-flight scans cleanly without waiting for Docker `SIGKILL`; if a thread stays wedged past the 2s grace window (or times out 3 times in a row), `run_daemon` exits `1`. |
 | **Silent daemon stall / invisible hang** | `run_daemon` writes `data/heartbeat.json` on the main loop thread (during startup, scan progress, after ticks, and every `15s` while sleeping). Docker's `HEALTHCHECK` runs `python3 tracker.py --healthcheck` every `30s`, failing if `heartbeat.json` is missing, stale (`> max(KEEPALIVE_INTERVAL, 60)` or `HEALTHCHECK_MAX_AGE`), or in `waiting_for_session` / `exiting_session_expired` / `wedged_exiting`. |
 | **`--once` network/HTTP failure** | `main()` wraps `--once` in `run_with_timeout` and catches `SessionExpiredError`, `PortalHttpError`, `CycleTimeoutError`, `StateLockError`, and `ValueError`, printing a one-line `[ERROR]` message and exiting `1` cleanly. |
 
@@ -125,7 +130,7 @@ All runtime files live under `./data/` (mounted to `/app/data` in Docker) and ar
 | `CYCLE_TIMEOUT` | `120` (min `5`) | Hard per-tick deadline (seconds) before flagging a cycle as timed out / wedged. |
 | `SESSION_EXPIRED_TIMEOUT` | `300` (min `0`) | Seconds to poll `.env` after expiry before exiting `1` for restart (`0` = immediate exit). |
 | `EXPIRED_POLL_INTERVAL` | `15` (min `1`) | Seconds between `.env` checks while waiting on an expired session. |
-| `NOTIFIER_TIMEOUT` | `20` (min `1`) | Join timeout (seconds) per notification dispatch in `tracker.py` (notifier HTTP timeout defaults to `15s`, min `2s`). |
+| `NOTIFIER_TIMEOUT` | `20` (min `1`) | Single canonical rule in `config.py` (`NOTIFIER_TIMEOUT_DEFAULT = 20.0`, `NOTIFIER_TIMEOUT_MINIMUM = 1.0`): the join timeout per notification dispatch and the per-notifier HTTP timeout. Passed into `build_notifiers()`; there is no separate notifier-side default or minimum. Non-notifier `.env` edits never trigger a notifier rebuild. |
 | `MAX_STATE_BACKUPS` | `5` (min `1`) | Number of rolling `state.json.bak*` files to keep. |
 | `HEALTHCHECK_MAX_AGE` | `0` (auto) | Max allowed heartbeat age in seconds (`0` = `max(KEEPALIVE_INTERVAL, 60)`). |
 
@@ -137,6 +142,11 @@ All runtime files live under `./data/` (mounted to `/app/data` in Docker) and ar
   ```bash
   python3 -m unittest discover -s tests -v
   ```
+- **Add configuration by editing `config.py`, not `tracker.py`**: env decoding, parsing, session
+  normalization, source provenance, path resolution and typed `TrackerConfig` all live in the leaf
+  `config.py`. Keeping it leaf (no imports of `tracker`, `probe`, `sis_client` or `notifiers`) is
+  what keeps the module graph acyclic — `probe.py` imports config directly and must never import
+  `tracker`. New top-level modules must also be added to the `COPY` line in `Dockerfile`.
 - **Keep it zero-dependency**: stick to Python standard library modules only (`Dockerfile` does not run `pip install`).
 - **Verify HTML changes against real snapshots**: `snapshots/*.html` (gitignored, present locally) contains real captured portal pages; run `detect_login_page()`, `has_authenticated_shell()`, and `parse_active_course()` against them whenever modifying HTML parsing or login detection.
 - **Container updates**: changes to `Dockerfile`, `docker-compose.yml`, or Python source require `docker compose up -d --build` on the host; `.env` updates alone do not.
