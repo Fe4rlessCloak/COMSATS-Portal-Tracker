@@ -41,7 +41,9 @@ from sis_client import (  # noqa: E402
     SisClient,
     TransportError,
     UrllibTransport,
+    extract_diagnostic_text,
     parse_active_course,
+    scrub_diagnostic_html,
     verify_active_course,
 )
 
@@ -1101,6 +1103,41 @@ class PortalSecretScrubbingSeamTests(unittest.TestCase):
         self.assertIn("No marks available.", snapshot.diagnostic_preview)
         self.assertNotIn(self.PASSWORD_VALUE, snapshot.diagnostic_preview)
         self.assertNotIn(self.SESSION_VALUE, snapshot.diagnostic_preview)
+
+    def test_diagnostic_scrubbers_are_directly_callable_on_hostile_markup(self) -> None:
+        """The pure scrubbers keep working standalone, including on real captures."""
+        hostile = (
+            '<html><body class="sis-portal-body">'
+            '<header class="sis-portal-header">'
+            '<a id="Dash_Board" href="/Courses/Index">Dashboard</a>'
+            '<div class="page_title_container"><h3>Course 1</h3>'
+            "<h5>Course Code : CSC101</h5></div>"
+            '<form id="synopsisForm" method="post" '
+            'action="https://ww5.comsats.edu.pk/efs/StudentLogin.aspx">'
+            '<input name="uid" hidden type="text" value="CIIT/TEST-001/ISB">'
+            f'<input name="pwd" hidden type="password" value="{self.PASSWORD_VALUE}">'
+            "</form></header>"
+            '<div class="main_body"><div class="content_area">'
+            '<div class="sis-marks-summary"><p class="sis-marks-empty">No marks available.</p>'
+            '<input type="password" value="INNER_SECRET">'
+            "</div></div></div>"
+            '<footer class="sis-portal-footer"><p>Footer</p></footer>'
+            "</body></html>"
+        )
+        scrubbed = scrub_diagnostic_html(hostile)
+        self.assertNotIn(self.PASSWORD_VALUE, scrubbed)
+        self.assertNotIn("synopsisForm", scrubbed)
+        self.assertNotIn("INNER_SECRET", scrubbed)
+        self.assertIn("<!-- password input redacted -->", scrubbed)
+        self.assertIn("No marks available.", extract_diagnostic_text(hostile))
+
+        snap_marks = Path(__file__).resolve().parent.parent / "snapshots" / "marks_summary.html"
+        if snap_marks.exists():  # gitignored local captures; absent in clean CI checkouts
+            raw_snap = snap_marks.read_text(encoding="utf-8", errors="replace")
+            scrubbed_snap = scrub_diagnostic_html(raw_snap)
+            self.assertNotIn("synopsisForm", scrubbed_snap)
+            self.assertNotIn("type='password'", scrubbed_snap.lower())
+            self.assertNotIn('type="password"', scrubbed_snap.lower())
 
     def test_cookie_value_travels_as_a_header_name_only(self) -> None:
         stub = StubTransport()
