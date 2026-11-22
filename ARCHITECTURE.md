@@ -10,13 +10,15 @@ Zero external packages — **Python 3.9+ standard library only** (`urllib`, `htm
 
 | File | Role |
 | :--- | :--- |
-| `tracker.py` | Main daemon loop, `.env` watcher, state locking, backups, snapshot validation, diffing, watchdog timeouts, heartbeat & `--healthcheck` CLI. |
+| `tracker.py` | Main daemon loop, `.env` watcher, config load, snapshot validation, diffing, watchdog timeouts, and the CLI (`--once`, `--healthcheck`, ...). Persists everything through `RuntimeStore`. |
+| `runtime_store.py` | **Runtime Store** — single owner of all eight `data/` runtime files: exclusive `fcntl.flock` locking, atomic state saves with rolling backups + corrupt fallback, heartbeat writing/`--healthcheck` evaluation, SHA-256 session-expiry marker, anomaly marker, and scrubbed anomaly diagnostics. One atomic temp-file+`os.replace` writer with guaranteed temp cleanup. |
 | `sis_client.py` | HTTP client (`SisClient`) with a single injectable HTTP transport adapter, `ASP.NET_SessionId` + authenticated `Set-Cookie` handling, explicit `reconfigure()` for connection settings, login/expiry detection, page-marker validation, active-course verification, diagnostic HTML scrubbing, and HTML parsers. |
 | `notifiers.py` | Pluggable push backends (`ConsoleNotifier`, `NtfyNotifier`, `WebhookNotifier`, `DiscordNotifier`, `TelegramNotifier`) with threaded, timeout-bounded `dispatch_all`. |
 | `probe.py` | Standalone diagnostic CLI (respects `ENV_FILE`) to inspect raw portal HTML endpoints and test keep-alive timing. |
 | `Dockerfile` | `python:3.13-slim` container running `python3 -u tracker.py` with `HEALTHCHECK` calling `python3 tracker.py --healthcheck`. |
 | `docker-compose.yml` | Runs `comsats-portal-tracker` with `restart: unless-stopped`, directory-mounted config (`./:/app/config:ro`), and persistent `./data:/app/data`. |
 | `tests/test_tracker.py` | Offline unit tests (`python3 -m unittest discover -s tests -v`) covering parsers, diffing, real HTML snapshots, and every failure fallback. |
+| `tests/test_runtime_store.py` | Behavioral tests for the Runtime Store against real temp dirs: real `flock` contention/timeout, atomic writes + temp cleanup on simulated disk failure, backup rotation/recovery, markers, diagnostics, bound heartbeat, healthcheck. |
 | `tests/test_portal.py` | Portal transport-seam tests: every `SisClient` protocol behavior (redirect safety, cookie lifecycle, login detection, active-course verification, cancellation, header sanitization, error translation, explicit reconfiguration) driven through one stub transport adapter. |
 | `tests/support_stub_transport.py` | Reusable in-memory `PortalTransport` stub (`StubTransport` / `StubResponse`) serving canned responses, redirect sequences, multi-value `Set-Cookie`, and transport errors while recording outbound requests. Not shipped in the image. |
 
@@ -46,13 +48,14 @@ The COMSATS ASP.NET portal kills idle sessions after ~4–5 minutes. Because scr
  │   3. Bounded tick via run_with_timeout(CYCLE_TIMEOUT = 120s):          │
  │      ├─ client.get_courses()  (/Courses + courses marker check)        │
  │      ├─ If due (>= FETCH_INTERVAL or first scan):                      │
- │      │    run_cycle() under state_lock (state.json.lock):              │
- │      │      load_state() -> scan_all_courses() -> validate_snapshot()  │
- │      │      -> save_state() (with .bak rotation) -> diff_states()      │
+ │      │    run_cycle() under RuntimeStore.lock() (state.json.lock):     │
+ │      │      store.load_state() -> scan_all_courses()                   │
+ │      │      -> validate_snapshot() -> store.save_state() (.bak)        │
+ │      │      -> diff_states()                                           │
  │      │      -> dispatch_all() (bounded by NOTIFIER_TIMEOUT)            │
  │      └─ Else: Keep-alive OK                                            │
  │                                                                        │
- │   4. Update heartbeat.json ("ok" / "anomaly")                          │
+ │   4. Update heartbeat.json ("ok" / "anomaly") via store.write_heartbeat │
  │      └─ Sleep KEEPALIVE_INTERVAL (refreshing heartbeat every 15s) ─────┘
 ```
 
@@ -101,7 +104,7 @@ Future sessions editing `sis_client.py` should keep these portal behaviors in mi
 | **Session expires mid-scan** (`SessionExpiredError`) | `scan_all_courses()` stops making further course requests immediately, preserves already-fetched + carried-forward courses in `ScanResult`, and `run_cycle()` raises `SessionExpiredError` **without** touching `state.json`. |
 | **Degenerate / empty scan, semester rollover, & anomaly alert spam** (0 courses, `>0 -> 0` marks, or `>50%` drop when baseline has `>=3` courses or `>=5` marks/resources) | `parse_semester()` records the active semester (e.g. `Fall 2026`, or `SIS_SEMESTER` override) in `state.json`. When the semester changes (`detect_semester_rollover()`, including when retaken courses share course IDs across semesters, or for legacy `state.json` files with 0% course ID overlap), `run_cycle()` backs up the old semester, saves the new baseline, and emits one `semester_rollover` notification. Within the same semester, `validate_snapshot()` rejects anomalous drops (unless `--once --reset-state` is passed), persists the anomaly key/count in `data/.anomaly_alerted` (sending **one** `scan_anomaly` alert per unique anomaly reason until recovery), writes scrubbed diagnostics to `data/last_anomaly.json` and `data/last_anomaly_marks.html` (stripping `synopsisForm` / password inputs), and sends a `scan_recovered` alert once normal scans resume. Keep-alives preserve `"status": "anomaly"` in `heartbeat.json` until a full scan recovers. |
 | **Silent deletions on the portal** | `diff_states()` compares both directions (`new - old` and `old - new`), emitting `marks_removed`, `resource_removed`, `announcement_removed`, and `course_removed`. Legitimate small removals (e.g. `2 -> 1` marks) pass plausibility checks, update state, and notify. |
-| **Corrupt `state.json` or concurrent `--once` + daemon race** | `state_lock()` acquires an exclusive `fcntl.flock` on `data/state.json.lock` **before** `load_state()` so old state is always read prior to scanning. `save_state()` writes a PID/thread-scoped temp file (cleaning up temps on error), skips rotating `.bak*` if `state.json` on disk is corrupt JSON, and otherwise atomically rotates `state.json.bak`..`.bak.5` before `os.replace`ing `state.json`. If `state.json` is corrupt JSON, `load_state()` falls back across `state.json.bak` through `state.json.bak.N`. |
+| **Corrupt `state.json` or concurrent `--once` + daemon race** | `RuntimeStore.lock()` acquires an exclusive `fcntl.flock` on `data/state.json.lock` **before** `load_state()` so old state is always read prior to scanning. `save_state()` writes a PID/thread-scoped temp file (cleaning up temps on any error), skips rotating `.bak*` if `state.json` on disk is corrupt JSON, and otherwise atomically rotates `state.json.bak`..`.bak.5` before `os.replace`ing `state.json`. If `state.json` is corrupt JSON, `load_state()` falls back across `state.json.bak` through `state.json.bak.N`. |
 | **Session expiry & restart alert spam** | `run_daemon()` hashes the expired cookie into `data/.session_alerted` so it sends **one** `session_expired` notification (even across container restarts while still expired). It polls `.env` every `EXPIRED_POLL_INTERVAL` (`15s`) and exits with code `1` once `SESSION_EXPIRED_TIMEOUT` (`300s`) elapses so Docker's `restart: unless-stopped` recycles the container. Any `.env` save while waiting immediately re-tests the session, and any successful `get_courses()` clears `.session_alerted` immediately (even if the subsequent full scan hits an anomaly). |
 | **`.env` edits with inode replacement, BOM/shell formats, or `env_file:` overrides** | `docker-compose.yml` mounts `./:/app/config:ro` (`ENV_FILE=/app/config/.env`) instead of a single-file `.env` mount, so atomic-save editors (`vim`, VS Code, `sed -i`) are visible immediately. `parse_env_file()` / `parse_env_text()` supports UTF-8/UTF-16/UTF-32 BOMs (with cp1252 fallback), POSIX `export KEY=VALUE` lines, single/double quotes with escape handling, inline `#` comments (both unquoted and after quoted values), and `Cookie:` / `ASP.NET_SessionId=` normalization. `load_env_with_sources()` lets non-empty `.env` keys override `os.environ` (falling back to `os.environ` if `.env` leaves a key blank) and logs the winning source. `EnvWatcher` hashes and stats `.env` fresh by path on every iteration. |
 | **Hung HTTP request, unsafe redirect, header error, or shutdown mid-scan** | `SisClient.get_html()` sanitizes `User-Agent`/`Referer`, catches `URLError`, `TimeoutError`, `http.client.HTTPException`, `OSError`, and `ValueError`/`UnicodeEncodeError`, refuses cross-host or HTTPS-to-HTTP downgrade redirects (`_is_safe_redirect_target()` in `sis_client.py` and `probe.py`), and supports cooperative `cancel_event`. `dispatch_all()` sends each non-console notifier in a daemon thread bounded by `NOTIFIER_TIMEOUT` (`20s` in `tracker.py`, `15s` per notifier default). The whole daemon tick runs inside `run_with_timeout(CYCLE_TIMEOUT = 120s)` with `stop_event` support so `SIGTERM`/`SIGINT` cancels in-flight scans cleanly without waiting for Docker `SIGKILL`; if a thread stays wedged past the 2s grace window (or times out 3 times in a row), `run_daemon` exits `1`. |
@@ -112,18 +115,20 @@ Future sessions editing `sis_client.py` should keep these portal behaviors in mi
 
 ## 5. Runtime Files (`./data/`)
 
-All runtime files live under `./data/` (mounted to `/app/data` in Docker) and are gitignored:
+All runtime files live under `./data/` (mounted to `/app/data` in Docker) and are gitignored. **Every one of them is owned and written exclusively by `runtime_store.RuntimeStore`** — no module performs its own `open(...,'w')` on a runtime file. All writes go through one atomic temp-file+`os.replace` writer that creates parent directories and deletes the temp file on any failure (including `BaseException`), so an interrupted write can neither half-write a file nor leave `*.tmp.*` litter behind.
 
-| File | Purpose |
-| :--- | :--- |
-| `data/state.json` | Current known courses, marks, resources, and optional announcements. |
-| `data/state.json.bak`, `.bak.2`..`.bak.N` | Rolling backups rotated before every `save_state()` overwrite. |
-| `data/state.json.lock` | `fcntl.flock` lock file serializing `load -> scan -> validate -> save -> diff/dispatch`. |
-| `data/heartbeat.json` | Main-loop liveness timestamp, PID, intervals, and status read by `--healthcheck`. |
-| `data/.session_alerted` | SHA-256 hash of the cookie that already triggered a `session_expired` notification. |
-| `data/.anomaly_alerted` | Active anomaly key, first/last seen timestamps, and rejected scan count for deduplication + recovery alerts. |
-| `data/last_anomaly.json` | Latest rejected scan summary (counts, `Set-Cookie` names observed, failed courses, plain-text page preview). |
-| `data/last_anomaly_marks.html` | Credential-scrubbed `MarksSummary` HTML captured from the latest rejected 0-mark scan. |
+| File | Purpose | `RuntimeStore` interface |
+| :--- | :--- | :--- |
+| `data/state.json` | Current known courses, marks, resources, and optional announcements. | `load_state()`, `save_state(state, max_backups=...)` |
+| `data/state.json.bak`, `.bak.2`..`.bak.N` | Rolling backups rotated before every state overwrite (bounded by `MAX_STATE_BACKUPS`). | `save_state()` / `backup_paths()` |
+| `data/state.json.lock` | `fcntl.flock` lock file serializing `load -> scan -> validate -> save -> diff/dispatch`. | `lock(timeout=...)` |
+| `data/heartbeat.json` | Main-loop liveness timestamp, PID, bound intervals, and status read by `--healthcheck`. | `write_heartbeat(status, detail=None, last_ok=None)`, `bind_heartbeat(...)`, `check_healthcheck(max_age_override=None)` |
+| `data/.session_alerted` | SHA-256 hash of the cookie that already triggered a `session_expired` notification. | `was_session_alerted(sid)`, `mark_session_alerted(sid)`, `clear_session_alerted()` |
+| `data/.anomaly_alerted` | Active anomaly key, first/last seen timestamps, and rejected scan count for deduplication + recovery alerts. | `load_anomaly()`, `save_anomaly(payload)`, `clear_anomaly()` |
+| `data/last_anomaly.json` | Latest rejected scan summary (counts, `Set-Cookie` names observed, failed courses, plain-text page preview). | `write_anomaly_diagnostics(...)` |
+| `data/last_anomaly_marks.html` | Credential-scrubbed `MarksSummary` HTML captured from the latest rejected 0-mark scan. | `write_anomaly_diagnostics(...)` |
+
+**Heartbeat timing is bound once.** `RuntimeStore` is constructed (and re-bound via `bind_heartbeat()` on every `.env` reload) with `keepalive_interval`, `fetch_interval`, and `healthcheck_max_age`, so daemon call sites are just `store.write_heartbeat(status, detail=..., last_ok=...)`. `write_heartbeat()` still accepts the per-call timing keywords for ad-hoc callers, and the heartbeat JSON fields/status values and `--healthcheck` freshness and unhealthy-status rules are unchanged.
 
 ---
 

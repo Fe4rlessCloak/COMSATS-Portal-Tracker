@@ -42,28 +42,33 @@ from sis_client import (  # noqa: E402
     scrub_diagnostic_html,
     verify_active_course,
 )
+from runtime_store import RuntimeStore, StateLockError  # noqa: E402
 from tracker import (  # noqa: E402
     CycleTimeoutError,
     EnvWatcher,
-    StateLockError,
-    check_healthcheck,
     detect_semester_rollover,
     diff_states,
     load_config,
     load_env_with_sources,
-    load_state,
     normalize_session_id,
     parse_env_file,
     parse_env_text,
     run_cycle,
     run_daemon,
     run_with_timeout,
-    save_state,
     scan_all_courses,
-    state_lock,
     validate_snapshot,
-    write_heartbeat,
 )
+
+def save_state(state_path: Path, state: dict, max_backups: int = 5) -> None:
+    """Fixture helper: persist a baseline through the Runtime Store."""
+    RuntimeStore(state_path).save_state(state, max_backups=max_backups)
+
+
+def load_state(state_path: Path):
+    """Fixture helper: read a baseline through the Runtime Store."""
+    return RuntimeStore(state_path).load_state()
+
 
 COURSES_HTML = """
 <table class="table sis-dash-table">
@@ -269,13 +274,6 @@ class ParserAndDiffTests(unittest.TestCase):
     def test_latin1_safe_header_normalization(self) -> None:
         self.assertEqual(_latin1_safe("Marks update: CSC101 — Intro"), "Marks update: CSC101 - Intro")
 
-    def test_save_and_load_state_creates_parent_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "data" / "state.json"
-            payload = {"courses": {"1": {"marks": {}, "resources": {}}}}
-            save_state(state_path, payload)
-            self.assertEqual(load_state(state_path), payload)
-
 
 class _RecordingNotifier(BaseNotifier):
     name = "recording"
@@ -381,31 +379,12 @@ def _auth_shell(inner: str, course_code: str = "", course_name: str = "") -> str
 
 
 class ReliabilityAndBugfixTests(unittest.TestCase):
-    def test_bug1_degenerate_scan_rejected_and_rolling_backups_kept(self) -> None:
+    def test_bug1_degenerate_scan_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "data" / "state.json"
             good_baseline = _make_state(marks_count=6, res_count=6, course_count=1)
             save_state(state_path, good_baseline, max_backups=3)
-
-            # Rotate backups across updates and verify .bak -> .bak.3 retention
-            for i in range(4):
-                updated = _make_state(marks_count=6 + i + 1, res_count=6, course_count=1)
-                save_state(state_path, updated, max_backups=3)
-
-            self.assertTrue(state_path.with_name("state.json.bak").exists())
-            self.assertTrue(state_path.with_name("state.json.bak.2").exists())
-            self.assertTrue(state_path.with_name("state.json.bak.3").exists())
-            self.assertFalse(state_path.with_name("state.json.bak.4").exists())
-
-            # Corrupt primary state.json -> load_state recovers from .bak
-            latest_before_corrupt = load_state(state_path)
-            bak_state = json.loads(state_path.with_name("state.json.bak").read_text(encoding="utf-8"))
-            state_path.write_text("{corrupt json", encoding="utf-8")
-            recovered = load_state(state_path)
-            self.assertEqual(recovered, bak_state)
-
-            # Restore latest good baseline and verify degenerate 0-marks scan does NOT overwrite
-            save_state(state_path, latest_before_corrupt, max_backups=3)
+            baseline = load_state(state_path)
             notifier = _RecordingNotifier()
 
             class _ZeroMarksClient:
@@ -429,19 +408,19 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             )
             self.assertFalse(result.saved)
             self.assertIsNotNone(result.anomaly)
-            self.assertEqual(load_state(state_path), latest_before_corrupt)
+            self.assertEqual(load_state(state_path), baseline)
             self.assertEqual([n.event for n in notifier.notes], ["scan_anomaly"])
 
             # Sharp >50% drop and 0-course scan are also rejected by validate_snapshot
             self.assertIsNotNone(
                 validate_snapshot(
-                    latest_before_corrupt,
+                    baseline,
                     tracker.ScanResult(state=_make_state(marks_count=2, res_count=6, course_count=1)),
                 )
             )
             self.assertIsNotNone(
                 validate_snapshot(
-                    latest_before_corrupt,
+                    baseline,
                     tracker.ScanResult(state={"courses": {}}),
                 )
             )
@@ -808,26 +787,27 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                 signal.signal(signal.SIGTERM, prev_term)
 
             self.assertEqual(rc, 1)
-            ok, msg = check_healthcheck(hb_path)
+            ok, msg = RuntimeStore(state_path, hb_path).check_healthcheck()
             self.assertFalse(ok)
             self.assertIn("wedged_exiting", msg)
 
         # Healthcheck checks: missing, fresh ok, stale, waiting_for_session
         with tempfile.TemporaryDirectory() as tmp:
             hb_path = Path(tmp) / "heartbeat.json"
-            self.assertFalse(check_healthcheck(hb_path)[0])
+            store = RuntimeStore(Path(tmp) / "state.json", hb_path, keepalive_interval=60)
+            self.assertFalse(store.check_healthcheck()[0])
 
-            write_heartbeat(hb_path, "ok", keepalive_interval=60, fetch_interval=480)
-            self.assertTrue(check_healthcheck(hb_path)[0])
+            store.write_heartbeat("ok")
+            self.assertTrue(store.check_healthcheck()[0])
 
-            write_heartbeat(hb_path, "waiting_for_session", keepalive_interval=60, fetch_interval=480)
-            self.assertFalse(check_healthcheck(hb_path)[0])
+            store.write_heartbeat("waiting_for_session")
+            self.assertFalse(store.check_healthcheck()[0])
 
             stale = json.loads(hb_path.read_text(encoding="utf-8"))
             stale["status"] = "ok"
             stale["timestamp"] = time.time() - 500
             hb_path.write_text(json.dumps(stale), encoding="utf-8")
-            ok_stale, msg_stale = check_healthcheck(hb_path, max_age_override=30)
+            ok_stale, msg_stale = store.check_healthcheck(max_age_override=30)
             self.assertFalse(ok_stale)
             self.assertIn("stale", msg_stale)
 
@@ -960,23 +940,26 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             self.assertIn("[ERROR] Scan failed: 502 Bad Gateway", buf.getvalue())
 
     def test_bug10_load_before_scan_and_state_locking(self) -> None:
+        """The baseline is read under the lock before the portal is scanned."""
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             baseline = _make_state(marks_count=2, res_count=1, course_count=1)
             save_state(state_path, baseline)
 
             call_order: list[str] = []
-            orig_load = tracker.load_state
+            orig_load = RuntimeStore.load_state
 
-            def _spy_load(path: Path):
+            def _spy_load(store_self):
                 call_order.append("load_state")
-                return orig_load(path)
+                return orig_load(store_self)
 
             def _spy_scan(*args, **kwargs):
                 call_order.append("scan_all_courses")
                 return tracker.ScanResult(state=_make_state(marks_count=3, res_count=1, course_count=1))
 
-            with mock.patch.object(tracker, "load_state", side_effect=_spy_load), mock.patch.object(
+            with mock.patch.object(
+                RuntimeStore, "load_state", _spy_load
+            ), mock.patch.object(
                 tracker, "scan_all_courses", side_effect=_spy_scan
             ):
                 res = run_cycle(
@@ -989,20 +972,8 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                 )
 
             self.assertTrue(res.saved)
+            # The baseline is read before the portal is scanned, inside the lock.
             self.assertEqual(call_order, ["load_state", "scan_all_courses"])
-
-            # Concurrent lock contention raises StateLockError
-            import fcntl
-
-            lock_path = state_path.with_name("state.json.lock")
-            with lock_path.open("a+", encoding="utf-8") as fh:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                try:
-                    with self.assertRaises(StateLockError):
-                        with state_lock(state_path, timeout=0.2):
-                            pass
-                finally:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
     def test_anomaly_dedup_recovery_and_diagnostics(self) -> None:
         from sis_client import MarkItem, ResourceItem
@@ -1276,7 +1247,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             hb = json.loads(hb_path.read_text(encoding="utf-8"))
             self.assertEqual(hb["status"], "anomaly")
             self.assertIn("keep-alive OK", hb["detail"])
-            self.assertTrue(check_healthcheck(hb_path)[0])
+            self.assertTrue(RuntimeStore(state_path, hb_path).check_healthcheck(max_age_override=300)[0])
 
         # Part B: Touching/replacing .env with the SAME SIS_SESSION_ID wakes up expired wait loop immediately
         with tempfile.TemporaryDirectory() as tmp:
@@ -1734,33 +1705,6 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             self.assertLess(elapsed_after_sig, 2.0)
             self.assertTrue(observed_cancel and observed_cancel[0].is_set())
             self.assertFalse(state_path.exists())
-
-    def test_backup_chain_recovery_and_corrupt_state_preservation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "data" / "state.json"
-            s1 = _make_state(marks_count=1, res_count=1, course_count=1)
-            s2 = _make_state(marks_count=2, res_count=1, course_count=1)
-            s3 = _make_state(marks_count=3, res_count=1, course_count=1)
-            s4 = _make_state(marks_count=4, res_count=1, course_count=1)
-
-            save_state(state_path, s1, max_backups=3)
-            save_state(state_path, s2, max_backups=3)
-            save_state(state_path, s3, max_backups=3)
-            # Now state.json=s3, .bak=s2, .bak.2=s1
-
-            # Corrupt both state.json and .bak -> load_state falls back to .bak.2
-            state_path.write_text("{bad primary", encoding="utf-8")
-            state_path.with_name("state.json.bak").write_text("{bad bak", encoding="utf-8")
-            self.assertEqual(load_state(state_path), s1)
-
-            # Restore .bak to s2 while state.json stays corrupt -> save_state(s4) preserves .bak=s2
-            save_state(state_path.with_name("state.json.bak"), s2, max_backups=0)
-            save_state(state_path, s4, max_backups=3)
-            self.assertEqual(load_state(state_path), s4)
-            self.assertEqual(
-                json.loads(state_path.with_name("state.json.bak").read_text(encoding="utf-8")),
-                s2,
-            )
 
     def test_semester_tracking_rollover_retake_legacy_and_reset_state(self) -> None:
         from sis_client import MarkItem
