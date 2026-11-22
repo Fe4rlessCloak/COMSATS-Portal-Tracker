@@ -43,7 +43,7 @@ from config import (  # noqa: E402
     resolve_state_file,
 )
 from notifiers import BaseNotifier, build_notifiers  # noqa: E402
-from sis_client import Course  # noqa: E402
+from sis_client import Course, CourseSnapshotResult, RosterResult  # noqa: E402
 
 NO_ENV: Dict[str, str] = {}
 
@@ -538,6 +538,8 @@ class DaemonNotifierRebuildTests(unittest.TestCase):
             notifier_changed = threading.Event()
 
             class _FakeClient:
+                """Interface-only daemon stub: this test is about *notifier rebuild timing*."""
+
                 def __init__(self, *args, **kwargs) -> None:
                     self.cancel_event = None
                     self.session_id = kwargs.get("session_id", "")
@@ -545,23 +547,17 @@ class DaemonNotifierRebuildTests(unittest.TestCase):
                     self.user_agent = kwargs.get("user_agent", "")
                     self.request_delay = 0.0
 
-                def get_courses(self):
+                def fetch_roster(self):
                     nonlocal ticks
                     with tick_lock:
                         ticks += 1
                         current = ticks
                     if current >= 3:
                         notifier_changed.set()
-                    return courses
+                    return RosterResult(courses=list(courses))
 
-                def select_course(self, cid, expected_course=None):
-                    return ""
-
-                def get_marks_summary(self, expected_course=None):
-                    return []
-
-                def get_learning_resources(self, expected_course=None):
-                    return []
+                def fetch_course_snapshot(self, course, include_announcements=False):
+                    return CourseSnapshotResult()
 
             real_load_config = config.load_config
 

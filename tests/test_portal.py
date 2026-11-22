@@ -26,13 +26,17 @@ for entry in (str(ROOT), str(HERE)):
         sys.path.insert(0, entry)
 
 import tracker  # noqa: E402
+from runtime_store import RuntimeStore  # noqa: E402
 from sis_client import (  # noqa: E402
+    AnnouncementItem,
     Course,
     CourseMismatchError,
+    CourseSnapshotResult,
     PortalHttpError,
     PortalParseError,
     PortalResponse,
     PortalTransport,
+    RosterResult,
     SessionExpiredError,
     SisClient,
     TransportError,
@@ -40,6 +44,8 @@ from sis_client import (  # noqa: E402
     parse_active_course,
     verify_active_course,
 )
+
+from support_portal_pages import SimulatedPortal, announcements_page, courses_page  # noqa: E402
 from support_stub_transport import (  # noqa: E402
     StubResponse,
     StubTransport,
@@ -75,6 +81,74 @@ COURSES_PAGE = _auth_shell(
 LOGIN_HTML = (
     '<html><body class="sis-login-page"><form action="/Login"><button>Go</button></form></body></html>'
 )
+
+
+def _intro_course() -> Course:
+    return Course(course_id="100001", code="CSC101", name="Intro")
+
+
+def _course_shell(course_id: str, code: str, name: str) -> str:
+    """SetCourse response whose active-course header matches ``code``/``name``."""
+    return _auth_shell(f'<div class="sis-ann">course {course_id}</div>', code, name)
+
+
+MARKS_ROWS = """
+      <tr id="9001">
+        <td>Quiz1</td>
+        <td><span class="sis-marks-score">7.0</span></td>
+        <td>10.0</td>
+        <td>Saturday, 31 October 2026</td>
+      </tr>
+      <tr id="9002">
+        <td>Assign1</td>
+        <td><span class="sis-marks-score">8.5</span></td>
+        <td>10.0</td>
+        <td>Sunday, 1 November 2026</td>
+      </tr>
+"""
+
+
+def _marks_shell(code: str, name: str, rows: str) -> str:
+    if rows:
+        body = (
+            '<div class="sis-marks-summary table-responsive quiz_listing">'
+            '<div class="sis-marks-section-head">Quizzes</div>'
+            '<table class="table table-striped sis-marks-table"><thead><tr>'
+            "<th>Title</th><th>Obtained Marks</th><th>Total Marks</th><th>Date Time</th>"
+            f"</tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    else:
+        body = (
+            '<div class="sis-marks-summary"><p class="sis-marks-empty">'
+            "No marks available.</p></div>"
+        )
+    return _auth_shell(body, code, name)
+
+
+def _resources_shell(code: str, name: str) -> str:
+    return _auth_shell(
+        '<div class="sis-lr"><span class="sis-lr-count">1 resource</span>'
+        '<div class="sis-lr-table-wrap"><table class="table sis-lr-table"><thead><tr>'
+        "<th>#</th><th>Title</th><th>Type</th><th>Date</th><th>Size</th><th>Action</th>"
+        '</tr></thead><tbody><tr class="sis-lr-row" id="res-55">'
+        '<td class="sis-lr-num">1</td><td class="sis-lr-title">Week 1 Slides</td>'
+        '<td><span class="sis-lr-material">Lecture Notes</span></td>'
+        '<td class="sis-lr-date">02 Nov 2026</td><td class="sis-lr-size">1.2 MB</td>'
+        '<td class="actions"><a class="sis-lr-btn" href="/LearningResources/Download/55">'
+        "Download</a></td></tr></tbody></table></div></div>",
+        code,
+        name,
+    )
+
+
+ANNOUNCEMENTS = [
+    AnnouncementItem(
+        key="Quiz 2 Postponed|Date: 10 Nov 2026",
+        title="Quiz 2 Postponed",
+        meta="Date: 10 Nov 2026",
+        body="Moved to Friday.",
+    )
+]
 
 
 def _client(transport, **kwargs) -> SisClient:
@@ -116,7 +190,6 @@ class StubTransportInterfaceTests(unittest.TestCase):
         client = _client(stub)
         response = client.fetch_page("/Courses")
         self.assertEqual(response.set_cookie_names, ("ARRAffinity", "PortalAffinity"))
-        self.assertEqual(client.last_set_cookie_names, ["ARRAffinity", "PortalAffinity"])
 
     def test_redirect_sequence_is_served_hop_by_hop(self) -> None:
         stub = StubTransport()
@@ -393,25 +466,31 @@ class PortalLoginDetectionTests(unittest.TestCase):
 
     def test_missing_page_markers_raise_parse_errors(self) -> None:
         stub = StubTransport()
-        stub.add(StubResponse(_auth_shell("<div>Empty error shell</div>")))
-        stub.add(StubResponse(_auth_shell("<div>Empty error shell</div>")))
+        shell = _auth_shell(
+            "<div>Empty error shell</div>", course_code="CSC101", course_name="Intro"
+        )
+        stub.add(StubResponse(shell))
+        stub.add(StubResponse(shell))
+        stub.add(StubResponse(shell))
         client = _client(stub)
+        course = Course(course_id="100001", code="CSC101", name="Intro")
         with self.assertRaises(PortalParseError) as ctx:
-            client.get_marks_summary()
+            client.fetch_course_snapshot(course)
         self.assertEqual(ctx.exception.set_cookie_names, ())
-        with self.assertRaises(PortalParseError):
-            client.get_learning_resources()
+        self.assertIn("MarksSummary", str(ctx.exception))
 
     def test_parse_error_reports_cookie_names_observed_on_the_page(self) -> None:
         stub = StubTransport()
-        stub.add(
-            StubResponse(
-                _auth_shell("<div>Empty error shell</div>"),
-                headers={"Set-Cookie": ["ARRAffinity=node1; Path=/"]},
-            )
+        shell = _auth_shell(
+            "<div>Empty error shell</div>", course_code="CSC101", course_name="Intro"
         )
+        stub.add(StubResponse(shell))
+        stub.add(
+            StubResponse(shell, headers={"Set-Cookie": ["ARRAffinity=node1; Path=/"]})
+        )
+        course = Course(course_id="100001", code="CSC101", name="Intro")
         with self.assertRaises(PortalParseError) as ctx:
-            _client(stub).get_marks_summary()
+            _client(stub).fetch_course_snapshot(course)
         self.assertEqual(ctx.exception.set_cookie_names, ("ARRAffinity",))
 
 
@@ -427,11 +506,11 @@ class PortalActiveCourseTests(unittest.TestCase):
         self.assertIsNotNone(info)
         self.assertEqual(info.code if info else "", "CSC336")
 
+        # SetCourse answers with a *different* active course than the one requested.
         stub = StubTransport()
         stub.add(StubResponse(stuck_html))
-        client = _client(stub)
         with self.assertRaises(CourseMismatchError):
-            client.select_course("182153", expected_course=expected_325)
+            _client(stub).fetch_course_snapshot(expected_325)
 
     def test_matching_active_course_passes(self) -> None:
         expected = Course(course_id="182153", code="CSC325", name="COAL")
@@ -441,9 +520,23 @@ class PortalActiveCourseTests(unittest.TestCase):
             course_name="Computer Organization and Assembly Language",
         )
         verify_active_course(html, expected)
+        marks = _auth_shell(
+            '<div class="sis-marks-summary"><p class="sis-marks-empty">No marks available.</p></div>',
+            course_code="CSC325",
+            course_name="Computer Organization and Assembly Language",
+        )
         stub = StubTransport()
         stub.add(StubResponse(html))
-        self.assertEqual(_client(stub).get_learning_resources(expected_course=expected), [])
+        stub.add(StubResponse(marks))
+        stub.add(StubResponse(html))
+        snapshot = _client(stub).fetch_course_snapshot(expected)
+        self.assertEqual(snapshot.marks, [])
+        self.assertIn("No marks available.", snapshot.diagnostic_preview)
+        self.assertEqual(
+            stub.urls(),
+            [f"{BASE}/Courses/SetCourse/182153", f"{BASE}/MarksSummary/Index",
+             f"{BASE}/LearningResources/Index"],
+        )
 
 
 class PortalHeaderAndErrorTranslationTests(unittest.TestCase):
@@ -641,8 +734,9 @@ class ProductionTransportTests(unittest.TestCase):
         try:
             port = server.server_address[1]
             client = SisClient("sid", base_url=f"http://127.0.0.1:{port}", request_delay=0.0)
-            response = client.get_html("/Courses")
-            self.assertEqual(client.last_set_cookie_names, ["ARRAffinity", "PortalAffinity"])
+            page = client.fetch_page("/Courses")
+            response = page.body
+            self.assertEqual(page.set_cookie_names, ("ARRAffinity", "PortalAffinity"))
             client.get_html("/Courses")
         finally:
             server.shutdown()
@@ -754,6 +848,329 @@ class ProbeTransportSafetyTests(unittest.TestCase):
         self.assertEqual(hits, ["/Courses"])
 
 
+class PortalTypedRosterTests(unittest.TestCase):
+    """``fetch_roster()`` owns dashboard quirks and returns one typed result."""
+
+    def test_returns_courses_semester_and_cookie_names(self) -> None:
+        stub = StubTransport()
+        stub.add(
+            StubResponse(
+                COURSES_PAGE,
+                headers={"Set-Cookie": ["ARRAffinity=node1; Path=/", "PortalAffinity=e2; Path=/"]},
+            ),
+            url="/Courses",
+        )
+        roster = _client(stub).fetch_roster()
+        self.assertEqual([c.course_id for c in roster.courses], ["100001"])
+        self.assertEqual(roster.courses[0].code, "CSC101")
+        self.assertEqual(roster.semester, "")
+        self.assertEqual(roster.set_cookie_names, ("ARRAffinity", "PortalAffinity"))
+        self.assertEqual(stub.urls(), [f"{BASE}/Courses"])
+
+    def test_extracts_semester_label_from_the_dashboard(self) -> None:
+        stub = StubTransport()
+        stub.add(StubResponse(courses_page([_intro_course()], semester="Spring 2027")))
+        roster = _client(stub).fetch_roster()
+        self.assertEqual(roster.semester, "Spring 2027")
+        self.assertEqual([c.code for c in roster.courses], ["CSC101"])
+
+    def test_missing_dashboard_marker_raises_parse_error(self) -> None:
+        stub = StubTransport()
+        stub.add(StubResponse(_auth_shell("<div>nothing here</div>")))
+        with self.assertRaises(PortalParseError) as ctx:
+            _client(stub).fetch_roster()
+        self.assertIn("courses table", str(ctx.exception))
+
+    def test_zero_courses_raises_parse_error(self) -> None:
+        stub = StubTransport()
+        stub.add(StubResponse(_auth_shell('<table class="sis-dash-table"></table>')))
+        with self.assertRaises(PortalParseError) as ctx:
+            _client(stub).fetch_roster()
+        self.assertIn("0 courses", str(ctx.exception))
+
+    def test_login_page_raises_session_expired_not_parse_error(self) -> None:
+        stub = StubTransport()
+        stub.add(StubResponse(LOGIN_HTML))
+        with self.assertRaises(SessionExpiredError):
+            _client(stub).fetch_roster()
+
+
+class PortalTypedSnapshotTests(unittest.TestCase):
+    """``fetch_course_snapshot()`` owns course switching, verification and parsing."""
+
+    def test_returns_marks_resources_and_cookie_names_in_course_order(self) -> None:
+        stub = StubTransport()
+        stub.add(StubResponse(_course_shell("100001", "CSC101", "Intro")))
+        stub.add(StubResponse(_marks_shell("CSC101", "Intro", MARKS_ROWS)))
+        stub.add(
+            StubResponse(
+                _resources_shell("CSC101", "Intro"),
+                headers={"Set-Cookie": ["ARRAffinity=node3; Path=/"]},
+            )
+        )
+        snapshot = _client(stub).fetch_course_snapshot(_intro_course())
+
+        self.assertEqual([m.key for m in snapshot.marks], ["Quizzes:9001", "Quizzes:9002"])
+        self.assertEqual([r.key for r in snapshot.resources], ["res-55"])
+        self.assertIsNone(snapshot.announcements)
+        self.assertEqual(snapshot.diagnostic_html, "")
+        self.assertEqual(snapshot.diagnostic_preview, "")
+        self.assertEqual(snapshot.set_cookie_names, ("ARRAffinity",))
+        self.assertEqual(
+            stub.urls(),
+            [
+                f"{BASE}/Courses/SetCourse/100001",
+                f"{BASE}/MarksSummary/Index",
+                f"{BASE}/LearningResources/Index",
+            ],
+        )
+
+    def test_announcements_are_parsed_only_when_requested(self) -> None:
+        def _stub() -> StubTransport:
+            stub = StubTransport()
+            stub.add(StubResponse(announcements_page(_intro_course(), ANNOUNCEMENTS)))
+            stub.add(StubResponse(_marks_shell("CSC101", "Intro", MARKS_ROWS)))
+            stub.add(StubResponse(_resources_shell("CSC101", "Intro")))
+            return stub
+
+        without = _client(_stub()).fetch_course_snapshot(_intro_course())
+        self.assertIsNone(without.announcements)
+
+        with_ann = _client(_stub()).fetch_course_snapshot(
+            _intro_course(), include_announcements=True
+        )
+        assert with_ann.announcements is not None
+        self.assertEqual([a.title for a in with_ann.announcements], ["Quiz 2 Postponed"])
+        self.assertIn("10 Nov 2026", with_ann.announcements[0].to_dict()["meta"])
+
+    def test_empty_marks_carry_scrubbed_html_and_preview(self) -> None:
+        stub = StubTransport()
+        stub.add(StubResponse(_course_shell("100001", "CSC101", "Intro")))
+        stub.add(StubResponse(_marks_shell("CSC101", "Intro", "")))
+        stub.add(StubResponse(_resources_shell("CSC101", "Intro")))
+        snapshot = _client(stub).fetch_course_snapshot(_intro_course())
+
+        self.assertEqual(snapshot.marks, [])
+        self.assertIn("sis-marks-summary", snapshot.diagnostic_html)
+        self.assertIn("No marks available.", snapshot.diagnostic_preview)
+        self.assertNotIn("<html", snapshot.diagnostic_html)
+
+    def test_course_mismatch_aborts_before_marks_are_attributed(self) -> None:
+        stub = StubTransport()
+        stub.add(StubResponse(_course_shell("100001", "CSC336", "Web Technologies")))
+        with self.assertRaises(CourseMismatchError):
+            _client(stub).fetch_course_snapshot(_intro_course())
+        # Only the SetCourse request was made: marks attribution never happened.
+        self.assertEqual(stub.urls(), [f"{BASE}/Courses/SetCourse/100001"])
+
+    def test_late_failure_keeps_every_cookie_name_observed_so_far(self) -> None:
+        stub = StubTransport()
+        stub.add(
+            StubResponse(
+                _course_shell("100001", "CSC101", "Intro"),
+                headers={"Set-Cookie": ["ARRAffinity=node1; Path=/"]},
+            )
+        )
+        stub.add(
+            StubResponse(
+                _marks_shell("CSC101", "Intro", MARKS_ROWS),
+                headers={"Set-Cookie": ["PortalAffinity=edge2; Path=/"]},
+            )
+        )
+        stub.add(StubResponse("upstream boom", status=502))
+        with self.assertRaises(PortalHttpError) as ctx:
+            _client(stub).fetch_course_snapshot(_intro_course())
+        self.assertEqual(ctx.exception.set_cookie_names, ("ARRAffinity", "PortalAffinity"))
+
+    def test_session_expiry_mid_snapshot_carries_cookie_names(self) -> None:
+        stub = StubTransport()
+        stub.add(
+            StubResponse(
+                _course_shell("100001", "CSC101", "Intro"),
+                headers={"Set-Cookie": ["ARRAffinity=node1; Path=/"]},
+            )
+        )
+        stub.add(
+            StubResponse("", status=302, headers={"Location": "/Login/Index"}), url="/MarksSummary/Index"
+        )
+        with self.assertRaises(SessionExpiredError) as ctx:
+            _client(stub).fetch_course_snapshot(_intro_course())
+        self.assertEqual(ctx.exception.set_cookie_names, ("ARRAffinity",))
+
+    def test_missing_marks_marker_raises_parse_error(self) -> None:
+        stub = StubTransport()
+        stub.add(StubResponse(_course_shell("100001", "CSC101", "Intro")))
+        stub.add(StubResponse(_course_shell("100001", "CSC101", "Intro")))
+        with self.assertRaises(PortalParseError) as ctx:
+            _client(stub).fetch_course_snapshot(_intro_course())
+        self.assertIn("MarksSummary", str(ctx.exception))
+
+    def test_missing_resources_marker_raises_parse_error(self) -> None:
+        stub = StubTransport()
+        stub.add(StubResponse(_course_shell("100001", "CSC101", "Intro")))
+        stub.add(StubResponse(_marks_shell("CSC101", "Intro", MARKS_ROWS)))
+        stub.add(StubResponse(_course_shell("100001", "CSC101", "Intro")))
+        with self.assertRaises(PortalParseError) as ctx:
+            _client(stub).fetch_course_snapshot(_intro_course())
+        self.assertIn("LearningResources", str(ctx.exception))
+
+    def test_result_dataclasses_are_constructible_with_defaults(self) -> None:
+        self.assertEqual(RosterResult().courses, [])
+        self.assertEqual(RosterResult().semester, "")
+        self.assertEqual(RosterResult().set_cookie_names, ())
+        snapshot = CourseSnapshotResult()
+        self.assertEqual(snapshot.marks, [])
+        self.assertEqual(snapshot.resources, [])
+        self.assertIsNone(snapshot.announcements)
+        self.assertEqual(snapshot.set_cookie_names, ())
+        self.assertEqual(snapshot.diagnostic_html, "")
+        self.assertEqual(snapshot.diagnostic_preview, "")
+
+
+class PortalSecretScrubbingSeamTests(unittest.TestCase):
+    """Raw form inputs and cookie values must never cross the Portal seam."""
+
+    PASSWORD_VALUE = "SUPER_SECRET_PWD_5"
+    SESSION_VALUE = "SESSION_ID_DO_NOT_LEAK"
+
+    def _hostile_marks_page(self) -> str:
+        secret_shell = (
+            '<form id="synopsisForm" method="post" action="https://ww5.comsats.edu.pk/efs/StudentLogin.aspx">'
+            f'<input name="uid" hidden type="text" value="CIIT/TEST-001/ISB">'
+            f'<input name="pwd" hidden type="password" value="{self.PASSWORD_VALUE}">'
+            "</form>"
+            '<input type="password" name="inner" value="INNER_SECRET_5">'
+            f'<span class="session-echo">{self.SESSION_VALUE}</span>'
+        )
+        # Empty marks so the diagnostic path (the only place HTML could cross) is used.
+        return _auth_shell(
+            secret_shell
+            + '<div class="content_area"><div class="sis-marks-summary">'
+            '<p class="sis-marks-empty">No marks available.</p></div></div>',
+            _intro_course().code,
+            _intro_course().name,
+        )
+
+    def test_diagnostic_html_is_already_scrubbed_and_still_has_page_content(self) -> None:
+        stub = StubTransport()
+        stub.add(StubResponse(_course_shell("100001", "CSC101", "Intro")))
+        stub.add(
+            StubResponse(
+                self._hostile_marks_page(),
+                headers={
+                    "Set-Cookie": [f"ASP.NET_SessionId={self.SESSION_VALUE}; Path=/"]
+                },
+            )
+        )
+        stub.add(StubResponse(_resources_shell("CSC101", "Intro")))
+
+        snapshot = _client(stub).fetch_course_snapshot(_intro_course())
+
+        self.assertEqual(snapshot.marks, [])
+        self.assertTrue(snapshot.diagnostic_html)
+        # Secrets are gone...
+        self.assertNotIn(self.PASSWORD_VALUE, snapshot.diagnostic_html)
+        self.assertNotIn("synopsisForm", snapshot.diagnostic_html)
+        self.assertNotIn("INNER_SECRET_5", snapshot.diagnostic_html)
+        self.assertNotIn(self.SESSION_VALUE, snapshot.diagnostic_html)
+        self.assertNotIn("type=\"password\"", snapshot.diagnostic_html.lower())
+        # ...while the actual page content survives.
+        self.assertIn("sis-marks-summary", snapshot.diagnostic_html)
+        self.assertIn("No marks available.", snapshot.diagnostic_html)
+        # The preview is text-only and equally clean.
+        self.assertIn("No marks available.", snapshot.diagnostic_preview)
+        self.assertNotIn(self.PASSWORD_VALUE, snapshot.diagnostic_preview)
+        self.assertNotIn(self.SESSION_VALUE, snapshot.diagnostic_preview)
+
+    def test_cookie_value_travels_as_a_header_name_only(self) -> None:
+        stub = StubTransport()
+        stub.add(
+            StubResponse(
+                _course_shell("100001", "CSC101", "Intro"),
+                headers={"Set-Cookie": [f"ASP.NET_SessionId={self.SESSION_VALUE}; Path=/"]},
+            )
+        )
+        stub.add(StubResponse(_marks_shell("CSC101", "Intro", MARKS_ROWS)))
+        stub.add(StubResponse(_resources_shell("CSC101", "Intro")))
+
+        snapshot = _client(stub).fetch_course_snapshot(_intro_course())
+
+        # Only the *name* is reported; the value stays inside the cookie jar.
+        self.assertEqual(snapshot.set_cookie_names, ("ASP.NET_SessionId",))
+        self.assertNotIn(self.SESSION_VALUE, snippet(snapshot))
+
+    def test_anomaly_artifact_written_end_to_end_contains_no_secrets(self) -> None:
+        import tracker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "data" / "state.json"
+            portal = SimulatedPortal(
+                courses=[_intro_course()],
+                marks={_intro_course().course_id: []},
+                marks_html={_intro_course().course_id: self._hostile_marks_page()},
+            )
+            portal.add(StubResponse(COURSES_PAGE), url="/Courses")
+            client = SisClient(
+                "sid", base_url=BASE, request_delay=0.0, transport=portal
+            )
+
+            RuntimeStore(state_path).save_state(
+                {
+                    "courses": {
+                        "100001": {
+                            "code": "CSC101",
+                            "name": "Intro",
+                            "label": "CSC101 — Intro",
+                            "marks": {
+                                "Quizzes:1": {
+                                    "key": "Quizzes:1",
+                                    "section": "Quizzes",
+                                    "title": "Quiz1",
+                                    "obtained": "8.0",
+                                    "total": "10.0",
+                                    "date_text": "01 Nov 2026",
+                                }
+                            },
+                            "resources": {},
+                        }
+                    }
+                }
+            )
+            tracker.run_cycle(
+                client,
+                [_intro_course()],
+                state_path=state_path,
+                base_url=BASE,
+                track_announcements=False,
+                notifiers=[],
+            )
+            diagnostics = (state_path.parent / "last_anomaly.json").read_text(encoding="utf-8")
+            saved_html = (state_path.parent / "last_anomaly_marks.html").read_text(
+                encoding="utf-8"
+            )
+
+        for blob in (diagnostics, saved_html):
+            self.assertNotIn(self.PASSWORD_VALUE, blob)
+            self.assertNotIn("INNER_SECRET_5", blob)
+            self.assertNotIn("synopsisForm", blob)
+            self.assertNotIn(self.SESSION_VALUE, blob)
+        self.assertIn("No marks available.", diagnostics)
+        self.assertIn("No marks available.", saved_html)
+
+
+def snippet(result: CourseSnapshotResult) -> str:
+    """Every string a snapshot result exposes, concatenated (leak assertions)."""
+    return " ".join(
+        [
+            result.diagnostic_html,
+            result.diagnostic_preview,
+            " ".join(m.key + m.title + m.obtained for m in result.marks),
+            " ".join(r.key + r.title + r.href for r in result.resources),
+            " ".join(result.set_cookie_names),
+        ]
+    )
+
+
 class ScanCookieDiagnosticsTests(unittest.TestCase):
     """Mid-scan failures must still surface cookie diagnostics through ScanResult."""
 
@@ -827,43 +1244,83 @@ class DaemonReconfigurationTests(unittest.TestCase):
             resumed = threading.Event()
             retested = threading.Event()
             reconfig_calls: list[dict] = []
+            course = Course(course_id="100001", code="CSC101", name="Intro")
+            courses_page_html = _auth_shell(
+                '<table class="table sis-dash-table"><thead><tr>'
+                "<th>Course No</th><th>Course Name</th></tr></thead><tbody>"
+                "<tr onclick=\"window.location='/Courses/SetCourse/100001'\">"
+                "<td>CSC101</td><td>Intro</td></tr></tbody></table>"
+            )
 
-            class _RecordingClient:
-                def __init__(self, session_id, **kwargs) -> None:
-                    self.session_id = session_id
-                    self.base_url = kwargs.get("base_url", BASE)
-                    self.user_agent = kwargs.get("user_agent", "")
-                    self.request_delay = 0.0
-                    self.cancel_event = None
-                    self.attempts = 0
+            # A real SisClient over a scripted transport: the portal answers /Courses with
+            # the login page while the session is "expired", and with a real dashboard once
+            # the .env update has been picked up.
+            class _ExpiringPortal(StubTransport):
+                dashboard_hits = 0
 
-                def reconfigure(self, session_id=None, base_url=None, user_agent=None,
-                                request_delay=None, reset_cookies=False):
+                def fetch(self, url, headers, timeout=None):
+                    path = urllib.parse.urlparse(url).path
+                    if path == "/Courses":
+                        self.dashboard_hits += 1
+                        if self.dashboard_hits >= 2:
+                            retested.set()
+                        if resumed.is_set():
+                            self.add(StubResponse(courses_page_html), url=None)
+                        else:
+                            self.add(StubResponse(LOGIN_HTML), url=None)
+                    elif path == "/Courses/SetCourse/100001":
+                        self.add(StubResponse(_auth_shell("<div>ann</div>")), url=None)
+                    elif path == "/MarksSummary/Index":
+                        self.add(
+                            StubResponse(
+                                _auth_shell(
+                                    '<div class="sis-marks-summary">'
+                                    '<p class="sis-marks-empty">No marks</p></div>',
+                                    course_code="CSC101",
+                                    course_name="Intro",
+                                )
+                            ),
+                            url=None,
+                        )
+                    elif path == "/LearningResources/Index":
+                        self.add(
+                            StubResponse(
+                                _auth_shell(
+                                    '<div class="sis-lr"><span class="sis-lr-count">0 resources</span></div>',
+                                    course_code="CSC101",
+                                    course_name="Intro",
+                                )
+                            ),
+                            url=None,
+                        )
+                    else:  # pragma: no cover - unexpected route
+                        raise AssertionError(f"unexpected path {path}")
+                    return super().fetch(url, headers, timeout)
+
+            portal = _ExpiringPortal()
+
+            def _client_factory(**kwargs):
+                client = SisClient(
+                    kwargs["session_id"],
+                    base_url=kwargs.get("base_url", BASE),
+                    user_agent=kwargs.get("user_agent", ""),
+                    request_delay=0.0,
+                    cancel_event=kwargs.get("cancel_event"),
+                    transport=portal,
+                )
+                real_reconfigure = client.reconfigure
+
+                def _spy(*args, **kw):
                     reconfig_calls.append(
-                        {"session_id": session_id, "reset_cookies": reset_cookies}
+                        {
+                            "session_id": kw.get("session_id", args[0] if args else None),
+                            "reset_cookies": kw.get("reset_cookies", False),
+                        }
                     )
-                    if session_id is not None:
-                        self.session_id = session_id
-                    return reset_cookies
+                    return real_reconfigure(*args, **kw)
 
-                def get_courses(self):
-                    self.attempts += 1
-                    if self.attempts == 1:
-                        raise SessionExpiredError("Expired #1")
-                    if self.attempts == 2:
-                        retested.set()
-                        raise SessionExpiredError("Still expired #2")
-                    resumed.set()
-                    return [Course(course_id="100001", code="CSC101", name="Intro")]
-
-                def select_course(self, cid, expected_course=None):
-                    return ""
-
-                def get_marks_summary(self, expected_course=None):
-                    return []
-
-                def get_learning_resources(self, expected_course=None):
-                    return []
+                client.reconfigure = _spy  # type: ignore[method-assign]
+                return client
 
             def _wait_for_waiting() -> None:
                 deadline = time.monotonic() + 5.0
@@ -884,11 +1341,14 @@ class DaemonReconfigurationTests(unittest.TestCase):
                 self.assertTrue(retested.wait(timeout=5.0))
 
                 _wait_for_waiting()
+                resumed.set()
                 tmp_env2 = Path(tmp) / ".env.tmp2"
                 tmp_env2.write_text(env_content + "# touched twice\n", encoding="utf-8")
                 os.replace(tmp_env2, env_path)
-                self.assertTrue(resumed.wait(timeout=5.0))
-                time.sleep(0.2)
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline and not state_path.exists():
+                    time.sleep(0.05)
+                time.sleep(0.3)
                 signal.raise_signal(signal.SIGTERM)
 
             import signal
@@ -898,7 +1358,7 @@ class DaemonReconfigurationTests(unittest.TestCase):
             t = threading.Thread(target=_updater, daemon=True)
             t.start()
             try:
-                with mock.patch.object(tracker, "SisClient", _RecordingClient), mock.patch.object(
+                with mock.patch.object(tracker, "SisClient", _client_factory), mock.patch.object(
                     tracker, "build_notifiers", return_value=[notifier]
                 ):
                     rc = tracker.run_daemon(env_path, state_path, heartbeat_path=hb_path)
