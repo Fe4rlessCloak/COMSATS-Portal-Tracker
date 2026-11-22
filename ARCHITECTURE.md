@@ -11,12 +11,14 @@ Zero external packages — **Python 3.9+ standard library only** (`urllib`, `htm
 | File | Role |
 | :--- | :--- |
 | `tracker.py` | Main daemon loop, `.env` watcher, state locking, backups, snapshot validation, diffing, watchdog timeouts, heartbeat & `--healthcheck` CLI. |
-| `sis_client.py` | HTTP client (`SisClient`) with `ASP.NET_SessionId` + authenticated `Set-Cookie` handling, login/expiry detection, page-marker validation, active-course verification, diagnostic HTML scrubbing, and HTML parsers. |
+| `sis_client.py` | HTTP client (`SisClient`) with a single injectable HTTP transport adapter, `ASP.NET_SessionId` + authenticated `Set-Cookie` handling, explicit `reconfigure()` for connection settings, login/expiry detection, page-marker validation, active-course verification, diagnostic HTML scrubbing, and HTML parsers. |
 | `notifiers.py` | Pluggable push backends (`ConsoleNotifier`, `NtfyNotifier`, `WebhookNotifier`, `DiscordNotifier`, `TelegramNotifier`) with threaded, timeout-bounded `dispatch_all`. |
 | `probe.py` | Standalone diagnostic CLI (respects `ENV_FILE`) to inspect raw portal HTML endpoints and test keep-alive timing. |
 | `Dockerfile` | `python:3.13-slim` container running `python3 -u tracker.py` with `HEALTHCHECK` calling `python3 tracker.py --healthcheck`. |
 | `docker-compose.yml` | Runs `comsats-portal-tracker` with `restart: unless-stopped`, directory-mounted config (`./:/app/config:ro`), and persistent `./data:/app/data`. |
 | `tests/test_tracker.py` | Offline unit tests (`python3 -m unittest discover -s tests -v`) covering parsers, diffing, real HTML snapshots, and every failure fallback. |
+| `tests/test_portal.py` | Portal transport-seam tests: every `SisClient` protocol behavior (redirect safety, cookie lifecycle, login detection, active-course verification, cancellation, header sanitization, error translation, explicit reconfiguration) driven through one stub transport adapter. |
+| `tests/support_stub_transport.py` | Reusable in-memory `PortalTransport` stub (`StubTransport` / `StubResponse`) serving canned responses, redirect sequences, multi-value `Set-Cookie`, and transport errors while recording outbound requests. Not shipped in the image. |
 
 ---
 
@@ -75,9 +77,18 @@ Future sessions editing `sis_client.py` should keep these portal behaviors in mi
 - **Pure parsers vs. client methods**:
   `parse_courses`, `parse_marks_summary`, `parse_learning_resources`, and `parse_announcements` remain pure HTML-fragment parsers (used by unit tests). `SisClient.get_courses()`, `get_marks_summary()`, and `get_learning_resources()` additionally enforce `has_*_page_marker()` (`PortalParseError`) and `verify_active_course()` (`CourseMismatchError`).
 
+- **HTTP transport adapter seam**:
+  `SisClient` reaches the network only through `client.transport.fetch(url, headers, timeout) -> TransportResponse(status, headers, body, final_url)`. The default is `UrllibTransport` (stdlib `urllib` with `_NoRedirect` installed, so redirects come back as 3xx `TransportResponse`s instead of being followed by urllib). Adapters must return a response for every HTTP status and raise only for genuine transport failures. All protocol logic — header sanitization, cookie-header construction, cookie staging across hops, same-origin/no-downgrade redirect checks, login detection, cancellation, error translation — stays inside `SisClient`, so tests injecting a stub still exercise the real protocol. Tests use `tests/support_stub_transport.py` (`StubTransport`, `StubResponse`); never patch a private opener.
+
+- **Observed `Set-Cookie` names travel on data, not side channels**:
+  `fetch_page()` returns `PortalResponse(url, final_url, status, body, set_cookie_names)`, and `SessionExpiredError` / `PortalHttpError` carry the same `set_cookie_names` tuple so mid-scan failures still feed anomaly diagnostics. Both exceptions remain constructible with a single message argument.
+
+- **Explicit reconfiguration instead of field poking**:
+  `session_id`/`base_url`/`user_agent`/`request_delay` are read-only properties. `SisClient.reconfigure(session_id=..., base_url=..., user_agent=..., request_delay=..., timeout=..., cancel_event=..., reset_cookies=False)` updates settings in one call and resets the cookie jar only when the session identifier actually changes or `reset_cookies=True`; it returns whether the jar was reset. `run_daemon` uses it for hot-reload, and passes `reset_cookies=True` on the expired-session `.env`-change path.
+
 - **ASP.NET cookie reuse & `Set-Cookie` handling**:
   If a session expires and the user logs back into `https://sis.comsats.edu.pk` in the **same browser** without clearing cookies, ASP.NET often re-authenticates the **exact same `ASP.NET_SessionId` value** rather than issuing a new string.
-  - When `run_daemon` is in the `waiting_for_session` state and detects any `.env` change (`EnvWatcher`), even if `SIS_SESSION_ID` is unchanged, it resets `SisClient`'s cookie jar and immediately re-tests the session rather than waiting for `SESSION_EXPIRED_TIMEOUT`.
+  - When `run_daemon` is in the `waiting_for_session` state and detects any `.env` change (`EnvWatcher`), even if `SIS_SESSION_ID` is unchanged, it calls `client.reconfigure(session_id=..., reset_cookies=True)` to drop the cookie jar and immediately re-tests the session rather than waiting for `SESSION_EXPIRED_TIMEOUT`.
   - On authenticated responses (after `detect_login_page()` passes), `SisClient` adopts any non-login `Set-Cookie` additions/rotations (including auxiliary cookies and `ASP.NET_SessionId` rotations, logging cookie names only) and drops unauthenticated cookies on login redirects.
 
 ---
