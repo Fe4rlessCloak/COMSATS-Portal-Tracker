@@ -624,6 +624,118 @@ class ProductionTransportTests(unittest.TestCase):
         self.assertEqual(ctx.exception.set_cookie_names, ("ARRAffinity",))
 
 
+class ProbeTransportSafetyTests(unittest.TestCase):
+    """`probe.fetch` keeps its own redirect guard; verify it against a real local server."""
+
+    def test_probe_fetch_refuses_cross_host_redirect(self) -> None:
+        import probe
+
+        hits: list[str] = []
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - http.server naming
+                hits.append(self.path)
+                self.send_response(302)
+                self.send_header("Location", "https://evil.example.com/steal")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - http.server API
+                """Keep test output quiet."""
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            result = probe.fetch(f"http://127.0.0.1:{port}/Courses", "secret_sid")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5.0)
+
+        self.assertEqual(result.status, 302)
+        self.assertEqual(hits, ["/Courses"])
+
+    def test_probe_fetch_refuses_port_change_redirect(self) -> None:
+        import probe
+
+        hits: list[str] = []
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - http.server naming
+                hits.append(self.path)
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:1/Courses/Index")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - http.server API
+                """Keep test output quiet."""
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            result = probe.fetch(f"http://127.0.0.1:{port}/Courses", "secret_sid")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5.0)
+
+        self.assertEqual(result.status, 302)
+        self.assertEqual(hits, ["/Courses"])
+
+
+class ScanCookieDiagnosticsTests(unittest.TestCase):
+    """Mid-scan failures must still surface cookie diagnostics through ScanResult."""
+
+    def test_mid_scan_session_expiry_carries_error_cookie_names(self) -> None:
+        courses = [
+            Course(course_id="100001", code="CSC101", name="Course 1"),
+            Course(course_id="100002", code="CSC102", name="Course 2"),
+        ]
+        marks_html = _auth_shell(
+            '<div class="sis-marks-summary"><p class="sis-marks-empty">No marks available.</p></div>',
+            course_code="CSC101",
+            course_name="Course 1",
+        )
+        resources_html = _auth_shell(
+            '<div class="sis-lr"><span class="sis-lr-count">0 resources</span></div>',
+            course_code="CSC101",
+            course_name="Course 1",
+        )
+
+        stub = StubTransport()
+        # Course 1: SetCourse -> marks -> resources all succeed.
+        stub.add(StubResponse(DASH), url="/Courses/SetCourse/100001")
+        stub.add(StubResponse(marks_html), url="/MarksSummary/Index")
+        stub.add(StubResponse(resources_html), url="/LearningResources/Index")
+        # Course 2: SetCourse rotates to the login page while setting a cookie.
+        stub.add(
+            StubResponse(
+                "",
+                status=302,
+                headers={"Location": "/Login/Index", "Set-Cookie": ["ARRAffinity=node7; Path=/"]},
+            ),
+            url="/Courses/SetCourse/100002",
+        )
+
+        scan = tracker.scan_all_courses(_client(stub), courses)
+        self.assertTrue(scan.session_expired)
+        self.assertIn("ARRAffinity", scan.set_cookie_names)
+
+    def test_mid_scan_portal_error_carries_error_cookie_names(self) -> None:
+        courses = [Course(course_id="100001", code="CSC101", name="Course 1")]
+        stub = StubTransport()
+        stub.add(
+            StubResponse("boom", status=502, headers={"Set-Cookie": ["PortalAffinity=x; Path=/"]}),
+            url="/Courses/SetCourse/100001",
+        )
+        scan = tracker.scan_all_courses(_client(stub), courses)
+        self.assertTrue(scan.partial)
+        self.assertIn("PortalAffinity", scan.set_cookie_names)
+
+
 class DaemonReconfigurationTests(unittest.TestCase):
     """The daemon hot-reload path must go through the explicit reconfiguration API."""
 
