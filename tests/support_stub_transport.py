@@ -29,10 +29,16 @@ Python 3.9+ standard library only.
 from __future__ import annotations
 
 import email.message
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-from sis_client import PortalTransport, TransportResponse
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from sis_client import PortalTransport, TransportResponse  # noqa: E402
 
 __all__ = [
     "StubResponse",
