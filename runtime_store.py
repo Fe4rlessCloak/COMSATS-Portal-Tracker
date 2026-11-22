@@ -224,7 +224,12 @@ class RuntimeStore:
     # ------------------------------------------------------------------- lock
 
     def lock(self, timeout: Optional[float] = None) -> ContextManager[None]:
-        """Exclusive ``fcntl.flock`` on the lock file; ``StateLockError`` on timeout."""
+        """Exclusive ``fcntl.flock`` on the lock file; ``StateLockError`` on timeout.
+
+        The lock file is the one runtime file that is not written through the atomic
+        writer: an advisory exclusive lock needs an open descriptor, so it is opened
+        ``a+`` and left empty. Its *content* is never meaningful.
+        """
         effective = self.lock_timeout if timeout is None else float(timeout)
         return state_lock(self.state_path, timeout=effective)
 
