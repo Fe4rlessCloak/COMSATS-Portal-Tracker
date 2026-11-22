@@ -963,6 +963,26 @@ class PortalTypedSnapshotTests(unittest.TestCase):
         # Only the SetCourse request was made: marks attribution never happened.
         self.assertEqual(stub.urls(), [f"{BASE}/Courses/SetCourse/100001"])
 
+    def test_mismatch_after_a_cookie_rotation_still_reports_the_name(self) -> None:
+        stub = StubTransport()
+        stub.add(
+            StubResponse(
+                _course_shell("100001", "CSC101", "Intro"),
+                headers={"Set-Cookie": ["ARRAffinity=node1; Path=/"]},
+            )
+        )
+        # SetCourse still reports CSC101, but the marks page claims CSC336: the sticky
+        # session glitch this verification exists for.
+        stub.add(
+            StubResponse(
+                _marks_shell("CSC336", "Web Technologies", MARKS_ROWS),
+                headers={"Set-Cookie": ["PortalAffinity=edge2; Path=/"]},
+            )
+        )
+        with self.assertRaises(CourseMismatchError) as ctx:
+            _client(stub).fetch_course_snapshot(_intro_course())
+        self.assertEqual(ctx.exception.set_cookie_names, ("ARRAffinity", "PortalAffinity"))
+
     def test_late_failure_keeps_every_cookie_name_observed_so_far(self) -> None:
         stub = StubTransport()
         stub.add(

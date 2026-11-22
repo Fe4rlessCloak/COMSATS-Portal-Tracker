@@ -1524,10 +1524,7 @@ class SisClient:
         try:
             page = self.fetch_page(path)
         except (SessionExpiredError, PortalHttpError) as exc:
-            merged = _merge_names(observed, exc.set_cookie_names)
-            if merged == exc.set_cookie_names:
-                raise
-            raise type(exc)(str(exc), set_cookie_names=merged) from exc
+            raise _with_observed_cookies(exc, observed)
         observed.extend(page.set_cookie_names)
         return page
 
@@ -1550,7 +1547,10 @@ class SisClient:
         announcements_html = self._fetch_collecting(
             f"/Courses/SetCourse/{course.course_id}", observed
         ).body
-        verify_active_course(announcements_html, course)
+        try:
+            verify_active_course(announcements_html, course)
+        except CourseMismatchError as exc:
+            raise _with_observed_cookies(exc, observed)
 
         marks_html = self._fetch_collecting("/MarksSummary/Index", observed).body
         if not has_marks_page_marker(marks_html):
@@ -1558,7 +1558,10 @@ class SisClient:
                 "MarksSummary response missing expected marks markup.",
                 set_cookie_names=tuple(observed),
             )
-        verify_active_course(marks_html, course)
+        try:
+            verify_active_course(marks_html, course)
+        except CourseMismatchError as exc:
+            raise _with_observed_cookies(exc, observed)
         marks = parse_marks_summary(marks_html)
 
         resources_html = self._fetch_collecting("/LearningResources/Index", observed).body
@@ -1567,7 +1570,10 @@ class SisClient:
                 "LearningResources response missing expected resources markup.",
                 set_cookie_names=tuple(observed),
             )
-        verify_active_course(resources_html, course)
+        try:
+            verify_active_course(resources_html, course)
+        except CourseMismatchError as exc:
+            raise _with_observed_cookies(exc, observed)
         resources = parse_learning_resources(resources_html)
 
         announcements: Optional[List[AnnouncementItem]] = None
@@ -1600,3 +1606,19 @@ def _merge_names(existing: Iterable[str], extra: Iterable[str]) -> Tuple[str, ..
         if name not in names:
             names.append(name)
     return tuple(names)
+
+
+def _with_observed_cookies(
+    exc: Exception, observed: Iterable[str]
+) -> Exception:
+    """Re-raise ``exc`` carrying every cookie name observed so far in the snapshot.
+
+    Returns the exception to raise (never raises itself) so call sites read
+    ``raise _with_observed_cookies(...)``. When nothing new was observed the original
+    exception instance is returned unchanged, keeping its traceback chain intact.
+    """
+    current: Tuple[str, ...] = getattr(exc, "set_cookie_names", ())
+    merged = _merge_names(observed, current)
+    if merged == current:
+        return exc
+    return type(exc)(str(exc), set_cookie_names=merged)  # type: ignore[call-arg]
