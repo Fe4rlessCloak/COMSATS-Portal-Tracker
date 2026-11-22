@@ -771,14 +771,20 @@ def compute_transition(
     clear_anomaly = AnomalyAction(kind=ANOMALY_CLEAR if prior_anomaly is not None else ANOMALY_NONE)
 
     def _accepted(
-        kind: str,
-        state: Dict[str, Any],
-        notifications: List[Notification],
-        message: Optional[str] = None,
+        kind: str, state: Dict[str, Any], notifications: List[Notification]
     ) -> TransitionOutcome:
         notes = list(notifications)
         if recovery_note is not None:
             notes.insert(0, recovery_note)
+        c_count, m_count, r_count = scanned_totals
+        # The operator-facing "nothing happened" line is printed only when this cycle
+        # dispatched nothing at all — a lone recovery alert counts as an event.
+        message = None
+        if not notes:
+            message = (
+                f"Scanned {c_count} courses ({m_count} marks, {r_count} resources) "
+                "— no changes."
+            )
         return TransitionOutcome(
             kind=kind,
             persist_state=True,
@@ -827,10 +833,4 @@ def compute_transition(
         base_url=options.base_url,
         track_announcements=options.track_announcements,
     )
-    c_count, m_count, r_count = scanned_totals
-    message = None
-    if not notifications:
-        message = (
-            f"Scanned {c_count} courses ({m_count} marks, {r_count} resources) — no changes."
-        )
-    return _accepted(KIND_DIFF_APPLIED, state, notifications, message=message)
+    return _accepted(KIND_DIFF_APPLIED, state, notifications)

@@ -974,6 +974,9 @@ class RecoveryOrderingTests(unittest.TestCase):
         outcome = transition(previous, scan_of(copy.deepcopy(previous)), self.PRIOR)
         self.assertEqual([n.event for n in outcome.notifications], ["scan_recovered"])
         self.assertEqual(outcome.anomaly_action.kind, ANOMALY_CLEAR)
+        # A lone recovery alert is a real event: the "nothing happened" line stays off.
+        self.assertIsNone(outcome.summary["message"])
+        self.assertTrue(outcome.summary["recovered"])
 
     def test_notify_anomaly_off_suppresses_recovery_but_still_clears(self) -> None:
         options = TransitionOptions(base_url=BASE, notify_anomaly=False)
