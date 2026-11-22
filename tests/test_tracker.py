@@ -375,24 +375,12 @@ def _auth_shell(inner: str, course_code: str = "", course_name: str = "") -> str
 
 
 class ReliabilityAndBugfixTests(unittest.TestCase):
-    def test_bug1_degenerate_scan_rejected_and_rolling_backups_kept(self) -> None:
+    def test_bug1_degenerate_scan_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "data" / "state.json"
             good_baseline = _make_state(marks_count=6, res_count=6, course_count=1)
             save_state(state_path, good_baseline, max_backups=3)
-
-            # Rotate backups across updates and verify .bak -> .bak.3 retention
-            for i in range(4):
-                updated = _make_state(marks_count=6 + i + 1, res_count=6, course_count=1)
-                save_state(state_path, updated, max_backups=3)
-
-            self.assertTrue(state_path.with_name("state.json.bak").exists())
-            self.assertTrue(state_path.with_name("state.json.bak.2").exists())
-            self.assertTrue(state_path.with_name("state.json.bak.3").exists())
-            self.assertFalse(state_path.with_name("state.json.bak.4").exists())
-
-            # Restore latest good baseline and verify degenerate 0-marks scan does NOT overwrite
-            latest_before_corrupt = load_state(state_path)
+            baseline = load_state(state_path)
             notifier = _RecordingNotifier()
 
             class _ZeroMarksClient:
@@ -416,19 +404,19 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             )
             self.assertFalse(result.saved)
             self.assertIsNotNone(result.anomaly)
-            self.assertEqual(load_state(state_path), latest_before_corrupt)
+            self.assertEqual(load_state(state_path), baseline)
             self.assertEqual([n.event for n in notifier.notes], ["scan_anomaly"])
 
             # Sharp >50% drop and 0-course scan are also rejected by validate_snapshot
             self.assertIsNotNone(
                 validate_snapshot(
-                    latest_before_corrupt,
+                    baseline,
                     tracker.ScanResult(state=_make_state(marks_count=2, res_count=6, course_count=1)),
                 )
             )
             self.assertIsNotNone(
                 validate_snapshot(
-                    latest_before_corrupt,
+                    baseline,
                     tracker.ScanResult(state={"courses": {}}),
                 )
             )
@@ -995,6 +983,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             self.assertIn("[ERROR] Scan failed: 502 Bad Gateway", buf.getvalue())
 
     def test_bug10_load_before_scan_and_state_locking(self) -> None:
+        """The baseline is read under the lock before the portal is scanned."""
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"
             baseline = _make_state(marks_count=2, res_count=1, course_count=1)

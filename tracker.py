@@ -811,7 +811,7 @@ def run_cycle(
     dry_run: bool = False,
     *,
     store: Optional[RuntimeStore] = None,
-    max_backups: int = 5,
+    max_backups: Optional[int] = None,
     notifier_timeout: Optional[float] = None,
     cancel_event: Optional[threading.Event] = None,
     on_progress: Optional[Callable[[], None]] = None,
