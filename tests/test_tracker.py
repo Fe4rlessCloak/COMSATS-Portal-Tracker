@@ -1121,7 +1121,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
 
             courses = [Course(course_id="100001", code="CSC101", name="Course 1")]
             tick_event = threading.Event()
-            get_courses_calls = 0
+            dashboard_fetch_count = 0
 
             # Real client over a simulator that answers with the same dashboard every time.
             portal = SimulatedPortal(
@@ -1142,10 +1142,10 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             )
 
             def _count_dashboard(path, headers, sim):
-                nonlocal get_courses_calls
+                nonlocal dashboard_fetch_count
                 if path == "/Courses":
-                    get_courses_calls += 1
-                    if get_courses_calls >= 2:
+                    dashboard_fetch_count += 1
+                    if dashboard_fetch_count >= 2:
                         tick_event.set()
                 return sim._respond(path, headers)
 
@@ -1188,7 +1188,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                 t.join(timeout=2.0)
 
             self.assertEqual(rc, 0)
-            self.assertGreaterEqual(get_courses_calls, 2)
+            self.assertGreaterEqual(dashboard_fetch_count, 2)
             hb = json.loads(hb_path.read_text(encoding="utf-8"))
             self.assertEqual(hb["status"], "anomaly")
             self.assertIn("keep-alive OK", hb["detail"])
