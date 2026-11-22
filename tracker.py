@@ -46,6 +46,22 @@ from sis_client import (
     SessionExpiredError,
     SisClient,
 )
+from snapshot_transition import (
+    ANOMALY_CLEAR,
+    KIND_ANOMALY_REJECTED,
+    ANOMALY_NONE,
+    ANOMALY_RECORD,
+    AnomalyAction,
+    CycleResult,
+    ScanResult,
+    TransitionOptions,
+    TransitionOutcome,
+    compute_transition,
+    detect_semester_rollover,
+    diff_states,
+    summarize_totals,
+    validate_snapshot,
+)
 
 T = TypeVar("T")
 
@@ -60,26 +76,6 @@ class CycleTimeoutError(RuntimeError):
 
 class CycleCancelledError(RuntimeError):
     """Raised when a running cycle is interrupted by a shutdown signal."""
-
-
-@dataclass
-class ScanResult:
-    state: Dict[str, Any]
-    partial: bool = False
-    failed_courses: List[str] = field(default_factory=list)
-    session_expired: bool = False
-    session_expired_error: Optional[str] = None
-    sample_marks_html: str = ""
-    sample_marks_preview: str = ""
-    sample_marks_course: str = ""
-    set_cookie_names: List[str] = field(default_factory=list)
-
-
-@dataclass
-class CycleResult:
-    saved: bool
-    anomaly: Optional[str] = None
-    notifications: List[Notification] = field(default_factory=list)
 
 
 def scan_all_courses(
@@ -190,311 +186,160 @@ def scan_all_courses(
     )
 
 
-def _norm_semester(val: str) -> str:
-    return " ".join(val.strip().lower().split())
+@dataclass(frozen=True)
+class CycleOptions:
+    """Every knob one cycle needs, in one object.
 
+    Field names intentionally match the historical ``run_cycle`` keyword arguments, so
+    the compatibility shim below can build one straight from legacy call sites.
+    """
 
-def detect_semester_rollover(
-    old_state: Optional[Dict[str, Any]], new_state: Dict[str, Any]
-) -> Optional[Tuple[str, str]]:
-    """Return (old_semester, new_semester) when state transitions to a new academic semester."""
-    if old_state is None:
-        return None
-    old_raw = str(old_state.get("semester") or "").strip()
-    new_raw = str(new_state.get("semester") or "").strip()
-    old_norm = _norm_semester(old_raw)
-    new_norm = _norm_semester(new_raw)
-    if old_norm and new_norm:
-        return (old_raw, new_raw) if old_norm != new_norm else None
+    base_url: str
+    track_announcements: bool = False
+    reset_state: bool = False
+    notify_anomaly: bool = True
+    semester: Optional[str] = None
+    dry_run: bool = False
+    max_backups: Optional[int] = None
+    notifier_timeout: Optional[float] = None
+    lock_timeout: float = 30.0
+    cancel_event: Optional[threading.Event] = None
+    on_progress: Optional[Callable[[], None]] = None
+    state_path: Optional[Path] = None
 
-    old_courses = old_state.get("courses", {})
-    new_courses = new_state.get("courses", {})
-    if old_courses and new_courses and set(old_courses).isdisjoint(new_courses):
-        return (old_raw or "previous semester", new_raw or "new semester")
-    return None
-
-
-def validate_snapshot(
-    old_state: Optional[Dict[str, Any]],
-    scan_result: ScanResult,
-    *,
-    reset_state: bool = False,
-) -> Optional[str]:
-    """Validate snapshot plausibility before persisting; returns an error reason or None."""
-    if scan_result.session_expired:
-        return f"Session expired mid-scan: {scan_result.session_expired_error}"
-    if scan_result.partial:
-        return (
-            f"Partial scan ({len(scan_result.failed_courses)} course(s) failed: "
-            f"{', '.join(scan_result.failed_courses)})"
+    def transition_options(self) -> TransitionOptions:
+        return TransitionOptions(
+            base_url=self.base_url,
+            track_announcements=self.track_announcements,
+            reset_state=self.reset_state,
+            notify_anomaly=self.notify_anomaly,
         )
 
-    new_c, new_m, new_r = summarize_totals(scan_result.state)
-    if new_c == 0:
-        return "Scan returned 0 courses."
 
-    if reset_state:
-        return None
-
-    if old_state is not None:
-        if detect_semester_rollover(old_state, scan_result.state) is not None:
-            return None
-        old_c, old_m, old_r = summarize_totals(old_state)
-        if old_m > 0 and new_m == 0:
-            return f"Total marks dropped from {old_m} to 0 (degenerate scan)."
-        if old_c >= 3 and new_c < old_c * 0.5:
-            return f"Course count dropped sharply from {old_c} to {new_c}."
-        if old_m >= 5 and new_m < old_m * 0.5:
-            return f"Total marks dropped sharply from {old_m} to {new_m}."
-        if old_r >= 5 and new_r < old_r * 0.5:
-            return f"Total resources dropped sharply from {old_r} to {new_r}."
-
-    return None
+# Backwards-compatible keyword names still accepted by ``run_cycle``. Each maps onto a
+# ``CycleOptions`` field.
+_LEGACY_CYCLE_KWARGS = frozenset(
+    {
+        "state_path",
+        "base_url",
+        "track_announcements",
+        "dry_run",
+        "max_backups",
+        "notifier_timeout",
+        "cancel_event",
+        "on_progress",
+        "lock_timeout",
+        "notify_anomaly",
+        "semester",
+        "reset_state",
+    }
+)
 
 
-def diff_states(
-    old_state: Dict[str, Any],
-    new_state: Dict[str, Any],
-    base_url: str,
-    track_announcements: bool = False,
-) -> List[Notification]:
-    """Compare old and new snapshots and return Notifications for added, updated, or removed items."""
-    notes: List[Notification] = []
-    old_courses = old_state.get("courses", {})
-    new_courses = new_state.get("courses", {})
+def _cycle_options_from_legacy(**kwargs: Any) -> CycleOptions:
+    """Build ``CycleOptions`` from the pre-refactor ``run_cycle`` keyword arguments."""
+    unknown = set(kwargs) - _LEGACY_CYCLE_KWARGS
+    if unknown:
+        raise TypeError(
+            f"run_cycle() got unexpected keyword argument(s): {', '.join(sorted(unknown))}"
+        )
+    base_url = kwargs.get("base_url")
+    if not base_url:
+        raise TypeError("run_cycle() requires base_url (directly or via CycleOptions)")
+    return CycleOptions(
+        base_url=str(base_url),
+        track_announcements=bool(kwargs.get("track_announcements", False)),
+        reset_state=bool(kwargs.get("reset_state", False)),
+        notify_anomaly=bool(kwargs.get("notify_anomaly", True)),
+        semester=kwargs.get("semester"),
+        dry_run=bool(kwargs.get("dry_run", False)),
+        max_backups=kwargs.get("max_backups"),
+        notifier_timeout=kwargs.get("notifier_timeout"),
+        lock_timeout=float(
+            kwargs["lock_timeout"] if kwargs.get("lock_timeout") is not None else 30.0
+        ),
+        cancel_event=kwargs.get("cancel_event"),
+        on_progress=kwargs.get("on_progress"),
+        state_path=kwargs.get("state_path"),
+    )
 
-    for cid, new_c in new_courses.items():
-        old_c = old_courses.get(cid)
-        label = new_c.get("label") or cid
 
-        # Skip alerting on brand-new course appearance only if desired; usually helpful to scan its items.
-        old_marks = (old_c or {}).get("marks", {})
-        new_marks = new_c.get("marks", {})
-        mark_lines: List[str] = []
-        changed_marks: List[Dict[str, Any]] = []
+def _resolve_cycle_store(
+    store: Optional[RuntimeStore], state_path: Optional[Path]
+) -> RuntimeStore:
+    """Return the store to use, accepting a bare path for either argument."""
+    if isinstance(store, RuntimeStore):
+        return store
+    if store is not None and state_path is None:
+        state_path = Path(store)  # type: ignore[arg-type]
+    if state_path is None:
+        raise TypeError("run_cycle() requires a RuntimeStore or state_path")
+    return RuntimeStore(Path(state_path))
 
-        for key, item in new_marks.items():
-            prev = old_marks.get(key)
-            score_str = f"{item['obtained']} / {item['total']}".strip(" /")
-            if prev is None:
-                mark_lines.append(f"+ [{item['section']}] {item['title']}: {score_str}")
-                changed_marks.append({"change": "added", **item})
-            elif (
-                prev.get("obtained") != item.get("obtained")
-                or prev.get("total") != item.get("total")
-            ):
-                old_score = f"{prev.get('obtained', '')} / {prev.get('total', '')}".strip(" /")
-                mark_lines.append(
-                    f"~ [{item['section']}] {item['title']}: {old_score} -> {score_str}"
-                )
-                changed_marks.append({"change": "updated", "previous": prev, **item})
 
-        if mark_lines:
-            notes.append(
-                Notification(
-                    event="marks_updated",
-                    title=f"Marks update: {label}",
-                    message="\n".join(mark_lines),
-                    priority="high",
-                    tags=("mortar_board", "chart_with_upwards_trend"),
-                    url=f"{base_url}/Courses/SetCourse/{cid}",
-                    data={"course_id": cid, "course": label, "items": changed_marks},
-                )
+def _log_transition(outcome: TransitionOutcome) -> None:
+    """Print the operator-facing lines the pre-refactor cycle printed inline."""
+    summary = outcome.summary
+    if outcome.kind == KIND_ANOMALY_REJECTED:
+        reason = str(summary.get("reason") or "")
+        scanned_c, scanned_m, scanned_r = outcome.scanned_totals
+        dedup_note = (
+            " (duplicate alert suppressed)" if summary.get("duplicate_suppressed") else ""
+        )
+        print(
+            f"[WARN] Rejected snapshot ({reason}; scanned={scanned_c}c/{scanned_m}m/"
+            f"{scanned_r}r; occurrence #{summary.get('occurrence')}){dedup_note} "
+            "— preserving existing baseline."
+        )
+        preview = str(summary.get("preview") or "")
+        if preview:
+            print(
+                f"[INFO] Anomaly page preview ({summary.get('preview_course')}): {preview}"
             )
-
-        removed_mark_lines: List[str] = []
-        removed_marks: List[Dict[str, Any]] = []
-        for key, prev in old_marks.items():
-            if key not in new_marks:
-                score_str = f"{prev.get('obtained', '')} / {prev.get('total', '')}".strip(" /")
-                section = prev.get("section", "")
-                title = prev.get("title", key)
-                removed_mark_lines.append(f"- [{section}] {title}: {score_str}")
-                removed_marks.append({"change": "removed", **prev})
-
-        if removed_mark_lines:
-            notes.append(
-                Notification(
-                    event="marks_removed",
-                    title=f"Marks removed: {label}",
-                    message="\n".join(removed_mark_lines),
-                    priority="high",
-                    tags=("warning", "chart_with_downwards_trend"),
-                    url=f"{base_url}/Courses/SetCourse/{cid}",
-                    data={"course_id": cid, "course": label, "items": removed_marks},
-                )
-            )
-
-        old_res = (old_c or {}).get("resources", {})
-        new_res = new_c.get("resources", {})
-        res_lines: List[str] = []
-        added_res: List[Dict[str, Any]] = []
-        first_res_url: Optional[str] = None
-
-        for key, item in new_res.items():
-            if key not in old_res:
-                meta_parts = [p for p in (item.get("material_type"), item.get("size"), item.get("date_text")) if p]
-                meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
-                href = item.get("href", "")
-                full_href = urllib.parse.urljoin(f"{base_url}/", href) if href else ""
-                if not first_res_url and full_href:
-                    first_res_url = full_href
-                line = f"+ {item['title']}{meta}"
-                if full_href:
-                    line += f"\n  {full_href}"
-                res_lines.append(line)
-                added_res.append(item)
-
-        if res_lines:
-            notes.append(
-                Notification(
-                    event="resource_added",
-                    title=f"New material: {label}",
-                    message="\n".join(res_lines),
-                    priority="default",
-                    tags=("books", "page_facing_up"),
-                    url=first_res_url or f"{base_url}/Courses/SetCourse/{cid}",
-                    data={"course_id": cid, "course": label, "items": added_res},
-                )
-            )
-
-        removed_res_lines: List[str] = []
-        removed_res: List[Dict[str, Any]] = []
-        for key, prev in old_res.items():
-            if key not in new_res:
-                meta_parts = [
-                    p
-                    for p in (prev.get("material_type"), prev.get("size"), prev.get("date_text"))
-                    if p
-                ]
-                meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
-                removed_res_lines.append(f"- {prev.get('title', key)}{meta}")
-                removed_res.append(prev)
-
-        if removed_res_lines:
-            notes.append(
-                Notification(
-                    event="resource_removed",
-                    title=f"Material removed: {label}",
-                    message="\n".join(removed_res_lines),
-                    priority="default",
-                    tags=("warning", "books"),
-                    url=f"{base_url}/Courses/SetCourse/{cid}",
-                    data={"course_id": cid, "course": label, "items": removed_res},
-                )
-            )
-
-        if track_announcements:
-            old_ann = (old_c or {}).get("announcements", {})
-            new_ann = new_c.get("announcements", {})
-            ann_lines: List[str] = []
-            added_ann: List[Dict[str, Any]] = []
-            for key, item in new_ann.items():
-                if key not in old_ann:
-                    snippet = item.get("body", "")[:180]
-                    ann_lines.append(f"+ {item.get('title', 'Announcement')}\n  {snippet}")
-                    added_ann.append(item)
-            if ann_lines:
-                notes.append(
-                    Notification(
-                        event="announcement_added",
-                        title=f"Announcement: {label}",
-                        message="\n".join(ann_lines),
-                        priority="default",
-                        tags=("loudspeaker",),
-                        url=f"{base_url}/Courses/SetCourse/{cid}",
-                        data={"course_id": cid, "course": label, "items": added_ann},
-                    )
-                )
-
-            removed_ann_lines: List[str] = []
-            removed_ann: List[Dict[str, Any]] = []
-            for key, prev in old_ann.items():
-                if key not in new_ann:
-                    removed_ann_lines.append(f"- {prev.get('title', 'Announcement')}")
-                    removed_ann.append(prev)
-            if removed_ann_lines:
-                notes.append(
-                    Notification(
-                        event="announcement_removed",
-                        title=f"Announcement removed: {label}",
-                        message="\n".join(removed_ann_lines),
-                        priority="default",
-                        tags=("loudspeaker",),
-                        url=f"{base_url}/Courses/SetCourse/{cid}",
-                        data={"course_id": cid, "course": label, "items": removed_ann},
-                    )
-                )
-
-    for cid, old_c in old_courses.items():
-        if cid not in new_courses:
-            old_label = old_c.get("label") or cid
-            old_marks = old_c.get("marks", {})
-            old_res = old_c.get("resources", {})
-            notes.append(
-                Notification(
-                    event="course_removed",
-                    title=f"Course removed: {old_label}",
-                    message=(
-                        f"Course {old_label} is no longer present "
-                        f"(had {len(old_marks)} marks, {len(old_res)} resources)."
-                    ),
-                    priority="high",
-                    tags=("warning",),
-                    url=f"{base_url}/Courses",
-                    data={
-                        "course_id": cid,
-                        "course": old_label,
-                        "marks_count": len(old_marks),
-                        "resources_count": len(old_res),
-                    },
-                )
-            )
-
-    return notes
-
-
-def summarize_totals(state: Dict[str, Any]) -> Tuple[int, int, int]:
-    courses = state.get("courses", {})
-    marks = sum(len(c.get("marks", {})) for c in courses.values())
-    resources = sum(len(c.get("resources", {})) for c in courses.values())
-    return len(courses), marks, resources
+        return
+    message = summary.get("message")
+    if message:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
 
 def run_cycle(
-    client: SisClient,
+    client: Optional[SisClient],
     courses: List[Course],
-    state_path: Path,
-    base_url: str,
-    track_announcements: bool,
-    notifiers: List[BaseNotifier],
-    dry_run: bool = False,
-    *,
     store: Optional[RuntimeStore] = None,
-    max_backups: Optional[int] = None,
-    notifier_timeout: Optional[float] = None,
-    cancel_event: Optional[threading.Event] = None,
-    on_progress: Optional[Callable[[], None]] = None,
-    lock_timeout: float = 30.0,
-    notify_anomaly: bool = True,
-    semester: Optional[str] = None,
-    reset_state: bool = False,
+    options: Optional[CycleOptions] = None,
+    notifiers: Optional[List[BaseNotifier]] = None,
+    **legacy_kwargs: Any,
 ) -> CycleResult:
-    """Run one locked load -> multi-course fetch -> validate -> save -> diff + notify cycle."""
-    store = store or RuntimeStore(state_path)
-    with store.lock(timeout=lock_timeout):
-        old_state = store.load_state()
+    """Run one locked load -> multi-course fetch -> transition -> commit + notify cycle.
+
+    ``run_cycle(client, courses, store, options, notifiers)`` is the current surface.
+    Every pre-refactor keyword argument still works through ``legacy_kwargs``; mixing
+    ``options`` with them raises ``TypeError`` so a caller can never half-migrate.
+    """
+    if options is None:
+        options = _cycle_options_from_legacy(**legacy_kwargs)
+    elif legacy_kwargs:
+        raise TypeError(
+            "run_cycle() accepts either CycleOptions or the legacy keyword arguments, "
+            f"not both (got: {', '.join(sorted(legacy_kwargs))})"
+        )
+    active_notifiers: List[BaseNotifier] = list(notifiers or ())
+    runtime_store = _resolve_cycle_store(store, options.state_path)
+
+    # Load + scan happen under the exclusive lock, baseline first (unchanged ordering).
+    with runtime_store.lock(timeout=options.lock_timeout):
+        previous_state = runtime_store.load_state()
         scan_result = scan_all_courses(
             client,
             courses,
-            track_announcements=track_announcements,
-            previous_state=old_state,
-            cancel_event=cancel_event,
-            on_progress=on_progress,
-            semester=semester,
+            track_announcements=options.track_announcements,
+            previous_state=previous_state,
+            cancel_event=options.cancel_event,
+            on_progress=options.on_progress,
+            semester=options.semester,
         )
 
-        if cancel_event is not None and cancel_event.is_set():
+        if options.cancel_event is not None and options.cancel_event.is_set():
             return CycleResult(saved=False, anomaly="Cancelled")
 
         if scan_result.session_expired:
@@ -503,247 +348,49 @@ def run_cycle(
                 scan_result.session_expired_error or "Session expired mid-scan."
             )
 
-        anomaly = validate_snapshot(old_state, scan_result, reset_state=reset_state)
-        if anomaly is not None:
-            new_c, new_m, new_r = summarize_totals(scan_result.state)
-            old_c, old_m, old_r = (
-                summarize_totals(old_state) if old_state is not None else (0, 0, 0)
-            )
-            now_iso = datetime.now(timezone.utc).isoformat()
-            anomaly_key = anomaly.strip()
-            prev_anom = store.load_anomaly()
-            if prev_anom is not None and str(prev_anom.get("key") or "") == anomaly_key:
-                occurrence = int(prev_anom.get("count") or 1) + 1
-                first_seen = str(prev_anom.get("first_seen") or now_iso)
-                should_notify = False
-            else:
-                occurrence = 1
-                first_seen = now_iso
-                should_notify = notify_anomaly
-
-            if not dry_run:
-                store.save_anomaly(
-                    {
-                        "key": anomaly_key,
-                        "reason": anomaly,
-                        "first_seen": first_seen,
-                        "last_seen": now_iso,
-                        "count": occurrence,
-                        "scanned": {"courses": new_c, "marks": new_m, "resources": new_r},
-                    }
-                )
-                store.write_anomaly_diagnostics(
-                    reason=anomaly,
-                    occurrence=occurrence,
-                    scanned_totals={"courses": new_c, "marks": new_m, "resources": new_r},
-                    baseline_totals={"courses": old_c, "marks": old_m, "resources": old_r},
-                    failed_courses=scan_result.failed_courses,
-                    set_cookie_names=scan_result.set_cookie_names,
-                    sample_marks_course=scan_result.sample_marks_course,
-                    marks_html=scan_result.sample_marks_html,
-                )
-
-            preview = scan_result.sample_marks_preview
-            if len(preview) > 240:
-                preview = preview[:237].rstrip() + "..."
-            dedup_note = (
-                " (duplicate alert suppressed)"
-                if (not should_notify and notify_anomaly)
-                else ""
-            )
-            print(
-                f"[WARN] Rejected snapshot ({anomaly}; scanned={new_c}c/{new_m}m/{new_r}r; "
-                f"occurrence #{occurrence}){dedup_note} — preserving existing baseline."
-            )
-            if preview:
-                course_label = scan_result.sample_marks_course or "MarksSummary"
-                print(f"[INFO] Anomaly page preview ({course_label}): {preview}")
-
-            msg_lines = [
-                anomaly,
-                (
-                    f"Scanned: {new_c} courses, {new_m} marks, {new_r} resources "
-                    f"(baseline: {old_c} courses, {old_m} marks, {old_r} resources)."
-                ),
-            ]
-            if scan_result.set_cookie_names:
-                msg_lines.append(
-                    f"Set-Cookie names observed: {', '.join(scan_result.set_cookie_names)}"
-                )
-            if preview:
-                msg_lines.append(f"Page preview: {preview}")
-            msg_lines.append(
-                "Existing baseline was NOT overwritten. "
-                "Further identical alerts are suppressed until recovery."
-            )
-            anomaly_note = Notification(
-                event="scan_anomaly",
-                title="Portal scan anomaly (state preserved)",
-                message="\n".join(msg_lines),
-                priority="high",
-                tags=("warning",),
-                url=f"{base_url}/Courses",
-                data={
-                    "reason": anomaly,
-                    "occurrence": occurrence,
-                    "failed_courses": scan_result.failed_courses,
-                    "scanned": {"courses": new_c, "marks": new_m, "resources": new_r},
-                    "baseline": {"courses": old_c, "marks": old_m, "resources": old_r},
-                    "set_cookie_names": list(scan_result.set_cookie_names),
-                },
-            )
-            if should_notify:
-                dispatch_all(notifiers, anomaly_note, timeout=notifier_timeout)
-                return CycleResult(saved=False, anomaly=anomaly, notifications=[anomaly_note])
-            return CycleResult(saved=False, anomaly=anomaly, notifications=[])
-
-        new_state = scan_result.state
-        prev_anom = store.load_anomaly()
-        c_count, m_count, r_count = summarize_totals(new_state)
-        recovery_note: Optional[Notification] = None
-        if prev_anom is not None:
-            prev_reason = str(prev_anom.get("reason") or "previous scan anomaly")
-            prev_count = int(prev_anom.get("count") or 1)
-            recovery_note = Notification(
-                event="scan_recovered",
-                title="Portal scan recovered",
-                message=(
-                    f"Normal portal data returned after {prev_count} rejected scan(s) "
-                    f"({prev_reason}).\n"
-                    f"Current totals: {c_count} courses, {m_count} marks, {r_count} resources."
-                ),
-                priority="default",
-                tags=("white_check_mark",),
-                url=f"{base_url}/Courses",
-                data={
-                    "previous_reason": prev_reason,
-                    "rejected_scans": prev_count,
-                    "courses": c_count,
-                    "marks": m_count,
-                    "resources": r_count,
-                },
-            )
-
-        rollover = None if reset_state else detect_semester_rollover(old_state, new_state)
-
-        if old_state is None or reset_state:
-            if cancel_event is not None and cancel_event.is_set():
-                return CycleResult(saved=False, anomaly="Cancelled")
-            if not dry_run:
-                store.save_state(new_state, max_backups=max_backups)
-                if prev_anom is not None:
-                    store.clear_anomaly()
-            new_sem = str(new_state.get("semester") or "").strip()
-            baseline_data: Dict[str, Any] = {
-                "courses": c_count,
-                "marks": m_count,
-                "resources": r_count,
-            }
-            if new_sem:
-                baseline_data["semester"] = new_sem
-                baseline_msg = (
-                    f"Baseline saved for {c_count} courses "
-                    f"({new_sem}: {m_count} marks, {r_count} resources)."
-                )
-            else:
-                baseline_msg = (
-                    f"Baseline saved for {c_count} courses "
-                    f"({m_count} marks, {r_count} resources)."
-                )
-            baseline_note = Notification(
-                event="baseline_saved",
-                title="COMSATS Portal Tracker started",
-                message=baseline_msg,
-                priority="low",
-                tags=("white_check_mark",),
-                url=f"{base_url}/Courses",
-                data=baseline_data,
-            )
-            sent_notes: List[Notification] = []
-            if recovery_note is not None and notify_anomaly:
-                dispatch_all(notifiers, recovery_note, timeout=notifier_timeout)
-                sent_notes.append(recovery_note)
-            dispatch_all(notifiers, baseline_note, timeout=notifier_timeout)
-            sent_notes.append(baseline_note)
-            return CycleResult(saved=not dry_run, notifications=sent_notes)
-
-        if rollover is not None:
-            if cancel_event is not None and cancel_event.is_set():
-                return CycleResult(saved=False, anomaly="Cancelled")
-            old_sem_label, new_sem_label = rollover
-            if not dry_run:
-                store.save_state(new_state, max_backups=max_backups)
-                if prev_anom is not None:
-                    store.clear_anomaly()
-            course_lines = "\n".join(
-                f"- {c.get('label') or cid}"
-                for cid, c in new_state.get("courses", {}).items()
-            )
-            rollover_title = (
-                "New semester detected"
-                if new_sem_label == "new semester"
-                else f"New semester detected: {new_sem_label}"
-            )
-            rollover_msg = (
-                f"Transition: {old_sem_label} -> {new_sem_label}\n"
-                f"Saved fresh baseline for {c_count} courses "
-                f"({m_count} marks, {r_count} resources)."
-            )
-            if course_lines:
-                rollover_msg += f"\n{course_lines}"
-            rollover_note = Notification(
-                event="semester_rollover",
-                title=rollover_title,
-                message=rollover_msg,
-                priority="default",
-                tags=("mortar_board", "white_check_mark"),
-                url=f"{base_url}/Courses",
-                data={
-                    "previous_semester": old_sem_label,
-                    "semester": new_sem_label,
-                    "courses": c_count,
-                    "marks": m_count,
-                    "resources": r_count,
-                },
-            )
-            sent_rollover: List[Notification] = []
-            if recovery_note is not None and notify_anomaly:
-                dispatch_all(notifiers, recovery_note, timeout=notifier_timeout)
-                sent_rollover.append(recovery_note)
-            dispatch_all(notifiers, rollover_note, timeout=notifier_timeout)
-            sent_rollover.append(rollover_note)
-            return CycleResult(saved=not dry_run, notifications=sent_rollover)
-
-        if not new_state.get("semester") and old_state.get("semester"):
-            new_state["semester"] = str(old_state["semester"]).strip()
-
-        notifications = diff_states(
-            old_state,
-            new_state,
-            base_url=base_url,
-            track_announcements=track_announcements,
+        outcome = compute_transition(
+            previous_state,
+            scan_result,
+            runtime_store.load_anomaly(),
+            datetime.now(timezone.utc),
+            options.transition_options(),
         )
-        if cancel_event is not None and cancel_event.is_set():
+        _log_transition(outcome)
+
+        # ONE unified post-transition tail: cancel check -> dry-run gate -> commit ->
+        # dispatch. Baseline, rollover, and diff all travel this path.
+        if options.cancel_event is not None and options.cancel_event.is_set():
             return CycleResult(saved=False, anomaly="Cancelled")
-        if not dry_run:
-            store.save_state(new_state, max_backups=max_backups)
-            if prev_anom is not None:
-                store.clear_anomaly()
 
-        all_notes: List[Notification] = []
-        if recovery_note is not None and notify_anomaly:
-            all_notes.append(recovery_note)
-        all_notes.extend(notifications)
+        if not options.dry_run:
+            if outcome.persist_state and outcome.state is not None:
+                runtime_store.save_state(outcome.state, max_backups=options.max_backups)
+            action = outcome.anomaly_action
+            if action.kind == ANOMALY_RECORD and action.marker is not None:
+                runtime_store.save_anomaly(action.marker)
+                diagnostics = action.diagnostics
+                if diagnostics is not None:
+                    runtime_store.write_anomaly_diagnostics(
+                        reason=diagnostics.reason,
+                        occurrence=diagnostics.occurrence,
+                        scanned_totals=diagnostics.scanned_totals,
+                        baseline_totals=diagnostics.baseline_totals,
+                        failed_courses=list(diagnostics.failed_courses),
+                        set_cookie_names=list(diagnostics.set_cookie_names),
+                        sample_marks_course=diagnostics.sample_marks_course,
+                        marks_html=diagnostics.marks_html,
+                    )
+            elif action.kind == ANOMALY_CLEAR:
+                runtime_store.clear_anomaly()
 
-        if all_notes:
-            for note in all_notes:
-                dispatch_all(notifiers, note, timeout=notifier_timeout)
-        else:
-            now = datetime.now().strftime("%H:%M:%S")
-            print(
-                f"[{now}] Scanned {c_count} courses ({m_count} marks, {r_count} resources) — no changes."
-            )
-        return CycleResult(saved=not dry_run, notifications=all_notes)
+        for note in outcome.notifications:
+            dispatch_all(active_notifiers, note, timeout=options.notifier_timeout)
+
+        return CycleResult(
+            saved=outcome.persist_state and not options.dry_run,
+            anomaly=outcome.summary.get("anomaly"),
+            notifications=list(outcome.notifications),
+        )
 
 
 def run_with_timeout(
