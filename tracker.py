@@ -29,7 +29,6 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
 from config import (
     EnvWatcher,
     TrackerConfig,
-    default_heartbeat_path,
     load_config,
     load_env_dict,
     parse_int,
@@ -831,7 +830,7 @@ def run_daemon(
         request_delay=cfg.request_delay,
     )
 
-    hb_path = heartbeat_path or default_heartbeat_path(state_path, environ)
+    hb_path = heartbeat_path or resolve_heartbeat_file(state_path, environ)
     store = RuntimeStore(
         state_path,
         hb_path,
