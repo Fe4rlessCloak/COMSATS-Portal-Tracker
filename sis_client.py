@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from html.parser import HTMLParser
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
@@ -120,6 +120,38 @@ class AnnouncementItem:
 
     def to_dict(self) -> Dict[str, str]:
         return asdict(self)
+
+
+@dataclass
+class RosterResult:
+    """Everything ``fetch_roster()`` observed on ``/Courses``.
+
+    ``courses`` are the parsed enrolled courses, ``semester`` is the extracted semester
+    label (empty when the dashboard omits it), and ``set_cookie_names`` are the
+    ``Set-Cookie`` header names seen while fetching the page.
+    """
+
+    courses: List[Course] = field(default_factory=list)
+    semester: str = ""
+    set_cookie_names: Tuple[str, ...] = ()
+
+
+@dataclass
+class CourseSnapshotResult:
+    """Everything ``fetch_course_snapshot()`` observed for one course.
+
+    ``announcements`` is ``None`` when the caller did not ask for them. ``diagnostic_html``
+    is already scrubbed by :func:`scrub_diagnostic_html` and ``diagnostic_preview`` by
+    :func:`extract_diagnostic_text`; both are only populated when ``marks`` is empty, so
+    raw portal HTML never crosses this seam.
+    """
+
+    marks: List[MarkItem] = field(default_factory=list)
+    resources: List[ResourceItem] = field(default_factory=list)
+    announcements: Optional[List[AnnouncementItem]] = None
+    set_cookie_names: Tuple[str, ...] = ()
+    diagnostic_html: str = ""
+    diagnostic_preview: str = ""
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1250,11 +1282,6 @@ class SisClient:
         )
         self.transport: PortalTransport = transport if transport is not None else UrllibTransport()
         self._last_request_ts = 0.0
-        self.last_marks_html: str = ""
-        self.last_resources_html: str = ""
-        self.last_set_cookie_names: List[str] = []
-        self.last_response_info: Dict[str, Any] = {}
-        self.last_semester: str = ""
 
     # -- connection settings --------------------------------------------------
     @property
@@ -1417,8 +1444,6 @@ class SisClient:
                 next_url = urllib.parse.urljoin(url, location) if location else ""
                 if location and (is_login_url(next_url) or "login" in location.lower()):
                     names = _merge_names(seen_names, response.set_cookie_names)
-                    self.last_set_cookie_names = list(names)
-                    self.last_response_info = _response_info(url, next_url or url, response.status, names)
                     raise SessionExpiredError(
                         f"Redirected to login ({location}).", set_cookie_names=names
                     )
@@ -1448,15 +1473,11 @@ class SisClient:
                 # A login response must never mutate the jar or the session identifier; the
                 # cookie names are still reported for diagnostics.
                 names = _merge_names(seen_names, response.set_cookie_names)
-                self.last_set_cookie_names = list(names)
-                self.last_response_info = _response_info(url, final_url, response.status, names)
                 raise SessionExpiredError(login_reason, set_cookie_names=names)
 
             _stage_set_cookies(response.headers, pending, seen_names)
             self._commit_cookies(pending)
             names = tuple(seen_names)
-            self.last_set_cookie_names = list(names)
-            self.last_response_info = _response_info(url, final_url, response.status, names)
             return PortalResponse(
                 url=url,
                 final_url=final_url,
@@ -1473,52 +1494,103 @@ class SisClient:
         """Fetch an authenticated portal page body, raising SessionExpiredError at Login."""
         return self.fetch_page(path).body
 
-    # -- typed-ish page operations (kept stable for the tracker orchestrator) --
-    def get_courses(self) -> List[Course]:
-        html = self.get_html("/Courses")
-        self.last_semester = parse_semester(html)
+    # -- typed portal operations ---------------------------------------------
+    def fetch_roster(self) -> RosterResult:
+        """Fetch and parse the enrolled-course roster from ``/Courses``.
+
+        Owns the dashboard page-marker check, semester extraction, and the "0 courses is a
+        parse error" rule, and reports the ``Set-Cookie`` header names observed on the page.
+        """
+        page = self.fetch_page("/Courses")
+        html = page.body
         if not has_courses_page_marker(html):
             raise PortalParseError(
                 "Dashboard response missing expected courses table markup.",
-                set_cookie_names=self.last_set_cookie_names,
+                set_cookie_names=page.set_cookie_names,
             )
         courses = parse_courses(html)
         if not courses:
             raise PortalParseError(
-                "Dashboard parsed 0 courses.", set_cookie_names=self.last_set_cookie_names
+                "Dashboard parsed 0 courses.", set_cookie_names=page.set_cookie_names
             )
-        return courses
+        return RosterResult(
+            courses=courses,
+            semester=parse_semester(html),
+            set_cookie_names=page.set_cookie_names,
+        )
 
-    def select_course(self, course_id: str, expected_course: Optional[Course] = None) -> str:
-        """Switch active session course via /Courses/SetCourse/<id> (returns Announcements HTML)."""
-        html = self.get_html(f"/Courses/SetCourse/{course_id}")
-        if expected_course is not None:
-            verify_active_course(html, expected_course)
-        return html
+    def _fetch_collecting(self, path: str, observed: List[str]) -> PortalResponse:
+        """``fetch_page`` that accumulates observed cookie names and merges them on error."""
+        try:
+            page = self.fetch_page(path)
+        except (SessionExpiredError, PortalHttpError) as exc:
+            merged = _merge_names(observed, exc.set_cookie_names)
+            if merged == exc.set_cookie_names:
+                raise
+            raise type(exc)(str(exc), set_cookie_names=merged) from exc
+        observed.extend(page.set_cookie_names)
+        return page
 
-    def get_marks_summary(self, expected_course: Optional[Course] = None) -> List[MarkItem]:
-        html = self.get_html("/MarksSummary/Index")
-        self.last_marks_html = html
-        if not has_marks_page_marker(html):
+    def fetch_course_snapshot(
+        self, course: Course, include_announcements: bool = False
+    ) -> CourseSnapshotResult:
+        """Fetch one course's marks, resources and optional announcements.
+
+        Performs the whole ASP.NET dance in order — ``SetCourse`` -> active-course
+        verification -> ``/MarksSummary/Index`` fetch + parse -> ``/LearningResources/Index``
+        fetch + parse -> optional announcement parsing — and returns parsed items only.
+
+        Raw HTML never leaves this method: when no marks are parsed, ``diagnostic_html``
+        carries the already-scrubbed marks page (see :func:`scrub_diagnostic_html`) and
+        ``diagnostic_preview`` its credential-free plain-text snippet. Errors carry every
+        ``Set-Cookie`` name observed so far in addition to their own.
+        """
+        observed: List[str] = []
+
+        announcements_html = self._fetch_collecting(
+            f"/Courses/SetCourse/{course.course_id}", observed
+        ).body
+        verify_active_course(announcements_html, course)
+
+        marks_html = self._fetch_collecting("/MarksSummary/Index", observed).body
+        if not has_marks_page_marker(marks_html):
             raise PortalParseError(
                 "MarksSummary response missing expected marks markup.",
-                set_cookie_names=self.last_set_cookie_names,
+                set_cookie_names=tuple(observed),
             )
-        if expected_course is not None:
-            verify_active_course(html, expected_course)
-        return parse_marks_summary(html)
+        verify_active_course(marks_html, course)
+        marks = parse_marks_summary(marks_html)
 
-    def get_learning_resources(self, expected_course: Optional[Course] = None) -> List[ResourceItem]:
-        html = self.get_html("/LearningResources/Index")
-        self.last_resources_html = html
-        if not has_resources_page_marker(html):
+        resources_html = self._fetch_collecting("/LearningResources/Index", observed).body
+        if not has_resources_page_marker(resources_html):
             raise PortalParseError(
                 "LearningResources response missing expected resources markup.",
-                set_cookie_names=self.last_set_cookie_names,
+                set_cookie_names=tuple(observed),
             )
-        if expected_course is not None:
-            verify_active_course(html, expected_course)
-        return parse_learning_resources(html)
+        verify_active_course(resources_html, course)
+        resources = parse_learning_resources(resources_html)
+
+        announcements: Optional[List[AnnouncementItem]] = None
+        if include_announcements:
+            announcements = parse_announcements(announcements_html)
+
+        diagnostic_html = ""
+        diagnostic_preview = ""
+        if not marks:
+            diagnostic_html = scrub_diagnostic_html(marks_html)
+            diagnostic_preview = extract_diagnostic_text(marks_html)
+
+        return CourseSnapshotResult(
+            marks=marks,
+            resources=resources,
+            announcements=announcements,
+            set_cookie_names=tuple(observed),
+            diagnostic_html=diagnostic_html,
+            diagnostic_preview=diagnostic_preview,
+        )
+
+
+# -- module-level helpers ----------------------------------------------------
 
 
 def _merge_names(existing: Iterable[str], extra: Iterable[str]) -> Tuple[str, ...]:
@@ -1528,14 +1600,3 @@ def _merge_names(existing: Iterable[str], extra: Iterable[str]) -> Tuple[str, ..
         if name not in names:
             names.append(name)
     return tuple(names)
-
-
-def _response_info(
-    url: str, final_url: str, status: int, names: Iterable[str]
-) -> Dict[str, Any]:
-    return {
-        "url": url,
-        "final_url": final_url,
-        "status": status,
-        "set_cookie_names": list(names),
-    }
