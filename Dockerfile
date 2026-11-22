@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY sis_client.py notifiers.py tracker.py probe.py ./
+COPY config.py sis_client.py notifiers.py tracker.py probe.py ./
 
 RUN mkdir -p /app/data
 

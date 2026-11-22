@@ -37,6 +37,34 @@ try:
 except ImportError:  # pragma: no cover - Windows compatibility for importing parser helpers
     fcntl = None  # type: ignore[assignment]
 
+from config import (
+    KNOWN_ENV_KEYS,
+    NOTIFIER_TIMEOUT_DEFAULT,
+    NOTIFIER_TIMEOUT_MINIMUM,
+    EnvFileSignature,
+    EnvReload,
+    EnvWatcher,
+    TrackerConfig,
+    default_heartbeat_path,
+    describe_missing_session_context,
+    env_file_signature,
+    load_config,
+    load_env_dict,
+    load_env_with_sources,
+    normalize_session_id,
+    notifier_config_key,
+    parse_env_bytes,
+    parse_env_file,
+    parse_env_text,
+    parse_float,
+    parse_int,
+    parse_notifier_timeout,
+    read_env_bytes,
+    read_env_signature,
+    resolve_env_file,
+    resolve_heartbeat_file,
+    resolve_state_file,
+)
 from notifiers import BaseNotifier, Notification, build_notifiers, dispatch_all
 from sis_client import (
     AnnouncementItem,
@@ -56,35 +84,6 @@ from sis_client import (
 )
 
 T = TypeVar("T")
-
-KNOWN_ENV_KEYS = (
-    "SIS_SESSION_ID",
-    "SIS_BASE_URL",
-    "SIS_USER_AGENT",
-    "SIS_SEMESTER",
-    "KEEPALIVE_INTERVAL",
-    "FETCH_INTERVAL",
-    "REQUEST_DELAY",
-    "TRACK_ANNOUNCEMENTS",
-    "NTFY_URL",
-    "NTFY_TOKEN",
-    "WEBHOOK_URL",
-    "DISCORD_WEBHOOK_URL",
-    "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID",
-    "CYCLE_TIMEOUT",
-    "SESSION_EXPIRED_TIMEOUT",
-    "EXPIRED_POLL_INTERVAL",
-    "NOTIFIER_TIMEOUT",
-    "MAX_STATE_BACKUPS",
-    "HEALTHCHECK_MAX_AGE",
-)
-
-_EXPORT_PREFIX_RE = re.compile(r"^export[ \t]+")
-_INLINE_COMMENT_RE = re.compile(r"(?:^|\s+)#.*$")
-_SESSION_COOKIE_RE = re.compile(r"(?:^|;\s*)asp\.net_sessionid\s*=\s*([^;]*)", re.IGNORECASE)
-_SAFE_KEY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,40}$")
-
 
 class CycleTimeoutError(RuntimeError):
     """Raised when a polling/scan cycle exceeds its hard deadline."""
@@ -119,316 +118,6 @@ class CycleResult:
     saved: bool
     anomaly: Optional[str] = None
     notifications: List[Notification] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class EnvFileSignature:
-    exists: bool
-    inode: Optional[int]
-    mtime_ns: Optional[int]
-    size: Optional[int]
-    sha256: str
-
-
-@dataclass
-class TrackerConfig:
-    raw: Dict[str, str]
-    session_id: str
-    base_url: str
-    user_agent: str
-    keepalive_interval: int
-    fetch_interval: int
-    request_delay: float
-    track_announcements: bool
-    sources: Dict[str, str] = field(default_factory=dict)
-    cycle_timeout: int = 120
-    session_expired_timeout: int = 300
-    expired_poll_interval: int = 15
-    notifier_timeout: float = 20.0
-    max_state_backups: int = 5
-    healthcheck_max_age: int = 0
-    semester: str = ""
-
-
-def _decode_env_bytes(raw: bytes) -> str:
-    """Decode .env bytes supporting UTF-32/UTF-16/UTF-8 BOMs and cp1252 fallback."""
-    if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
-        return raw.decode("utf-32", errors="replace")
-    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return raw.decode("utf-16", errors="replace")
-    try:
-        return raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return raw.decode("cp1252", errors="replace")
-
-
-def _parse_quoted_env_value(val: str, quote: str) -> Optional[str]:
-    """Parse a single- or double-quoted .env value, allowing trailing # comments."""
-    if quote == "'":
-        end_idx = val.find("'", 1)
-        if end_idx == -1:
-            return None
-        tail = val[end_idx + 1 :].lstrip()
-        if tail and not tail.startswith("#"):
-            return None
-        return val[1:end_idx]
-
-    escapes = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
-    chars: List[str] = []
-    i = 1
-    n = len(val)
-    while i < n:
-        ch = val[i]
-        if ch == "\\":
-            if i + 1 < n:
-                nxt = val[i + 1]
-                chars.append(escapes.get(nxt, "\\" + nxt))
-                i += 2
-                continue
-            chars.append("\\")
-            i += 1
-            continue
-        if ch == '"':
-            tail = val[i + 1 :].lstrip()
-            if tail and not tail.startswith("#"):
-                return None
-            return "".join(chars)
-        chars.append(ch)
-        i += 1
-    return None
-
-
-def _parse_env_value(raw_val: str) -> str:
-    """Parse a .env RHS value, handling quotes, escapes, and inline # comments."""
-    val = raw_val.strip()
-    if not val:
-        return ""
-    if val[0] in ('"', "'"):
-        parsed = _parse_quoted_env_value(val, val[0])
-        if parsed is not None:
-            return parsed
-    return _INLINE_COMMENT_RE.sub("", val).strip()
-
-
-def parse_env_text(text: str) -> Dict[str, str]:
-    """Parse .env text supporting BOMs, `export KEY=VAL`, quotes, and inline # comments."""
-    values: Dict[str, str] = {}
-    for raw_line in text.splitlines():
-        line = raw_line.strip().lstrip("\ufeff").strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        raw_key, raw_val = line.split("=", 1)
-        key = raw_key.strip().lstrip("\ufeff").strip()
-        if _EXPORT_PREFIX_RE.match(key):
-            key = _EXPORT_PREFIX_RE.sub("", key, count=1).strip()
-        if not key:
-            continue
-        values[key] = _parse_env_value(raw_val)
-    return values
-
-
-def parse_env_file(env_path: Path) -> Dict[str, str]:
-    """Read and parse a .env file on disk; returns {} if missing or a directory."""
-    if not env_path.exists():
-        return {}
-    if env_path.is_dir():
-        print(f"[WARN] ENV_FILE points to a directory instead of a file: {env_path}")
-        return {}
-    return parse_env_text(_decode_env_bytes(env_path.read_bytes()))
-
-
-def normalize_session_id(raw_value: str) -> str:
-    """Normalize pasted ASP.NET_SessionId values (Cookie headers, cookie pairs, placeholders)."""
-    val = raw_value.strip().strip("\ufeff").strip()
-    if not val:
-        return ""
-    if val.lower().startswith("cookie:"):
-        val = val.split(":", 1)[1].strip()
-    cookie_match = _SESSION_COOKIE_RE.search(val)
-    if cookie_match:
-        val = cookie_match.group(1).strip()
-    if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
-        val = val[1:-1].strip()
-    if val == "paste_your_ASP_NET_SessionId_here":
-        return ""
-    return val
-
-
-def load_env_with_sources(env_path: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """Load settings from process environment overridden by non-empty values in .env."""
-    values: Dict[str, str] = {}
-    sources: Dict[str, str] = {}
-
-    for key in KNOWN_ENV_KEYS:
-        env_val = os.environ.get(key, "").strip()
-        if env_val != "":
-            values[key] = env_val
-            sources[key] = "process_env"
-
-    for key, val in parse_env_file(env_path).items():
-        if val.strip() != "":
-            had_proc_env = bool(os.environ.get(key, "").strip())
-            values[key] = val
-            sources[key] = (
-                f"env_file:{env_path} (overrides process_env)"
-                if had_proc_env
-                else f"env_file:{env_path}"
-            )
-        elif key not in values:
-            values[key] = ""
-            sources[key] = f"env_file:{env_path}"
-
-    return values, sources
-
-
-def load_env_dict(env_path: Path) -> Dict[str, str]:
-    """Load key=value settings from process environment overridden by .env on disk."""
-    values, _ = load_env_with_sources(env_path)
-    return values
-
-
-def read_env_signature(env_path: Path) -> EnvFileSignature:
-    """Read stat + SHA-256 signature fresh by path so inode replacements are detected."""
-    try:
-        st = env_path.stat()
-        raw = env_path.read_bytes()
-    except OSError:
-        return EnvFileSignature(
-            exists=False,
-            inode=None,
-            mtime_ns=None,
-            size=None,
-            sha256="",
-        )
-    return EnvFileSignature(
-        exists=True,
-        inode=st.st_ino,
-        mtime_ns=st.st_mtime_ns,
-        size=st.st_size,
-        sha256=hashlib.sha256(raw).hexdigest(),
-    )
-
-
-class EnvWatcher:
-    """Detects .env file changes across inode replacements, mtime edits, and content updates."""
-
-    def __init__(self, env_path: Path) -> None:
-        self.env_path = env_path
-        self._last_sig: EnvFileSignature = read_env_signature(env_path)
-
-    def check_changed(self) -> Tuple[bool, str]:
-        cur = read_env_signature(self.env_path)
-        prev = self._last_sig
-        if cur == prev:
-            return False, ""
-
-        reasons: List[str] = []
-        if not prev.exists and cur.exists:
-            reasons.append("created")
-        elif prev.exists and not cur.exists:
-            reasons.append("deleted")
-        else:
-            if prev.inode != cur.inode:
-                reasons.append(f"inode {prev.inode}->{cur.inode}")
-            if prev.sha256 != cur.sha256:
-                reasons.append("content changed")
-            else:
-                if prev.mtime_ns != cur.mtime_ns:
-                    reasons.append("mtime changed")
-                if prev.size != cur.size:
-                    reasons.append(f"size {prev.size}->{cur.size}")
-                reasons.append("content unchanged")
-
-        self._last_sig = cur
-        return True, ", ".join(reasons)
-
-
-def _parse_int(values: Dict[str, str], key: str, default: int, minimum: int = 5) -> int:
-    raw = values.get(key, "").strip()
-    if not raw:
-        return default
-    try:
-        return max(minimum, int(raw))
-    except ValueError:
-        return default
-
-
-def _parse_float(values: Dict[str, str], key: str, default: float, minimum: float = 0.0) -> float:
-    raw = values.get(key, "").strip()
-    if not raw:
-        return default
-    try:
-        return max(minimum, float(raw))
-    except ValueError:
-        return default
-
-
-def _describe_missing_session_context(env_path: Path, values: Dict[str, str]) -> str:
-    """Return a secret-free diagnostic line explaining why SIS_SESSION_ID is missing."""
-    if not env_path.exists():
-        file_desc = f"env file does not exist: {env_path}"
-    elif env_path.is_dir():
-        file_desc = f"env path is a directory (not a file): {env_path}"
-    else:
-        try:
-            file_desc = f"env file {env_path} exists ({env_path.stat().st_size} bytes)"
-        except OSError:
-            file_desc = f"env file {env_path} exists (stat failed)"
-
-    if "SIS_SESSION_ID" not in values:
-        sid_state = "SIS_SESSION_ID key absent"
-    else:
-        raw_sid = values["SIS_SESSION_ID"].strip()
-        if raw_sid == "paste_your_ASP_NET_SessionId_here":
-            sid_state = "SIS_SESSION_ID still set to example placeholder"
-        elif not raw_sid:
-            sid_state = "SIS_SESSION_ID key present but empty"
-        else:
-            sid_state = "SIS_SESSION_ID present but empty after normalization"
-
-    parts = [file_desc, sid_state]
-    known_set = [k for k in KNOWN_ENV_KEYS if k != "SIS_SESSION_ID" and values.get(k, "").strip()]
-    if known_set:
-        parts.append(f"other configured keys: {', '.join(known_set)}")
-    unrecognized = [
-        k for k in values if k not in KNOWN_ENV_KEYS and _SAFE_KEY_NAME_RE.match(k)
-    ][:10]
-    if unrecognized:
-        parts.append(f"unrecognized keys: {', '.join(unrecognized)}")
-    return "; ".join(parts) + "."
-
-
-def load_config(env_path: Path, require_session: bool = True) -> TrackerConfig:
-    values, sources = load_env_with_sources(env_path)
-    session_id = normalize_session_id(values.get("SIS_SESSION_ID", ""))
-
-    if require_session and not session_id:
-        diag = _describe_missing_session_context(env_path, values)
-        raise SystemExit(
-            "Missing SIS_SESSION_ID.\n"
-            f"{diag}\n"
-            f"Copy {env_path.parent / '.env.example'} to {env_path} and set SIS_SESSION_ID."
-        )
-
-    return TrackerConfig(
-        raw=values,
-        session_id=session_id,
-        base_url=(values.get("SIS_BASE_URL", "").strip() or DEFAULT_BASE_URL).rstrip("/"),
-        user_agent=values.get("SIS_USER_AGENT", "").strip() or DEFAULT_USER_AGENT,
-        keepalive_interval=_parse_int(values, "KEEPALIVE_INTERVAL", 120, minimum=15),
-        fetch_interval=_parse_int(values, "FETCH_INTERVAL", 480, minimum=30),
-        request_delay=_parse_float(values, "REQUEST_DELAY", 0.6),
-        track_announcements=values.get("TRACK_ANNOUNCEMENTS", "").strip().lower()
-        in ("1", "true", "yes", "on"),
-        sources=sources,
-        cycle_timeout=_parse_int(values, "CYCLE_TIMEOUT", 120, minimum=5),
-        session_expired_timeout=_parse_int(values, "SESSION_EXPIRED_TIMEOUT", 300, minimum=0),
-        expired_poll_interval=_parse_int(values, "EXPIRED_POLL_INTERVAL", 15, minimum=1),
-        notifier_timeout=_parse_float(values, "NOTIFIER_TIMEOUT", 20.0, minimum=1.0),
-        max_state_backups=_parse_int(values, "MAX_STATE_BACKUPS", 5, minimum=1),
-        healthcheck_max_age=_parse_int(values, "HEALTHCHECK_MAX_AGE", 0, minimum=0),
-        semester=values.get("SIS_SEMESTER", "").strip(),
-    )
 
 
 @contextlib.contextmanager
@@ -1246,11 +935,6 @@ def run_with_timeout(
     return result_box[0]
 
 
-def default_heartbeat_path(state_path: Path) -> Path:
-    env_hb = os.environ.get("HEARTBEAT_FILE", "").strip()
-    return Path(env_hb) if env_hb else state_path.with_name("heartbeat.json")
-
-
 def write_heartbeat(
     heartbeat_path: Path,
     status: str,
@@ -1428,6 +1112,13 @@ def _write_anomaly_diagnostics(
         print(f"[WARN] Could not write anomaly diagnostics: {exc}")
 
 
+def _reload_from_bytes(
+    env_path: Path, raw: Optional[bytes], require_session: bool
+) -> TrackerConfig:
+    """Parse an already-read .env snapshot so the daemon reads the file only once."""
+    return load_config(env_path, require_session=require_session, raw=raw)
+
+
 def run_daemon(
     env_path: Path,
     state_path: Path,
@@ -1449,7 +1140,7 @@ def run_daemon(
     signal.signal(signal.SIGTERM, _handle_sig)
 
     cfg = load_config(env_path, require_session=True)
-    notifiers = build_notifiers(cfg.raw)
+    notifiers = build_notifiers(cfg.raw, timeout=cfg.notifier_timeout)
     client = SisClient(
         session_id=cfg.session_id,
         base_url=cfg.base_url,
@@ -1469,6 +1160,7 @@ def run_daemon(
     last_detail = ""
     active_session_id = cfg.session_id
     active_anomaly: Optional[str] = None
+    active_notifier_key = cfg.notifier_key
 
     print(
         f"Starting tracker (keep-alive={cfg.keepalive_interval}s, "
@@ -1486,10 +1178,11 @@ def run_daemon(
     )
 
     while not stop:
-        # Hot-reload .env by path so inode replacements and overrides are always observed
+        # Hot-reload .env: ONE read per check, reused for fingerprint + parsing.
         try:
-            env_changed, change_desc = env_watcher.check_changed()
-            fresh_cfg = load_config(env_path, require_session=False)
+            reload = env_watcher.check(require_session=False, loader=_reload_from_bytes)
+            env_changed, change_desc = reload.changed, reload.description
+            fresh_cfg = reload.config
             session_src = fresh_cfg.sources.get("SIS_SESSION_ID", "unknown")
 
             if fresh_cfg.session_id and fresh_cfg.session_id != active_session_id:
@@ -1536,7 +1229,9 @@ def run_daemon(
                     )
 
             cfg = fresh_cfg
-            notifiers = build_notifiers(cfg.raw)
+            if cfg.notifier_key != active_notifier_key:
+                notifiers = build_notifiers(cfg.raw, timeout=cfg.notifier_timeout)
+                active_notifier_key = cfg.notifier_key
         except Exception as exc:
             print(f"[WARN] Could not reload .env: {exc}")
 
@@ -1816,13 +1511,13 @@ def main() -> int:
         return 1
 
     root = Path(__file__).resolve().parent
-    env_path = Path(os.environ.get("ENV_FILE") or (root / ".env"))
-    state_path = Path(os.environ.get("STATE_FILE") or (root / "state.json"))
+    env_path = resolve_env_file(root)
+    state_path = resolve_state_file(root)
 
     if args.healthcheck:
         cfg_vals = load_env_dict(env_path)
-        max_age_override = _parse_int(cfg_vals, "HEALTHCHECK_MAX_AGE", 0, minimum=0) or None
-        hb_path = default_heartbeat_path(state_path)
+        max_age_override = parse_int(cfg_vals, "HEALTHCHECK_MAX_AGE", 0, minimum=0) or None
+        hb_path = resolve_heartbeat_file(state_path)
         ok, msg = check_healthcheck(hb_path, max_age_override=max_age_override)
         print(msg)
         return 0 if ok else 1

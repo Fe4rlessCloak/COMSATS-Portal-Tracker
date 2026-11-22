@@ -1729,9 +1729,8 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                 b"SESSION_EXPIRED_TIMEOUT=20\n"
             )
 
-            # Verify probe.load_env & probe.load_config handle BOM + export + quoted inline comment
+            # Verify probe.load_config handles BOM + export + quoted inline comment
             with mock.patch.dict(os.environ, {"SIS_SESSION_ID": "", "SIS_USER_AGENT": ""}, clear=False):
-                self.assertEqual(probe.load_env(env_path)["SIS_SESSION_ID"], "expired_cookie")
                 probe_sid, _ = probe.load_config(env_path)
                 self.assertEqual(probe_sid, "expired_cookie")
 
@@ -2262,8 +2261,10 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
 
             orig_load_config = tracker.load_config
 
-            def _fast_load_config(ep: Path, require_session: bool = True) -> tracker.TrackerConfig:
-                cfg_obj = orig_load_config(ep, require_session=require_session)
+            def _fast_load_config(
+                ep: Path, require_session: bool = True, raw: Optional[bytes] = None
+            ) -> tracker.TrackerConfig:
+                cfg_obj = orig_load_config(ep, require_session=require_session, raw=raw)
                 cfg_obj.keepalive_interval = 1
                 return cfg_obj
 

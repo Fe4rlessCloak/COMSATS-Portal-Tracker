@@ -26,8 +26,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from config import load_env_dict, normalize_session_id, resolve_env_file
 from sis_client import _is_safe_redirect_target
-from tracker import load_env_dict, normalize_session_id, parse_env_file
 
 BASE_URL = "https://sis.comsats.edu.pk"
 USER_AGENT = (
@@ -190,14 +190,11 @@ class StructureExtractor(HTMLParser):
             self._cell_buf.append(data)
 
 
-def load_env(env_path: Path) -> Dict[str, str]:
-    """Load key=value pairs from .env if present."""
-    return parse_env_file(env_path)
-
-
-def load_config(env_path: Path) -> Tuple[str, str]:
+def load_config(
+    env_path: Path, environ: Optional[Dict[str, str]] = None
+) -> Tuple[str, str]:
     """Load SIS_SESSION_ID and optional SIS_USER_AGENT from env or .env."""
-    values = load_env_dict(env_path)
+    values = load_env_dict(env_path, environ=environ)
     session_id = normalize_session_id(values.get("SIS_SESSION_ID", ""))
 
     if not session_id:
@@ -478,7 +475,7 @@ def main() -> int:
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parent
-    env_path = Path(os.environ.get("ENV_FILE") or (root / ".env"))
+    env_path = resolve_env_file(root)
     session_id, user_agent = load_config(env_path)
     if args.keepalive:
         return run_keepalive(session_id, user_agent, args.interval, args.duration, args.path)
