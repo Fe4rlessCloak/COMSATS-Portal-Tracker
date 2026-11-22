@@ -27,12 +27,17 @@ DEFAULT_USER_AGENT = (
 )
 
 
-def _cookie_names(value: Optional[Iterable[str]]) -> Tuple[str, ...]:
-    """Normalize an iterable of cookie names into an immutable, de-duplicated tuple."""
+def _dedupe_names(*values: Optional[Iterable[str]]) -> Tuple[str, ...]:
+    """Union of cookie names across ``values``, first-seen order, blanks dropped.
+
+    The one ordered-dedupe helper: exceptions normalize their ``set_cookie_names``
+    through it, and ``fetch_page`` widens an in-flight observation list with it.
+    """
     names: List[str] = []
-    for name in value or ():
-        if name and name not in names:
-            names.append(name)
+    for value in values:
+        for name in value or ():
+            if name and name not in names:
+                names.append(name)
     return tuple(names)
 
 
@@ -46,7 +51,7 @@ class SessionExpiredError(RuntimeError):
 
     def __init__(self, message: str, set_cookie_names: Optional[Iterable[str]] = None) -> None:
         super().__init__(message)
-        self.set_cookie_names: Tuple[str, ...] = _cookie_names(set_cookie_names)
+        self.set_cookie_names: Tuple[str, ...] = _dedupe_names(set_cookie_names)
 
 
 class PortalHttpError(RuntimeError):
@@ -54,7 +59,7 @@ class PortalHttpError(RuntimeError):
 
     def __init__(self, message: str, set_cookie_names: Optional[Iterable[str]] = None) -> None:
         super().__init__(message)
-        self.set_cookie_names: Tuple[str, ...] = _cookie_names(set_cookie_names)
+        self.set_cookie_names: Tuple[str, ...] = _dedupe_names(set_cookie_names)
 
 
 class PortalParseError(PortalHttpError):
@@ -1443,7 +1448,7 @@ class SisClient:
             if response.status in self._REDIRECT_STATUSES:
                 next_url = urllib.parse.urljoin(url, location) if location else ""
                 if location and (is_login_url(next_url) or "login" in location.lower()):
-                    names = _merge_names(seen_names, response.set_cookie_names)
+                    names = _dedupe_names(seen_names, response.set_cookie_names)
                     raise SessionExpiredError(
                         f"Redirected to login ({location}).", set_cookie_names=names
                     )
@@ -1451,20 +1456,20 @@ class SisClient:
                     if not _is_safe_redirect_target(self._base_url, next_url):
                         raise PortalHttpError(
                             f"Refusing unsafe redirect from {url} to {next_url}",
-                            set_cookie_names=_merge_names(seen_names, response.set_cookie_names),
+                            set_cookie_names=_dedupe_names(seen_names, response.set_cookie_names),
                         )
                     _stage_set_cookies(response.headers, pending, seen_names)
                     url = next_url
                     continue
                 raise PortalHttpError(
                     f"HTTP {response.status} fetching {url}",
-                    set_cookie_names=_merge_names(seen_names, response.set_cookie_names),
+                    set_cookie_names=_dedupe_names(seen_names, response.set_cookie_names),
                 )
 
             if not 200 <= response.status < 300:
                 raise PortalHttpError(
                     f"HTTP {response.status} fetching {url}",
-                    set_cookie_names=_merge_names(seen_names, response.set_cookie_names),
+                    set_cookie_names=_dedupe_names(seen_names, response.set_cookie_names),
                 )
 
             body = response.text()
@@ -1472,7 +1477,7 @@ class SisClient:
             if login_reason:
                 # A login response must never mutate the jar or the session identifier; the
                 # cookie names are still reported for diagnostics.
-                names = _merge_names(seen_names, response.set_cookie_names)
+                names = _dedupe_names(seen_names, response.set_cookie_names)
                 raise SessionExpiredError(login_reason, set_cookie_names=names)
 
             _stage_set_cookies(response.headers, pending, seen_names)
@@ -1528,6 +1533,34 @@ class SisClient:
         observed.extend(page.set_cookie_names)
         return page
 
+    def _fetch_verified(
+        self,
+        course: Course,
+        path: str,
+        marker_fn: Any,
+        missing_marker_message: str,
+        observed: List[str],
+        parse_fn: Any,
+    ) -> Tuple[str, Any]:
+        """Fetch one course page, verify it, and parse it; return ``(body, parsed)``.
+
+        One home for the four-step triple the marks and resources pages share:
+        ``_fetch_collecting`` -> page-marker check -> ``verify_active_course`` ->
+        ``parse_*``. Error messages and ``set_cookie_names`` widening are unchanged.
+        The page body is returned for callers that need it (marks diagnostics).
+        """
+        page = self._fetch_collecting(path, observed)
+        if not marker_fn(page.body):
+            raise PortalParseError(
+                missing_marker_message,
+                set_cookie_names=tuple(observed),
+            )
+        try:
+            verify_active_course(page.body, course)
+        except CourseMismatchError as exc:
+            raise _with_observed_cookies(exc, observed)
+        return page.body, parse_fn(page.body)
+
     def fetch_course_snapshot(
         self, course: Course, include_announcements: bool = False
     ) -> CourseSnapshotResult:
@@ -1552,29 +1585,22 @@ class SisClient:
         except CourseMismatchError as exc:
             raise _with_observed_cookies(exc, observed)
 
-        marks_html = self._fetch_collecting("/MarksSummary/Index", observed).body
-        if not has_marks_page_marker(marks_html):
-            raise PortalParseError(
-                "MarksSummary response missing expected marks markup.",
-                set_cookie_names=tuple(observed),
-            )
-        try:
-            verify_active_course(marks_html, course)
-        except CourseMismatchError as exc:
-            raise _with_observed_cookies(exc, observed)
-        marks = parse_marks_summary(marks_html)
-
-        resources_html = self._fetch_collecting("/LearningResources/Index", observed).body
-        if not has_resources_page_marker(resources_html):
-            raise PortalParseError(
-                "LearningResources response missing expected resources markup.",
-                set_cookie_names=tuple(observed),
-            )
-        try:
-            verify_active_course(resources_html, course)
-        except CourseMismatchError as exc:
-            raise _with_observed_cookies(exc, observed)
-        resources = parse_learning_resources(resources_html)
+        marks_html, marks = self._fetch_verified(
+            course,
+            "/MarksSummary/Index",
+            has_marks_page_marker,
+            "MarksSummary response missing expected marks markup.",
+            observed,
+            parse_marks_summary,
+        )
+        _resources_html, resources = self._fetch_verified(
+            course,
+            "/LearningResources/Index",
+            has_resources_page_marker,
+            "LearningResources response missing expected resources markup.",
+            observed,
+            parse_learning_resources,
+        )
 
         announcements: Optional[List[AnnouncementItem]] = None
         if include_announcements:
@@ -1599,15 +1625,6 @@ class SisClient:
 # -- module-level helpers ----------------------------------------------------
 
 
-def _merge_names(existing: Iterable[str], extra: Iterable[str]) -> Tuple[str, ...]:
-    """Union of observed cookie names, preserving first-seen order."""
-    names: List[str] = list(existing)
-    for name in extra:
-        if name not in names:
-            names.append(name)
-    return tuple(names)
-
-
 def _with_observed_cookies(
     exc: Exception, observed: Iterable[str]
 ) -> Exception:
@@ -1618,7 +1635,7 @@ def _with_observed_cookies(
     exception instance is returned unchanged, keeping its traceback chain intact.
     """
     current: Tuple[str, ...] = getattr(exc, "set_cookie_names", ())
-    merged = _merge_names(observed, current)
+    merged = _dedupe_names(observed, current)
     if merged == current:
         return exc
     return type(exc)(str(exc), set_cookie_names=merged)  # type: ignore[call-arg]

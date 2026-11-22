@@ -39,7 +39,6 @@ except ImportError:  # pragma: no cover - Windows compatibility for non-locking 
     fcntl = None  # type: ignore[assignment]
 
 from config import resolve_heartbeat_file
-from sis_client import extract_diagnostic_text, scrub_diagnostic_html
 
 DEFAULT_KEEPALIVE_INTERVAL = 120
 DEFAULT_FETCH_INTERVAL = 480
@@ -439,10 +438,17 @@ class RuntimeStore:
         set_cookie_names: Optional[List[str]] = None,
         sample_marks_course: str = "",
         marks_html: str = "",
+        marks_preview: str = "",
     ) -> None:
-        """Persist the rejected-scan summary plus scrubbed marks HTML."""
-        scrubbed_html = scrub_diagnostic_html(marks_html or "")
-        preview = extract_diagnostic_text(marks_html or "", max_chars=500)
+        """Persist the rejected-scan summary plus the scrubbed marks HTML.
+
+        ``marks_html`` is ``CourseSnapshotResult.diagnostic_html`` and ``marks_preview`` is
+        its ``diagnostic_preview``. Both are produced inside the Portal module — the only
+        place that ever holds raw markup — so this method writes them verbatim instead of
+        scrubbing a second time. The scrubbed input is therefore the caller's contract;
+        ``sis_client.scrub_diagnostic_html()`` / ``extract_diagnostic_text()`` remain the
+        single implementation of it.
+        """
         diag_payload = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "reason": reason,
@@ -456,14 +462,14 @@ class RuntimeStore:
             "failed_courses": list(failed_courses or ()),
             "set_cookie_names": list(set_cookie_names or ()),
             "sample_marks_course": sample_marks_course,
-            "sample_marks_preview": preview,
+            "sample_marks_preview": marks_preview,
         }
         try:
             _atomic_write_text(
                 self.anomaly_diagnostics_path,
                 json.dumps(diag_payload, indent=2, ensure_ascii=False),
             )
-            if scrubbed_html:
-                _atomic_write_text(self.anomaly_marks_path, scrubbed_html)
+            if marks_html:
+                _atomic_write_text(self.anomaly_marks_path, marks_html)
         except OSError as exc:
             print(f"[WARN] Could not write anomaly diagnostics: {exc}")

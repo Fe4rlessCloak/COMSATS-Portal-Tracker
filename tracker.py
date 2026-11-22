@@ -318,6 +318,7 @@ def run_cycle(
                         set_cookie_names=list(diagnostics.set_cookie_names),
                         sample_marks_course=diagnostics.sample_marks_course,
                         marks_html=diagnostics.marks_html,
+                        marks_preview=diagnostics.marks_preview,
                     )
             elif action.kind == ANOMALY_CLEAR:
                 runtime_store.clear_anomaly()

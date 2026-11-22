@@ -147,7 +147,12 @@ class TransitionOptions:
 
 @dataclass(frozen=True)
 class AnomalyDiagnostics:
-    """Payload the store persists as ``data/last_anomaly.json`` (+ scrubbed HTML)."""
+    """Payload the store persists as ``data/last_anomaly.json`` (+ scrubbed HTML).
+
+    ``marks_html`` is already scrubbed and ``marks_preview`` is its credential-free text
+    snippet; both come straight from ``CourseSnapshotResult`` inside the Portal module, so
+    the store writes them without re-scrubbing.
+    """
 
     reason: str
     occurrence: int
@@ -157,6 +162,7 @@ class AnomalyDiagnostics:
     set_cookie_names: Tuple[str, ...] = ()
     sample_marks_course: str = ""
     marks_html: str = ""
+    marks_preview: str = ""
 
 
 @dataclass(frozen=True)
@@ -743,6 +749,7 @@ def compute_transition(
             set_cookie_names=tuple(scan.set_cookie_names),
             sample_marks_course=scan.sample_marks_course,
             marks_html=scan.sample_marks_html,
+            marks_preview=scan.sample_marks_preview,
         )
         notifications = (
             [

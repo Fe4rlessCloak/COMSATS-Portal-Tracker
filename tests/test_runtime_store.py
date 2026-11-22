@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
 import runtime_store  # noqa: E402
 from config import resolve_heartbeat_file  # noqa: E402
 from runtime_store import RuntimeStore, StateLockError  # noqa: E402
+from sis_client import extract_diagnostic_text, scrub_diagnostic_html  # noqa: E402
 
 UNSAFE_HTML = (
     '<html><body class="sis-portal-body">'
@@ -42,6 +43,10 @@ UNSAFE_HTML = (
     "</div></div></div>"
     "</body></html>"
 )
+
+
+SCRUBBED_HTML = scrub_diagnostic_html(UNSAFE_HTML)
+SCRUBBED_PREVIEW = extract_diagnostic_text(UNSAFE_HTML, max_chars=500)
 
 
 def _state(marks: int = 2) -> Dict[str, Any]:
@@ -322,7 +327,8 @@ class RuntimeStoreAtomicWriteTests(unittest.TestCase):
                     occurrence=1,
                     scanned_totals={"courses": 1, "marks": 0, "resources": 1},
                     baseline_totals={"courses": 1, "marks": 6, "resources": 1},
-                    marks_html=UNSAFE_HTML,
+                    marks_html=SCRUBBED_HTML,
+                    marks_preview=SCRUBBED_PREVIEW,
                 )
             self._assert_no_leftovers(state_path.parent)
             # The JSON summary was written before the HTML failure.
@@ -342,7 +348,10 @@ class RuntimeStoreAtomicWriteTests(unittest.TestCase):
 
             with mock.patch("runtime_store.os.replace", side_effect=_fail_summary):
                 store.write_anomaly_diagnostics(
-                    reason="zero_marks", occurrence=1, marks_html=UNSAFE_HTML
+                    reason="zero_marks",
+                    occurrence=1,
+                    marks_html=SCRUBBED_HTML,
+                    marks_preview=SCRUBBED_PREVIEW,
                 )
             self._assert_no_leftovers(state_path.parent)
             self.assertFalse(store.anomaly_diagnostics_path.exists())
@@ -506,6 +515,11 @@ class RuntimeStoreAnomalyTests(unittest.TestCase):
 
 class RuntimeStoreDiagnosticsTests(unittest.TestCase):
     def test_diagnostics_write_summary_and_scrubbed_html(self) -> None:
+        """The store writes the caller's already-scrubbed HTML without re-scrubbing.
+
+        The scrub happens once, inside the Portal module (``sis_client``); this is the
+        seam guarantee that nothing raw is ever handed to the store.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             store = RuntimeStore(Path(tmp) / "data" / "state.json")
             store.write_anomaly_diagnostics(
@@ -516,8 +530,11 @@ class RuntimeStoreDiagnosticsTests(unittest.TestCase):
                 failed_courses=["100002"],
                 set_cookie_names=["ASP.NET_SessionId"],
                 sample_marks_course="CSC101 - Intro",
-                marks_html=UNSAFE_HTML,
+                marks_html=SCRUBBED_HTML,
+                marks_preview=SCRUBBED_PREVIEW,
             )
+            # The store no longer imports the scrubbing helpers: it must not own raw HTML.
+            self.assertFalse(hasattr(runtime_store, "scrub_diagnostic_html"))
 
             payload = json.loads(store.anomaly_diagnostics_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["reason"], "degenerate marks")

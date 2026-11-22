@@ -450,6 +450,20 @@ class WatcherTests(unittest.TestCase):
             )
 
 
+class PortalDefaultsDriftTests(unittest.TestCase):
+    """The mirrored portal defaults must not drift from the Portal module's copies.
+
+    ``config`` is a leaf and deliberately does not import ``sis_client``; this test is the
+    keep-in-sync guarantee the old comment used to claim.
+    """
+
+    def test_base_url_and_user_agent_match_sis_client(self) -> None:
+        import sis_client
+
+        self.assertEqual(config.DEFAULT_BASE_URL, sis_client.DEFAULT_BASE_URL)
+        self.assertEqual(config.DEFAULT_USER_AGENT, sis_client.DEFAULT_USER_AGENT)
+
+
 class PathResolutionTests(unittest.TestCase):
     """ENV_FILE / STATE_FILE / HEARTBEAT_FILE resolution against an injected mapping."""
 

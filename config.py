@@ -28,7 +28,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 # Portal defaults are mirrored here (not imported from sis_client) so this module
-# stays a leaf. Keep them in sync with sis_client.DEFAULT_BASE_URL / DEFAULT_USER_AGENT.
+# stays a leaf. tests/test_config.py asserts the two copies stay equal, so drift fails
+# CI rather than relying on a human noticing.
 DEFAULT_BASE_URL = "https://sis.comsats.edu.pk"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -128,10 +129,7 @@ class TrackerConfig:
         The daemon rebuilds notifier instances only when this key changes. It may
         contain credentials (tokens), so compare it but never print it.
         """
-        key: list = [("NOTIFIER_TIMEOUT", self.notifier_timeout)]
-        for name in NOTIFIER_ENV_KEYS:
-            key.append((name, (self.raw.get(name) or "").strip()))
-        return tuple(key)
+        return notifier_config_key(self.raw, timeout=self.notifier_timeout)
 
 
 @dataclass(frozen=True)
@@ -432,9 +430,16 @@ def parse_notifier_timeout(
     return parse_float(values, "NOTIFIER_TIMEOUT", default, minimum=minimum)
 
 
-def notifier_config_key(values: Mapping[str, str]) -> Tuple[Any, ...]:
-    """Comparison key for notifier-relevant settings parsed from a raw values mapping."""
-    key: list = [("NOTIFIER_TIMEOUT", parse_notifier_timeout(values))]
+def notifier_config_key(
+    values: Mapping[str, str], timeout: Optional[float] = None
+) -> Tuple[Any, ...]:
+    """Comparison key for notifier-relevant settings parsed from a raw values mapping.
+
+    ``timeout`` lets a caller that already parsed ``NOTIFIER_TIMEOUT`` (``TrackerConfig``)
+    pass it in; otherwise the canonical rule is applied here.
+    """
+    effective = parse_notifier_timeout(values) if timeout is None else timeout
+    key: list = [("NOTIFIER_TIMEOUT", effective)]
     for name in NOTIFIER_ENV_KEYS:
         key.append((name, (values.get(name) or "").strip()))
     return tuple(key)
