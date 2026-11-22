@@ -1229,17 +1229,15 @@ def run_daemon(
                         f"(source={session_src}) — resuming."
                     )
             elif env_changed:
-                client.reconfigure(
-                    user_agent=fresh_cfg.user_agent,
-                    base_url=fresh_cfg.base_url,
-                    request_delay=fresh_cfg.request_delay,
-                )
                 now_str = datetime.now().strftime("%H:%M:%S")
                 if expired_since is not None and fresh_cfg.session_id:
                     # Expired-session .env change: force-clear the cookie jar even though the
                     # session identifier is unchanged, so stale auxiliary cookies are dropped.
                     client.reconfigure(
                         session_id=fresh_cfg.session_id,
+                        user_agent=fresh_cfg.user_agent,
+                        base_url=fresh_cfg.base_url,
+                        request_delay=fresh_cfg.request_delay,
                         reset_cookies=True,
                     )
                     expired_since = None
@@ -1251,6 +1249,11 @@ def run_daemon(
                         f"SIS_SESSION_ID unchanged; source={session_src}) — re-testing session."
                     )
                 else:
+                    client.reconfigure(
+                        user_agent=fresh_cfg.user_agent,
+                        base_url=fresh_cfg.base_url,
+                        request_delay=fresh_cfg.request_delay,
+                    )
                     print(
                         f"[{now_str}] [INFO] Detected .env change ({change_desc}; "
                         f"SIS_SESSION_ID unchanged; source={session_src})."

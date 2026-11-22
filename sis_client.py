@@ -1384,7 +1384,7 @@ class SisClient:
         """Fetch an authenticated portal page, following safe redirects.
 
         Raises :class:`SessionExpiredError` when the portal redirects to Login or renders
-        the login form, and :class:`PortalHttpError` for unsafe redirects, non-200 statuses,
+        the login form, and :class:`PortalHttpError` for unsafe redirects, non-2xx statuses,
         and transport failures. Both carry ``set_cookie_names`` observed on the way.
         """
         url = path if path.startswith("http") else f"{self._base_url}{path}"
