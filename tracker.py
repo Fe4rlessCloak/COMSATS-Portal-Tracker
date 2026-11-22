@@ -49,19 +49,13 @@ from sis_client import (
 )
 from snapshot_transition import (
     ANOMALY_CLEAR,
-    KIND_ANOMALY_REJECTED,
-    ANOMALY_NONE,
     ANOMALY_RECORD,
-    AnomalyAction,
+    KIND_ANOMALY_REJECTED,
     CycleResult,
     ScanResult,
     TransitionOptions,
     TransitionOutcome,
     compute_transition,
-    detect_semester_rollover,
-    diff_states,
-    summarize_totals,
-    validate_snapshot,
 )
 
 T = TypeVar("T")
