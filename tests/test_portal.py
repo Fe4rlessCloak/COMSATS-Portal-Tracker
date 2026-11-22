@@ -32,6 +32,7 @@ from sis_client import (  # noqa: E402
     PortalHttpError,
     PortalParseError,
     PortalResponse,
+    PortalTransport,
     SessionExpiredError,
     SisClient,
     TransportError,
@@ -66,6 +67,11 @@ def _auth_shell(inner: str, course_code: str = "", course_name: str = "") -> str
 
 
 DASH = _auth_shell('<table class="sis-dash-table"></table>')
+COURSES_PAGE = _auth_shell(
+    '<table class="table sis-dash-table"><thead><tr><th>Course No</th><th>Course Name</th></tr></thead>'
+    '<tbody><tr onclick="window.location=\'/Courses/SetCourse/100001\'">'
+    "<td>CSC101</td><td>Intro</td></tr></tbody></table>"
+)
 LOGIN_HTML = (
     '<html><body class="sis-login-page"><form action="/Login"><button>Go</button></form></body></html>'
 )
@@ -864,6 +870,129 @@ class DaemonReconfigurationTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertTrue(any(call["reset_cookies"] for call in reconfig_calls))
+            self.assertIn("session_expired", [n.event for n in notifier.notes])
+
+    def test_real_client_drops_stale_cookies_after_expired_session_env_change(self) -> None:
+        """End-to-end: the daemon's reset_cookies path is visible at the wire.
+
+        A real ``SisClient`` over a scripted in-memory transport is driven by the real
+        ``run_daemon`` loop. The session dies on the first ``SetCourse``; after ``.env`` is
+        touched with the *same* ``SIS_SESSION_ID``, the retried ``/Courses`` request must
+        carry only ``ASP.NET_SessionId`` — proving the stale auxiliary cookie set on the
+        earlier authenticated response was explicitly dropped by ``reset_cookies=True``.
+        """
+        from test_tracker import _RecordingNotifier
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            state_path = Path(tmp) / "data" / "state.json"
+            hb_path = Path(tmp) / "data" / "heartbeat.json"
+            env_content = (
+                "SIS_SESSION_ID=reused_cookie\n"
+                "KEEPALIVE_INTERVAL=15\n"
+                "FETCH_INTERVAL=30\n"
+                "EXPIRED_POLL_INTERVAL=1\n"
+                "SESSION_EXPIRED_TIMEOUT=20\n"
+            )
+            env_path.write_text(env_content, encoding="utf-8")
+
+            marks_html = _auth_shell(
+                '<div class="sis-marks-summary"><p class="sis-marks-empty">No marks</p></div>',
+                course_code="CSC101",
+                course_name="Intro",
+            )
+            resources_html = _auth_shell(
+                '<div class="sis-lr"><span class="sis-lr-count">0 resources</span></div>',
+                course_code="CSC101",
+                course_name="Intro",
+            )
+
+            expired = threading.Event()
+            recovered = threading.Event()
+            stale_jars: list[str] = []
+            clean_jars: list[str] = []
+
+            class _ScriptedTransport(PortalTransport):
+                """First SetCourse redirects to Login; every later request is authenticated."""
+
+                def __init__(self) -> None:
+                    self.died = False
+
+                def fetch(self, url, headers, timeout=None):
+                    cookie = headers.get("Cookie", "")
+                    path = urllib.parse.urlparse(url).path
+                    if path == "/Courses":
+                        if self.died:
+                            if "ARRAffinity" in cookie:
+                                stale_jars.append(cookie)
+                            else:
+                                clean_jars.append(cookie)
+                                recovered.set()
+                        return StubResponse(
+                            COURSES_PAGE, headers={"Set-Cookie": ["ARRAffinity=node1; Path=/"]}
+                        ).to_transport_response(url)
+                    if path == "/Courses/SetCourse/100001":
+                        if not self.died:
+                            self.died = True
+                            expired.set()
+                            return StubResponse(
+                                "", status=302, headers={"Location": "/Login/Index"}
+                            ).to_transport_response(url)
+                        return StubResponse(_auth_shell("<div>ann</div>")).to_transport_response(url)
+                    if path == "/MarksSummary/Index":
+                        return StubResponse(marks_html).to_transport_response(url)
+                    if path == "/LearningResources/Index":
+                        return StubResponse(resources_html).to_transport_response(url)
+                    raise AssertionError(f"unexpected path {path}")
+
+            client = SisClient(
+                "reused_cookie", base_url=BASE, request_delay=0.0, transport=_ScriptedTransport()
+            )
+
+            def _client_factory(**kwargs):
+                self.assertEqual(kwargs["session_id"], "reused_cookie")
+                return client
+
+            notifier = _RecordingNotifier()
+            import os
+            import signal
+
+            def _updater() -> None:
+                try:
+                    self.assertTrue(expired.wait(timeout=10.0))
+                    deadline = time.monotonic() + 10.0
+                    while time.monotonic() < deadline:
+                        if hb_path.exists() and "waiting_for_session" in hb_path.read_text(
+                            encoding="utf-8"
+                        ):
+                            break
+                        time.sleep(0.05)
+                    tmp_env = Path(tmp) / ".env.tmp"
+                    tmp_env.write_text(env_content + "# touched\n", encoding="utf-8")
+                    os.replace(tmp_env, env_path)
+                    self.assertTrue(recovered.wait(timeout=10.0))
+                    time.sleep(0.3)
+                finally:
+                    signal.raise_signal(signal.SIGTERM)
+
+            prev_int = signal.getsignal(signal.SIGINT)
+            prev_term = signal.getsignal(signal.SIGTERM)
+            t = threading.Thread(target=_updater, daemon=True)
+            t.start()
+            try:
+                with mock.patch.object(tracker, "SisClient", _client_factory), mock.patch.object(
+                    tracker, "build_notifiers", return_value=[notifier]
+                ):
+                    rc = tracker.run_daemon(env_path, state_path, heartbeat_path=hb_path)
+            finally:
+                signal.signal(signal.SIGINT, prev_int)
+                signal.signal(signal.SIGTERM, prev_term)
+                t.join(timeout=5.0)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(stale_jars, [], "stale ARRAffinity survived the explicit jar reset")
+            self.assertTrue(clean_jars)
+            self.assertEqual(clean_jars[0], "ASP.NET_SessionId=reused_cookie")
             self.assertIn("session_expired", [n.event for n in notifier.notes])
 
 
