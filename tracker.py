@@ -200,6 +200,8 @@ class CycleOptions:
     lock_timeout: float = 30.0
     cancel_event: Optional[threading.Event] = None
     on_progress: Optional[Callable[[], None]] = None
+    # Only used to build a RuntimeStore when the caller passed a path instead of a store;
+    # a real store passed positionally always wins, exactly as before.
     state_path: Optional[Path] = None
 
     def transition_options(self) -> TransitionOptions:
