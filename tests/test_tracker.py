@@ -693,6 +693,19 @@ class CycleIntegrationTests(unittest.TestCase):
         # CycleOptions no longer carries a state_path field at all.
         self.assertFalse(hasattr(CycleOptions(base_url=self.BASE), "state_path"))
 
+    def test_a_bare_string_in_place_of_notifiers_is_rejected_loudly(self) -> None:
+        # A string is iterable, so without the guard it would fail deep inside
+        # dispatch_all with an AttributeError on the first character.
+        with self.assertRaises(TypeError) as ctx:
+            run_cycle(
+                portal_client(self.portal(marks=[])),
+                [self.course],
+                self.store,
+                CycleOptions(base_url=self.BASE),
+                "recording",  # type: ignore[arg-type]
+            )
+        self.assertIn("bare string", str(ctx.exception))
+
     def test_a_string_in_place_of_options_is_rejected_loudly(self) -> None:
         # The old 6-argument positional signature would land base_url here; failing loudly
         # beats silently scanning with the wrong policy.

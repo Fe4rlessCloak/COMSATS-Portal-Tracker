@@ -237,6 +237,13 @@ def run_cycle(
     This is the only cycle surface: ``(client, courses, store, options, notifiers)``.
     The pre-refactor keyword form is gone — there is no compatibility shim.
     """
+    if isinstance(notifiers, (str, bytes)):
+        # A bare string iterates character-by-character and dies with an AttributeError
+        # deep inside dispatch_all; fail here instead, where the mistake is visible.
+        raise TypeError(
+            "run_cycle() expects a sequence of notifiers, not a bare string "
+            f"({notifiers!r}); pass a list, e.g. [client_notifier]."
+        )
     active_notifiers: List[BaseNotifier] = list(notifiers)
     runtime_store = store
 
