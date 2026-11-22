@@ -17,6 +17,10 @@ Public surface
                       notify_anomaly=True)
     TransitionOutcome(kind, persist_state, state, anomaly_action, notifications,
                       baseline_totals, scanned_totals, summary)
+    TransitionSummary(status, anomaly, reason, occurrence, notified,
+                      duplicate_suppressed, preview, preview_course, changed,
+                      recovered, message)          # typed summary; .log_lines() formats
+    Totals(courses, marks, resources).as_dict() / .as_tuple()
     AnomalyAction(kind, marker, diagnostics) / AnomalyDiagnostics(...)
 
     ScanResult, CycleResult          # carrier dataclasses re-imported by tracker.py
@@ -60,7 +64,9 @@ __all__ = [
     "AnomalyDiagnostics",
     "AnomalyAction",
     "TransitionOptions",
+    "TransitionSummary",
     "TransitionOutcome",
+    "Totals",
     "ScanResult",
     "CycleResult",
     "compute_transition",
