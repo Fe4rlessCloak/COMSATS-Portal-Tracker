@@ -25,8 +25,10 @@ from typing import Any, Dict, List
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+HERE = Path(__file__).resolve().parent
+for entry in (str(ROOT), str(HERE)):
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
 
 import config  # noqa: E402
 import probe  # noqa: E402
@@ -43,7 +45,8 @@ from config import (  # noqa: E402
     resolve_state_file,
 )
 from notifiers import BaseNotifier, build_notifiers  # noqa: E402
-from sis_client import Course, CourseSnapshotResult, RosterResult  # noqa: E402
+from sis_client import Course, MarkItem, SisClient  # noqa: E402
+from support_portal_pages import SimulatedPortal  # noqa: E402
 
 NO_ENV: Dict[str, str] = {}
 
@@ -529,44 +532,60 @@ class DaemonNotifierRebuildTests(unittest.TestCase):
             env_path = Path(tmp) / ".env"
             state_path = Path(tmp) / "data" / "state.json"
             hb_path = Path(tmp) / "data" / "heartbeat.json"
-            env_path.write_text("SIS_SESSION_ID=valid_cookie\n", encoding="utf-8")
+            # Keep-alive/fetch of 1s keeps the test fast; config is still parsed by the
+            # real ``load_config`` from this file plus the injected ``environ``.
+            env_path.write_text(
+                "SIS_SESSION_ID=valid_cookie\nKEEPALIVE_INTERVAL=1\nFETCH_INTERVAL=1\n",
+                encoding="utf-8",
+            )
 
-            courses = [Course(course_id="100001", code="CSC101", name="Intro")]
+            course = Course(course_id="100001", code="CSC101", name="Intro")
+            portal = SimulatedPortal(
+                courses=[course],
+                marks={course.course_id: [MarkItem("Quizzes:1", "Quizzes", "Q1", "9", "10", "")]},
+            )
             ticks = 0
             tick_lock = threading.Lock()
             rebuilds: List[Any] = []
             notifier_changed = threading.Event()
 
-            class _FakeClient:
-                """Interface-only daemon stub: this test is about *notifier rebuild timing*."""
+            def _client_factory(*args, **kwargs):
+                """Build the *real* client over the in-memory portal."""
+                session_id = kwargs.get("session_id")
+                if session_id is None and args:
+                    session_id = args[0]
+                client = SisClient(
+                    session_id or "valid_cookie",
+                    base_url=kwargs.get("base_url", tracker.DEFAULT_BASE_URL),
+                    user_agent=kwargs.get("user_agent", ""),
+                    request_delay=0.0,
+                    cancel_event=kwargs.get("cancel_event"),
+                    transport=portal,
+                )
+                real_fetch_roster = client.fetch_roster
 
-                def __init__(self, *args, **kwargs) -> None:
-                    self.cancel_event = None
-                    self.session_id = kwargs.get("session_id", "")
-                    self.base_url = kwargs.get("base_url", tracker.DEFAULT_BASE_URL)
-                    self.user_agent = kwargs.get("user_agent", "")
-                    self.request_delay = 0.0
-
-                def fetch_roster(self):
+                def _counting_roster():
                     nonlocal ticks
+                    roster = real_fetch_roster()
                     with tick_lock:
                         ticks += 1
                         current = ticks
                     if current >= 3:
                         notifier_changed.set()
-                    return RosterResult(courses=list(courses))
+                    return roster
 
-                def fetch_course_snapshot(self, course, include_announcements=False):
-                    return CourseSnapshotResult()
+                client.fetch_roster = _counting_roster  # type: ignore[method-assign]
+                return client
 
-            real_load_config = config.load_config
+            real_parse_int = config.parse_int
 
-            def _fast_load_config(env_file, require_session=True, **kwargs):
-                cfg = real_load_config(
-                    env_file, require_session=require_session, **kwargs
-                )
-                cfg.keepalive_interval = 1
-                return cfg
+            def _fast_parse_int(values, key, default, minimum=5):
+                # Only the interval clamps are lowered so the daemon ticks every second;
+                # every value still flows through the real config parser (no load_config
+                # patch), so hot-reload semantics under test are the production ones.
+                if key in ("KEEPALIVE_INTERVAL", "FETCH_INTERVAL"):
+                    minimum = 1
+                return real_parse_int(values, key, default, minimum=minimum)
 
             def _counting_build_notifiers(cfg_raw, timeout=None):
                 rebuilds.append(timeout)
@@ -574,12 +593,13 @@ class DaemonNotifierRebuildTests(unittest.TestCase):
 
             def _driver() -> None:
                 # Wait for at least 3 idle ticks with no notifier-relevant change.
-                self.assertTrue(notifier_changed.wait(timeout=8.0))
+                self.assertTrue(notifier_changed.wait(timeout=15.0))
                 env_path.write_text(
-                    "SIS_SESSION_ID=valid_cookie\nNTFY_URL=https://ntfy.sh/new-topic\n",
+                    "SIS_SESSION_ID=valid_cookie\nKEEPALIVE_INTERVAL=1\nFETCH_INTERVAL=1\n"
+                    "NTFY_URL=https://ntfy.sh/new-topic\n",
                     encoding="utf-8",
                 )
-                deadline = time.monotonic() + 8.0
+                deadline = time.monotonic() + 10.0
                 while time.monotonic() < deadline and len(rebuilds) < 2:
                     time.sleep(0.05)
                 time.sleep(0.2)
@@ -590,12 +610,14 @@ class DaemonNotifierRebuildTests(unittest.TestCase):
             t = threading.Thread(target=_driver, daemon=True)
             t.start()
             try:
-                with mock.patch.object(tracker, "SisClient", _FakeClient), mock.patch.object(
-                    tracker, "load_config", side_effect=_fast_load_config
-                ), mock.patch.object(
+                with mock.patch.object(
+                    tracker, "SisClient", _client_factory
+                ), mock.patch.object(config, "parse_int", _fast_parse_int), mock.patch.object(
                     tracker, "build_notifiers", side_effect=_counting_build_notifiers
                 ):
-                    rc = tracker.run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = tracker.run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
