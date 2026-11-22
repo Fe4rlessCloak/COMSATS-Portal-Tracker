@@ -123,6 +123,16 @@ class StubTransportInterfaceTests(unittest.TestCase):
         self.assertEqual(response.final_url, f"{BASE}/Courses/Index")
         self.assertEqual(stub.urls(), [f"{BASE}/Courses", f"{BASE}/Courses/Index"])
 
+    def test_multi_value_location_header_is_read_as_a_single_url(self) -> None:
+        # Adapters may hand back repeated headers as sequences; Portal must read one value.
+        stub = StubTransport()
+        stub.add(
+            StubResponse("", status=302, headers={"Location": ["/Courses/Index"]}),
+            url="/Courses",
+        )
+        stub.add(StubResponse(DASH), url="/Courses/Index")
+        self.assertEqual(_client(stub).get_html("/Courses"), DASH)
+
     def test_unexpected_request_is_reported_loudly(self) -> None:
         stub = StubTransport()
         with self.assertRaises(AssertionError):

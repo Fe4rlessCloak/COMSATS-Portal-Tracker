@@ -162,10 +162,14 @@ class TransportResponse:
                 value = None
             if value is None:
                 value = getter(name.lower())
+            if isinstance(value, (list, tuple)):
+                value = value[-1] if value else None
             if value is not None:
                 return str(value)
         for key, value in getattr(headers, "items", lambda: [])():
             if str(key).lower() == name.lower():
+                if isinstance(value, (list, tuple)):
+                    value = value[-1] if value else ""
                 return str(value)
         return default
 
@@ -1432,7 +1436,7 @@ class SisClient:
                     set_cookie_names=_merge_names(seen_names, response.set_cookie_names),
                 )
 
-            if response.status != 200:
+            if not 200 <= response.status < 300:
                 raise PortalHttpError(
                     f"HTTP {response.status} fetching {url}",
                     set_cookie_names=_merge_names(seen_names, response.set_cookie_names),
