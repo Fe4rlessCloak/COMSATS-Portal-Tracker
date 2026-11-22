@@ -39,6 +39,7 @@ except ImportError:  # pragma: no cover - Windows compatibility for non-locking 
     fcntl = None  # type: ignore[assignment]
 
 from config import resolve_heartbeat_file
+from snapshot_transition import Totals
 
 DEFAULT_KEEPALIVE_INTERVAL = 120
 DEFAULT_FETCH_INTERVAL = 480
@@ -454,10 +455,10 @@ class RuntimeStore:
             "reason": reason,
             "occurrence": occurrence,
             "scanned_totals": dict(
-                scanned_totals or {"courses": 0, "marks": 0, "resources": 0}
+                scanned_totals or Totals().as_dict()
             ),
             "baseline_totals": dict(
-                baseline_totals or {"courses": 0, "marks": 0, "resources": 0}
+                baseline_totals or Totals().as_dict()
             ),
             "failed_courses": list(failed_courses or ()),
             "set_cookie_names": list(set_cookie_names or ()),

@@ -175,15 +175,30 @@ TransitionOutcome(
     notifications,      # ordered: scan_recovered first, then baseline/rollover/diff
     baseline_totals,    # (courses, marks, resources) of the previous baseline
     scanned_totals,     # (courses, marks, resources) of this scan
-    summary,            # status metadata the daemon prints / maps into heartbeat detail
+    summary,            # TransitionSummary: typed status/reason/occurrence/preview/...
 )
 ```
 
+`TransitionOutcome.log_lines() -> List[str]` owns the operator-facing formatting (the
+`[WARN] Rejected snapshot (...)` line, its anomaly-preview line, and the `Scanned … — no
+changes.` line); `tracker._log_transition()` only prints what it returns.
+`TransitionSummary` is a frozen dataclass — the old `Dict[str, Any]` bag is gone.
+
+`Totals(courses, marks, resources)` is the single carrier for the `(courses, marks,
+resources)` triple: `as_dict()` is the `data/last_anomaly.json` payload shape and
+`as_tuple()` the shape `summarize_totals()` returns, so the two can never disagree about
+a key name.
+
 Decision order (each step can only short-circuit what follows):
 
-1. **Reject** — session expiry mid-scan, partial scan, 0-course scan, `>0 -> 0` mark drop,
+1. **Reject** — partial scan, 0-course scan, `>0 -> 0` mark drop,
    or a `<50%` drop when the baseline had `>=3` courses / `>=5` marks / `>=5` resources.
    Rollover beats every drop rule; `reset_state` beats every drop rule.
+   **Session expiry is not decided here**: `run_cycle()` raises `SessionExpiredError`
+   before `compute_transition()` is called, so expiry has exactly one owner and
+   `state.json` is never touched. `compute_transition()` rejects an expired `ScanResult`
+   with `ValueError` (caller bug), while the standalone `validate_snapshot()` still
+   reports `"Session expired mid-scan: …"` for callers that only hold a scan.
 2. **Recover** — if an anomaly marker was present and the scan is accepted, one
    `scan_recovered` notification is placed *first* and the marker is scheduled for clearing
    (`notify_anomaly=False` suppresses the notification but still clears the marker).
@@ -211,21 +226,22 @@ public diff entry point — all three live here now, not in `tracker.py`.
 ### Cycle orchestration
 
 `run_cycle(client, courses, store, options, notifiers)` takes a real `RuntimeStore` and one
-`CycleOptions` (field names match the old keyword arguments, so every pre-refactor call site
-still works through a compatibility shim):
+`CycleOptions`. It is the only cycle surface — the pre-refactor keyword form and the
+`CycleOptions.state_path` field are gone:
 
 ```python
 CycleOptions(base_url, track_announcements=False, reset_state=False, notify_anomaly=True,
              semester=None, dry_run=False, max_backups=None, notifier_timeout=None,
-             lock_timeout=30.0, cancel_event=None, on_progress=None, state_path=None)
+             lock_timeout=30.0, cancel_event=None, on_progress=None)
 ```
 
 The body is one straight line with a single tail: `store.lock()` -> `store.load_state()` ->
-`scan_all_courses()` -> cancel check -> mid-scan `SessionExpiredError` re-raise (state untouched)
--> `store.load_anomaly()` -> `compute_transition()` -> `_log_transition()` -> cancel check ->
-dry-run gate -> `store.save_state()` / `save_anomaly()`+`write_anomaly_diagnostics()` /
-`clear_anomaly()` -> `dispatch_all()` per notification. Baseline, rollover, and diff no longer
-have separate tails, so lifecycle fixes cannot diverge between them.
+`scan_all_courses()` -> cancel check -> mid-scan `SessionExpiredError` re-raise carrying the
+observed `Set-Cookie` **names** (state untouched) -> `store.load_anomaly()` ->
+`compute_transition()` -> `outcome.log_lines()` printed -> cancel check -> dry-run gate ->
+`store.save_state()` / `save_anomaly()`+`write_anomaly_diagnostics()` / `clear_anomaly()` ->
+`dispatch_all()` per notification. Baseline, rollover, and diff no longer have separate
+tails, so lifecycle fixes cannot diverge between them.
 
 ---
 
@@ -234,7 +250,7 @@ have separate tails, so lifecycle fixes cannot diverge between them.
 | Failure Mode | What Happens (Safeguard / Fallback) |
 | :--- | :--- |
 | **One course fails mid-scan** (`PortalHttpError`, `PortalParseError`, `CourseMismatchError`) | `scan_all_courses()` calls `client.fetch_course_snapshot(course, ...)` per course; a per-course failure is logged `[WARN]` with that course's `set_cookie_names`, the course's entry is carried forward from `previous_state`, the remaining courses keep scanning, and `partial=True` is set. `compute_transition()` then returns `anomaly_rejected`, so `run_cycle()` refuses to overwrite `state.json` and triggers deduplicated `scan_anomaly` handling. |
-| **Session expires mid-scan** (`SessionExpiredError`) | `scan_all_courses()` stops making further course requests immediately, preserves already-fetched + carried-forward courses in `ScanResult`, and `run_cycle()` raises `SessionExpiredError` **without** touching `state.json`. The expiry's `set_cookie_names` (widened with names from earlier successful hops in the same snapshot) still reach `ScanResult.set_cookie_names`. |
+| **Session expires mid-scan** (`SessionExpiredError`) | `scan_all_courses()` stops making further course requests immediately, preserves already-fetched + carried-forward courses in `ScanResult`, and `run_cycle()` re-raises `SessionExpiredError` **without** touching `state.json`, now carrying every `Set-Cookie` **name** observed (its own plus the ones from earlier successful hops in the same snapshot) on `set_cookie_names`. The daemon appends those names — never values — to the `session_expired` notification, the `waiting_for_session` heartbeat detail, and its log line, so the operator can see which cookie the portal rotated. |
 | **Degenerate / empty scan, semester rollover, & anomaly alert spam** (0 courses, `>0 -> 0` marks, or `>50%` drop when baseline has `>=3` courses or `>=5` marks/resources) | The semester label comes from `fetch_roster().semester` (or the `SIS_SEMESTER` override, `cfg.semester or roster.semester`) and is recorded in `state.json`. When the semester changes (`compute_transition()` -> `semester_rollover`, including when retaken courses share course IDs across semesters, or for legacy `state.json` files with 0% course ID overlap), `run_cycle()` backs up the old semester, saves the new baseline, and emits one `semester_rollover` notification. Within the same semester, `compute_transition()` returns `anomaly_rejected` for anomalous drops (unless `--once --reset-state` is passed), persists the anomaly key/count in `data/.anomaly_alerted` (sending **one** `scan_anomaly` alert per unique anomaly reason until recovery), writes diagnostics to `data/last_anomaly.json` and `data/last_anomaly_marks.html` from the snapshot's **already-scrubbed** `diagnostic_html` / `diagnostic_preview` (the Portal module stripped `synopsisForm` and password inputs before this point), and sends a `scan_recovered` alert once normal scans resume — always ordered ahead of that scan's baseline/rollover/diff notifications. Keep-alives preserve `"status": "anomaly"` in `heartbeat.json` until a full scan recovers. |
 | **Silent deletions on the portal** | `snapshot_transition.diff_states()` compares both directions (`new - old` and `old - new`), emitting `marks_removed`, `resource_removed`, `announcement_removed`, and `course_removed`. Legitimate small removals (e.g. `2 -> 1` marks) pass plausibility checks, update state, and notify. |
 | **Corrupt `state.json` or concurrent `--once` + daemon race** | `RuntimeStore.lock()` acquires an exclusive `fcntl.flock` on `data/state.json.lock` **before** `load_state()` so old state is always read prior to scanning. `save_state()` writes a PID/thread-scoped temp file (cleaning up temps on any error), skips rotating `.bak*` if `state.json` on disk is corrupt JSON, and otherwise atomically rotates `state.json.bak`..`.bak.5` before `os.replace`ing `state.json`. If `state.json` is corrupt JSON, `load_state()` falls back across `state.json.bak` through `state.json.bak.N`. |
@@ -261,7 +277,7 @@ All runtime files live under `./data/` (mounted to `/app/data` in Docker) and ar
 | `data/last_anomaly.json` | Latest rejected scan summary (counts, `Set-Cookie` names observed, failed courses, plain-text page preview). | `write_anomaly_diagnostics(...)` |
 | `data/last_anomaly_marks.html` | Credential-scrubbed `MarksSummary` HTML captured from the latest rejected 0-mark scan. | `write_anomaly_diagnostics(...)` |
 
-**Heartbeat timing is bound once.** `RuntimeStore` is constructed (and re-bound via `bind_heartbeat()` on every `.env` reload) with `keepalive_interval`, `fetch_interval`, and `healthcheck_max_age`, so daemon call sites are just `store.write_heartbeat(status, detail=..., last_ok=...)`. `write_heartbeat()` still accepts the per-call timing keywords for ad-hoc callers, and the heartbeat JSON fields/status values and `--healthcheck` freshness and unhealthy-status rules are unchanged.
+**Heartbeat timing is bound once.** `RuntimeStore` is constructed (and re-bound via `bind_heartbeat()` on every `.env` reload) with `keepalive_interval`, `fetch_interval`, and `healthcheck_max_age`, so daemon call sites are just `store.write_heartbeat(status, detail=..., last_ok=...)`. `write_heartbeat()` takes no per-call timing keywords — `bind_heartbeat()` is the only way to change timing — and the heartbeat JSON fields/status values and `--healthcheck` freshness and unhealthy-status rules are unchanged. `RuntimeStore(state_path, heartbeat_path=None, *, environ=None, ...)` resolves `HEARTBEAT_FILE` through `config.resolve_heartbeat_file`, so a store built from a bare state path honours an injected `environ` instead of reading `os.environ`.
 
 ---
 

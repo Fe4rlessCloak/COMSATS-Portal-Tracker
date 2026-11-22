@@ -259,6 +259,23 @@ class TotalsAndNormalizationTests(unittest.TestCase):
             summarize_totals({"courses": {"a": {"label": "A"}}}), (1, 0, 0)
         )
 
+    def test_totals_round_trips_between_tuple_and_payload_dict(self) -> None:
+        """D2: Totals is the one conversion between the 3-tuple and the store payload."""
+        totals = st.Totals(courses=2, marks=6, resources=8)
+        self.assertEqual(totals.as_tuple(), (2, 6, 8))
+        self.assertEqual(
+            totals.as_dict(), {"courses": 2, "marks": 6, "resources": 8}
+        )
+        self.assertEqual(st.Totals.from_dict(totals.as_dict()), totals)
+        self.assertEqual(st.Totals.of(state(courses=2, marks=3, resources=4)), totals)
+        self.assertEqual(st.Totals().as_tuple(), (0, 0, 0))
+        self.assertEqual(
+            st.Totals().as_dict(), {"courses": 0, "marks": 0, "resources": 0}
+        )
+        # from_dict tolerates a partial/absent payload the way the store does.
+        self.assertEqual(st.Totals.from_dict({"courses": 1}).as_tuple(), (1, 0, 0))
+        self.assertEqual(st.Totals.from_dict({}).as_tuple(), (0, 0, 0))
+
     def test_normalize_semester(self) -> None:
         self.assertEqual(normalize_semester("  Fall   2026 "), "fall 2026")
         self.assertEqual(normalize_semester("FALL\t2026"), "fall 2026")
@@ -662,8 +679,8 @@ class BaselineTransitionTests(unittest.TestCase):
         self.assertEqual(note.data, {"courses": 1, "marks": 2, "resources": 2,
                                      "semester": "Fall 2026"})
         self.assertEqual(outcome.state, state(semester="Fall 2026"))
-        self.assertEqual(outcome.summary["status"], "ok")
-        self.assertIsNone(outcome.summary["anomaly"])
+        self.assertEqual(outcome.summary.status, "ok")
+        self.assertIsNone(outcome.summary.anomaly)
 
     def test_baseline_without_a_semester_label(self) -> None:
         outcome = transition(None, scan_of(state()))
@@ -701,10 +718,10 @@ class DiffTransitionTests(unittest.TestCase):
         self.assertEqual(outcome.notifications, [])
         self.assertEqual(outcome.anomaly_action.kind, ANOMALY_NONE)
         self.assertEqual(
-            outcome.summary["message"],
+            outcome.summary.message,
             "Scanned 1 courses (2 marks, 1 resources) — no changes.",
         )
-        self.assertFalse(outcome.summary["changed"])
+        self.assertFalse(outcome.summary.changed)
 
     def test_changed_snapshot_emits_the_diff_notifications_in_order(self) -> None:
         outcome = transition(OLD_DIFF_STATE, scan_of(NEW_DIFF_STATE))
@@ -714,8 +731,8 @@ class DiffTransitionTests(unittest.TestCase):
             ["marks_updated", "marks_removed", "resource_added", "resource_removed",
              "course_removed"],
         )
-        self.assertIsNone(outcome.summary["message"])
-        self.assertTrue(outcome.summary["changed"])
+        self.assertIsNone(outcome.summary.message)
+        self.assertTrue(outcome.summary.changed)
 
     def test_semester_label_is_carried_forward_when_the_scan_omits_it(self) -> None:
         previous = state(semester="Fall 2026")
@@ -781,7 +798,7 @@ class RolloverTransitionTests(unittest.TestCase):
                      "semester": "Spring 2027"}),
         )
         self.assertEqual(outcome.kind, KIND_SEMESTER_ROLLOVER)
-        self.assertIsNone(outcome.summary["anomaly"])
+        self.assertIsNone(outcome.summary.anomaly)
 
     def test_reset_state_suppresses_rollover_detection(self) -> None:
         options = TransitionOptions(base_url=BASE, reset_state=True)
@@ -882,8 +899,8 @@ class AnomalyTransitionTests(unittest.TestCase):
         self.assertEqual(action.marker["last_seen"], NOW.isoformat())
         assert action.diagnostics is not None
         self.assertEqual(action.diagnostics.occurrence, 3)
-        self.assertTrue(outcome.summary["duplicate_suppressed"])
-        self.assertFalse(outcome.summary["notified"])
+        self.assertTrue(outcome.summary.duplicate_suppressed)
+        self.assertFalse(outcome.summary.notified)
 
     def test_a_new_reason_restarts_the_occurrence_count(self) -> None:
         prior = {"key": "Scan returned 0 courses.", "reason": "Scan returned 0 courses.",
@@ -901,7 +918,7 @@ class AnomalyTransitionTests(unittest.TestCase):
         self.assertEqual(outcome.kind, KIND_ANOMALY_REJECTED)
         self.assertEqual(outcome.notifications, [])
         self.assertEqual(outcome.anomaly_action.kind, ANOMALY_RECORD)
-        self.assertFalse(outcome.summary["duplicate_suppressed"])
+        self.assertFalse(outcome.summary.duplicate_suppressed)
 
     def test_preview_is_truncated_to_240_characters(self) -> None:
         long_preview = ("abcdefghij" * 40).rstrip()
@@ -909,7 +926,7 @@ class AnomalyTransitionTests(unittest.TestCase):
             state(marks=6),
             scan_of(state(marks=0), sample_marks_preview=long_preview),
         )
-        preview = outcome.summary["preview"]
+        preview = outcome.summary.preview
         self.assertEqual(len(preview), 240)
         self.assertTrue(preview.endswith("..."))
         self.assertIn(f"Page preview: {preview}", outcome.notifications[0].message)
@@ -918,7 +935,7 @@ class AnomalyTransitionTests(unittest.TestCase):
         outcome = transition(
             state(marks=6), scan_of(state(marks=0), sample_marks_preview="empty")
         )
-        self.assertEqual(outcome.summary["preview_course"], "MarksSummary")
+        self.assertEqual(outcome.summary.preview_course, "MarksSummary")
 
     def test_partial_scan_records_failed_courses_in_diagnostics(self) -> None:
         outcome = transition(
@@ -933,6 +950,44 @@ class AnomalyTransitionTests(unittest.TestCase):
     def test_anomaly_marker_is_untouched_when_nothing_was_wrong(self) -> None:
         outcome = transition(None, scan_of(state()))
         self.assertEqual(outcome.anomaly_action.kind, ANOMALY_NONE)
+
+    def test_log_lines_are_formatted_by_the_outcome(self) -> None:
+        """D1: TransitionOutcome.log_lines() owns the operator-facing formatting."""
+        rejected = transition(
+            state(marks=6),
+            scan_of(
+                state(marks=0),
+                sample_marks_preview="empty page",
+                sample_marks_course="CSC101 — Intro",
+            ),
+        )
+        self.assertEqual(
+            rejected.log_lines(),
+            [
+                "[WARN] Rejected snapshot (Total marks dropped from 6 to 0 "
+                "(degenerate scan).; scanned=1c/0m/2r; occurrence #1) "
+                "— preserving existing baseline.",
+                "[INFO] Anomaly page preview (CSC101 — Intro): empty page",
+            ],
+        )
+
+        # A duplicate alert is called out, not silently dropped from the log.
+        prior = {
+            "key": rejected.anomaly_action.marker["key"],  # type: ignore[index]
+            "reason": rejected.summary.reason,
+            "count": 1,
+            "first_seen": NOW.isoformat(),
+        }
+        duplicate = transition(state(marks=6), scan_of(state(marks=0)), prior)
+        self.assertIn("(duplicate alert suppressed)", duplicate.log_lines()[0])
+
+        unchanged = transition(state(marks=2), scan_of(state(marks=2)))
+        line = unchanged.log_lines()[0]
+        self.assertRegex(line, r"^\[\d\d:\d\d:\d\d\] Scanned 1 courses")
+        self.assertTrue(line.endswith("— no changes."))
+        # An accepted cycle that notified prints nothing.
+        changed = transition(OLD_DIFF_STATE, scan_of(NEW_DIFF_STATE))
+        self.assertEqual(changed.log_lines(), [])
 
 
 class RecoveryOrderingTests(unittest.TestCase):
@@ -987,8 +1042,8 @@ class RecoveryOrderingTests(unittest.TestCase):
         self.assertEqual([n.event for n in outcome.notifications], ["scan_recovered"])
         self.assertEqual(outcome.anomaly_action.kind, ANOMALY_CLEAR)
         # A lone recovery alert is a real event: the "nothing happened" line stays off.
-        self.assertIsNone(outcome.summary["message"])
-        self.assertTrue(outcome.summary["recovered"])
+        self.assertIsNone(outcome.summary.message)
+        self.assertTrue(outcome.summary.recovered)
 
     def test_notify_anomaly_off_suppresses_recovery_but_still_clears(self) -> None:
         options = TransitionOptions(base_url=BASE, notify_anomaly=False)
@@ -1068,7 +1123,7 @@ class OutcomeContractTests(unittest.TestCase):
                 notifications=[],
                 baseline_totals=(0, 0, 0),
                 scanned_totals=(0, 0, 0),
-                summary={},
+                summary=st.TransitionSummary(),
             )
         with self.assertRaises(ValueError):
             st.AnomalyAction(kind="delete-everything")

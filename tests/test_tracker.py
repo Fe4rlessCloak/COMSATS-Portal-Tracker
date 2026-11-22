@@ -24,6 +24,7 @@ for entry in (str(ROOT), str(HERE)):
     if entry not in sys.path:
         sys.path.insert(0, entry)
 
+import config  # noqa: E402
 import probe  # noqa: E402
 import tracker  # noqa: E402
 from notifiers import BaseNotifier, Notification, _latin1_safe, dispatch_all  # noqa: E402
@@ -971,14 +972,14 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
 
             portal = _WedgedTransport()
 
-            fast_cfg = load_config(env_path)
+            fast_cfg = config.load_config(env_path)
             fast_cfg.cycle_timeout = 1  # type: ignore[assignment]
             prev_int = signal.getsignal(signal.SIGINT)
             prev_term = signal.getsignal(signal.SIGTERM)
             try:
                 with mock.patch.object(
                     tracker, "SisClient", portal_factory(portal)
-                ), mock.patch.object(tracker, "load_config", return_value=fast_cfg):
+                ), mock.patch.object(config, "load_config", return_value=fast_cfg):
                     rc = run_daemon(
                         env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
                     )
@@ -1124,7 +1125,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
 
             portal.on_path["/Courses"] = _count_dashboard
 
-            fast_cfg = tracker.TrackerConfig(
+            fast_cfg = config.TrackerConfig(
                 raw={"SIS_SESSION_ID": "valid_cookie"},
                 session_id="valid_cookie",
                 base_url="https://sis.comsats.edu.pk",
@@ -1152,7 +1153,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t.start()
             try:
                 with mock.patch.object(tracker, "SisClient", portal_factory(portal)), mock.patch.object(
-                    tracker, "load_config", return_value=fast_cfg
+                    config, "load_config", return_value=fast_cfg
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[_RecordingNotifier()]):
                     rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
             finally:
@@ -1569,11 +1570,11 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                 time.sleep(0.2)
                 signal.raise_signal(signal.SIGTERM)
 
-            orig_load_config = tracker.load_config
+            orig_load_config = config.load_config
 
             def _fast_load_config(
                 ep: Path, require_session: bool = True, **kwargs: object
-            ) -> tracker.TrackerConfig:
+            ) -> config.TrackerConfig:
                 cfg_obj = orig_load_config(ep, require_session=require_session, **kwargs)
                 cfg_obj.keepalive_interval = 1
                 return cfg_obj
@@ -1586,7 +1587,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                 with mock.patch.object(
                     tracker, "SisClient", portal_factory(portal)
                 ), mock.patch.object(
-                    tracker, "load_config", side_effect=_fast_load_config
+                    config, "load_config", side_effect=_fast_load_config
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[notifier]):
                     rc = run_daemon(
                         env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}

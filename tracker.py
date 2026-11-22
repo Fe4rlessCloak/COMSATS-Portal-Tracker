@@ -27,7 +27,6 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, TypeV
 
 from config import (
     EnvWatcher,
-    TrackerConfig,
     load_config,
     load_env_dict,
     parse_int,
@@ -50,7 +49,6 @@ from sis_client import (
 from snapshot_transition import (
     ANOMALY_CLEAR,
     ANOMALY_RECORD,
-    KIND_ANOMALY_REJECTED,
     CycleResult,
     ScanResult,
     TransitionOptions,
@@ -222,28 +220,9 @@ class CycleOptions:
 
 
 def _log_transition(outcome: TransitionOutcome) -> None:
-    """Print the operator-facing lines the pre-refactor cycle printed inline."""
-    summary = outcome.summary
-    if outcome.kind == KIND_ANOMALY_REJECTED:
-        reason = str(summary.get("reason") or "")
-        scanned_c, scanned_m, scanned_r = outcome.scanned_totals
-        dedup_note = (
-            " (duplicate alert suppressed)" if summary.get("duplicate_suppressed") else ""
-        )
-        print(
-            f"[WARN] Rejected snapshot ({reason}; scanned={scanned_c}c/{scanned_m}m/"
-            f"{scanned_r}r; occurrence #{summary.get('occurrence')}){dedup_note} "
-            "— preserving existing baseline."
-        )
-        preview = str(summary.get("preview") or "")
-        if preview:
-            print(
-                f"[INFO] Anomaly page preview ({summary.get('preview_course')}): {preview}"
-            )
-        return
-    message = summary.get("message")
-    if message:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+    """Print the operator-facing lines the transition itself formats."""
+    for line in outcome.log_lines():
+        print(line)
 
 
 def run_cycle(
@@ -328,7 +307,7 @@ def run_cycle(
 
         return CycleResult(
             saved=outcome.persist_state and not options.dry_run,
-            anomaly=outcome.summary.get("anomaly"),
+            anomaly=outcome.summary.anomaly,
             notifications=list(outcome.notifications),
         )
 
@@ -426,16 +405,6 @@ def run_daemon(
     )
     env_watcher = EnvWatcher(env_path, environ)
 
-    def _load_env_snapshot(
-        env_file: Path, raw: Optional[bytes], require_session: bool
-    ) -> TrackerConfig:
-        """Parse an already-read .env snapshot so the daemon reads the file only once."""
-        if environ is None:
-            return load_config(env_file, require_session=require_session, raw=raw)
-        return load_config(
-            env_file, require_session=require_session, raw=raw, environ=environ
-        )
-
     last_fetch = 0.0
     expired_since: Optional[float] = None
     last_expired_log = 0.0
@@ -459,9 +428,7 @@ def run_daemon(
     while not stop:
         # Hot-reload .env: ONE read per check, reused for fingerprint + parsing.
         try:
-            reload = env_watcher.check(
-                require_session=False, environ=environ, loader=_load_env_snapshot
-            )
+            reload = env_watcher.check(require_session=False, environ=environ)
             env_changed, change_desc = reload.changed, reload.description
             fresh_cfg = reload.config
             session_src = fresh_cfg.sources.get("SIS_SESSION_ID", "unknown")

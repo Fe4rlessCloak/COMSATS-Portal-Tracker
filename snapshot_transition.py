@@ -44,7 +44,7 @@ from __future__ import annotations
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from notifiers import Notification
 
@@ -102,6 +102,48 @@ PREVIEW_LIMIT = 240
 
 
 # ------------------------------------------------------------ carrier dataclass
+
+
+@dataclass(frozen=True)
+class Totals:
+    """``(courses, marks, resources)`` counts in one typed value.
+
+    The store payload (``{"courses": …, "marks": …, "resources": …}``) and the
+    ``summarize_totals`` 3-tuple are the same data in two shapes; this type is the one
+    place that converts between them, so a key can never be renamed on one side only.
+    """
+
+    courses: int = 0
+    marks: int = 0
+    resources: int = 0
+
+    def as_dict(self) -> Dict[str, int]:
+        return {
+            "courses": self.courses,
+            "marks": self.marks,
+            "resources": self.resources,
+        }
+
+    def as_tuple(self) -> Tuple[int, int, int]:
+        return (self.courses, self.marks, self.resources)
+
+    @classmethod
+    def from_dict(cls, values: Mapping[str, int]) -> "Totals":
+        return cls(
+            courses=int(values.get("courses") or 0),
+            marks=int(values.get("marks") or 0),
+            resources=int(values.get("resources") or 0),
+        )
+
+    @classmethod
+    def of(cls, state: Dict[str, Any]) -> "Totals":
+        """Count a snapshot's courses, marks, and resources."""
+        courses = state.get("courses", {})
+        return cls(
+            courses=len(courses),
+            marks=sum(len(c.get("marks", {})) for c in courses.values()),
+            resources=sum(len(c.get("resources", {})) for c in courses.values()),
+        )
 
 
 @dataclass
@@ -179,6 +221,27 @@ class AnomalyAction:
 
 
 @dataclass(frozen=True)
+class TransitionSummary:
+    """Typed status metadata for one transition (what the daemon logs / maps).
+
+    Replaces the old stringly ``Dict[str, Any]`` bag: every field the operator-facing
+    line needs is named here, so a typo is a failed test rather than a silent miss.
+    """
+
+    status: str = "ok"  # "ok" | "anomaly"
+    anomaly: Optional[str] = None
+    reason: Optional[str] = None
+    occurrence: Optional[int] = None
+    notified: bool = False
+    duplicate_suppressed: bool = False
+    preview: str = ""
+    preview_course: str = "MarksSummary"
+    changed: bool = False
+    recovered: bool = False
+    message: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class TransitionOutcome:
     """The complete, I/O-free plan for one scan cycle."""
 
@@ -189,11 +252,38 @@ class TransitionOutcome:
     notifications: List[Notification]
     baseline_totals: Tuple[int, int, int]
     scanned_totals: Tuple[int, int, int]
-    summary: Dict[str, Any]
+    summary: TransitionSummary
 
     def __post_init__(self) -> None:
         if self.kind not in TRANSITION_KINDS:
             raise ValueError(f"unknown transition kind: {self.kind!r}")
+
+    def log_lines(self) -> List[str]:
+        """The operator-facing lines this cycle prints, in order.
+
+        Formatting lives with the data it formats; ``tracker`` only prints the list.
+        """
+        if self.kind == KIND_ANOMALY_REJECTED:
+            summary = self.summary
+            scanned_c, scanned_m, scanned_r = self.scanned_totals
+            dedup_note = (
+                " (duplicate alert suppressed)" if summary.duplicate_suppressed else ""
+            )
+            lines = [
+                f"[WARN] Rejected snapshot ({summary.reason or ''}; "
+                f"scanned={scanned_c}c/{scanned_m}m/{scanned_r}r; "
+                f"occurrence #{summary.occurrence}){dedup_note} "
+                "— preserving existing baseline."
+            ]
+            if summary.preview:
+                lines.append(
+                    f"[INFO] Anomaly page preview ({summary.preview_course}): "
+                    f"{summary.preview}"
+                )
+            return lines
+        if self.summary.message:
+            return [f"[{datetime.now().strftime('%H:%M:%S')}] {self.summary.message}"]
+        return []
 
 
 # ------------------------------------------------------------- pure primitives
@@ -211,10 +301,7 @@ _norm_semester = normalize_semester
 
 def summarize_totals(state: Dict[str, Any]) -> Tuple[int, int, int]:
     """Return ``(courses, marks, resources)`` counts for a snapshot."""
-    courses = state.get("courses", {})
-    marks = sum(len(c.get("marks", {})) for c in courses.values())
-    resources = sum(len(c.get("resources", {})) for c in courses.values())
-    return len(courses), marks, resources
+    return Totals.of(state).as_tuple()
 
 
 def detect_semester_rollover(
@@ -520,8 +607,8 @@ def diff_states(
 
 
 def _totals_dict(totals: Tuple[int, int, int]) -> Dict[str, int]:
-    courses, marks, resources = totals
-    return {"courses": courses, "marks": marks, "resources": resources}
+    """Legacy tuple -> payload dict, routed through :class:`Totals`."""
+    return Totals(*totals).as_dict()
 
 
 def _truncate_preview(preview: str, limit: int = PREVIEW_LIMIT) -> str:
@@ -776,21 +863,16 @@ def compute_transition(
             notifications=notifications,
             baseline_totals=baseline_totals,
             scanned_totals=scanned_totals,
-            summary={
-                "kind": KIND_ANOMALY_REJECTED,
-                "anomaly": reason,
-                "status": "anomaly",
-                "reason": reason,
-                "occurrence": occurrence,
-                "notified": should_notify,
-                "duplicate_suppressed": not should_notify and options.notify_anomaly,
-                "preview": preview,
-                "preview_course": scan.sample_marks_course or "MarksSummary",
-                "courses": scanned_totals[0],
-                "marks": scanned_totals[1],
-                "resources": scanned_totals[2],
-                "message": None,
-            },
+            summary=TransitionSummary(
+                status="anomaly",
+                anomaly=reason,
+                reason=reason,
+                occurrence=occurrence,
+                notified=should_notify,
+                duplicate_suppressed=not should_notify and options.notify_anomaly,
+                preview=preview,
+                preview_course=scan.sample_marks_course or "MarksSummary",
+            ),
         )
 
     # -- accepted snapshot: recovery note (if any) always comes first --------------
@@ -822,17 +904,12 @@ def compute_transition(
             notifications=notes,
             baseline_totals=baseline_totals,
             scanned_totals=scanned_totals,
-            summary={
-                "kind": kind,
-                "anomaly": None,
-                "status": "ok",
-                "courses": scanned_totals[0],
-                "marks": scanned_totals[1],
-                "resources": scanned_totals[2],
-                "changed": bool(notifications),
-                "recovered": recovery_note is not None,
-                "message": message,
-            },
+            summary=TransitionSummary(
+                status="ok",
+                changed=bool(notifications),
+                recovered=recovery_note is not None,
+                message=message,
+            ),
         )
 
     # -- first baseline (or an explicit reset) -------------------------------------

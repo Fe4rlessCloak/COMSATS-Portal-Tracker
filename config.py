@@ -25,7 +25,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 # Portal defaults are mirrored here (not imported from sis_client) so this module
 # stays a leaf. tests/test_config.py asserts the two copies stay equal, so drift fails
@@ -379,21 +379,21 @@ class EnvWatcher:
         self,
         require_session: bool = False,
         environ: Optional[Mapping[str, str]] = None,
-        loader: Optional[Callable[[Path, Optional[bytes], bool], TrackerConfig]] = None,
     ) -> EnvReload:
-        """Single-read check returning change status, description, and fresh config."""
+        """Single-read check returning change status, description, and fresh config.
+
+        The one read is reused for the fingerprint and for parsing, and ``environ`` (or the
+        mapping given at construction) flows into ``load_config``.
+        """
         raw = read_env_bytes(self.env_path)
         _, changed, desc = self._observe(raw)
         env = self.environ if environ is None else environ
-        if loader is None:
-            cfg = load_config(
-                self.env_path,
-                require_session=require_session,
-                environ=env,
-                raw=raw,
-            )
-        else:
-            cfg = loader(self.env_path, raw, require_session)
+        cfg = load_config(
+            self.env_path,
+            require_session=require_session,
+            environ=env,
+            raw=raw,
+        )
         return EnvReload(changed=changed, description=desc, config=cfg)
 
 
