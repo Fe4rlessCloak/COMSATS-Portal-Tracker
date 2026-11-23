@@ -1,0 +1,59 @@
+name: checks
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  check:
+    # Pinned, not `ubuntu-latest`. GitHub's 3.9 builds stop at Ubuntu 24.04 —
+    # `ubuntu-latest` is now 26.04, where setup-python cannot find a 3.9 at all
+    # ("The version '3.9' with architecture 'x64' was not found for Ubuntu
+    # 26.04"). Since the 3.9 leg is the whole point, the runner is the floor for
+    # the floor. Revisit this pin when 24.04 is retired.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.9 enforces the promised minimum Python version; 3.13 matches the
+      # Dockerfile runtime. Local dev runs a newer interpreter, so without the
+      # 3.9 leg the floor promise is never actually executed.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # `check.py` reports on the files it reads, never on the interpreter
+      # running it, so a leg that silently fell back to /usr/bin/python3 (3.12
+      # on this image) would still pass and prove nothing about its own floor.
+      # Assert the interpreter the job claims to be.
+      - name: Assert the interpreter is the one this leg asked for
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          want = os.environ["EXPECTED"]
+          got = "%d.%d" % sys.version_info[:2]
+          print("running %s (wanted %s): %s" % (got, want, sys.version.split()[0]))
+          if got != want:
+              sys.exit("this leg must run Python %s, got %s" % (want, got))
+          PY
+        env:
+          EXPECTED: ${{ matrix.python-version }}
+
+      # The step name is the audit surface, so it must not name a check that
+      # does not exist. It also must not enumerate them: `check.py`'s set is
+      # still moving (the module-graph check is in flight on PR #11), and this
+      # repo has already been bitten by hardcoded lists going stale. Point at
+      # the script; the log prints every check it actually ran.
+      - name: Static guardrails (scripts/check.py)
+        run: python3 scripts/check.py
+
+      - name: Guardrail self-tests
+        run: python3 scripts/probe_guardrails.py
+
+      - name: Test suite
+        run: python3 -m unittest discover -s tests -v
