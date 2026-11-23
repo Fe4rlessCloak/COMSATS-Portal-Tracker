@@ -52,6 +52,7 @@ LOCAL_MODULES = frozenset(
         "notifiers",
         "probe",
         "runtime_store",
+        "session_ui",
         "sis_client",
         "snapshot_transition",
         "tracker",

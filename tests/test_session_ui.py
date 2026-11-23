@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""End-to-end HTTP tests for the session-renewal web page.
+
+Every test drives the *real* `ThreadingHTTPServer` on `127.0.0.1:0` with real
+temporary `.env` and `heartbeat.json` files, wired to the existing
+`tests.support_portal_pages.SimulatedPortal` transport seam. Nothing here mocks
+a private helper: assertions are made on HTTP statuses, response bodies, the
+bytes on disk, and `config.EnvWatcher.check()`.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import sys
+import tempfile
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parent.parent
+HERE = Path(__file__).resolve().parent
+for entry in (str(ROOT), str(HERE)):
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
+import config  # noqa: E402
+import session_ui  # noqa: E402
+from sis_client import Course  # noqa: E402
+from support_portal_pages import SimulatedPortal  # noqa: E402
+
+SECRET_SESSION = "stored_session_sentinel_do_not_render"
+SECRET_TOKEN = "ntfy_token_sentinel_do_not_render"
+
+ENV_TEXT = (
+    "# Tracker configuration — keep this comment\n"
+    "\n"
+    f"SIS_SESSION_ID={SECRET_SESSION}\n"
+    "SIS_BASE_URL=https://sis.example.test\n"
+    "\n"
+    "# notifier settings\n"
+    f"NTFY_TOKEN={SECRET_TOKEN}\n"
+    "NTFY_URL=https://ntfy.sh/topic\n"
+    "KEEPALIVE_INTERVAL=120\n"
+)
+
+COURSES = (
+    Course(course_id="100001", code="CSC101", name="Intro to Computing"),
+    Course(course_id="100002", code="CSC102", name="Programming"),
+    Course(course_id="100003", code="CSC103", name="Data Structures"),
+)
+
+
+class _ServerTestCase(unittest.TestCase):
+    """One real server + real temp files per test."""
+
+    courses = COURSES
+    env_text: Optional[str] = ENV_TEXT
+
+    def setUp(self) -> None:
+        self.log_stream = io.StringIO()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmpdir = Path(self._tmp.name)
+        self.env_path = self.tmpdir / ".env"
+        if self.env_text is not None:
+            self.env_path.write_text(self.env_text, encoding="utf-8")
+        self.heartbeat_path = self.tmpdir / "heartbeat.json"
+        self.portal = self.make_portal()
+        self.server, self.thread = self.start_server(self.portal)
+
+    # -- wiring ---------------------------------------------------------------
+    def make_portal(self) -> SimulatedPortal:
+        return SimulatedPortal(courses=self.courses)
+
+    def build_app(self, portal) -> "session_ui.SessionUiApp":
+        return session_ui.build_app(
+            self.env_path,
+            self.heartbeat_path,
+            transport=portal,
+            environ={"SIS_BASE_URL": "https://sis.example.test"},
+        )
+
+    def start_server(self, portal) -> Tuple["session_ui.ThreadingHTTPServer", threading.Thread]:
+        app = self.build_app(portal)
+        server = session_ui.create_server(app, port=0, log_stream=self.log_stream)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(self._stop, server, thread)
+        return server, thread
+
+    @staticmethod
+    def _stop(server, thread) -> None:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    @property
+    def base_url(self) -> str:
+        host, port = self.server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    # -- HTTP -----------------------------------------------------------------
+    def http(
+        self, method: str, path: str = "/", data: Optional[Dict[str, str]] = None
+    ) -> Tuple[int, str]:
+        payload = None
+        headers = {"Accept": "text/html"}
+        if data is not None:
+            payload = urllib.parse.urlencode(data).encode("utf-8")
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        request = urllib.request.Request(
+            self.base_url + path, data=payload, headers=headers, method=method
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10.0) as response:
+                return response.status, response.read().decode("utf-8")
+        except urllib.error.HTTPError as error:
+            try:
+                return error.code, error.read().decode("utf-8", errors="replace")
+            finally:
+                error.close()
+
+    def get(self, path: str = "/") -> Tuple[int, str]:
+        return self.http("GET", path)
+
+    def post(self, value: str) -> Tuple[int, str]:
+        return self.http("POST", data={session_ui.SESSION_FIELD: value})
+
+    # -- heartbeat ------------------------------------------------------------
+    def write_heartbeat(self, **overrides) -> None:
+        payload = {
+            "timestamp": time.time(),
+            "iso": "2026-11-23T10:00:00+00:00",
+            "pid": 4321,
+            "status": "ok",
+            "detail": "3 courses tracked",
+            "last_ok_timestamp": time.time() - 30,
+            "keepalive_interval": 120,
+            "fetch_interval": 480,
+            "healthcheck_max_age": 0,
+        }
+        payload.update(overrides)
+        self.heartbeat_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def env_bytes(self) -> bytes:
+        return self.env_path.read_bytes()
+
+
+class StatusPageTests(_ServerTestCase):
+    """`GET /` renders read-only tracker status and no secrets."""
+
+    def test_renders_status_detail_and_last_healthy_time(self) -> None:
+        self.write_heartbeat()
+
+        status, body = self.get()
+
+        self.assertEqual(status, 200)
+        lowered = body.lower()
+        self.assertIn("status", lowered)
+        self.assertIn("ok", lowered)
+        self.assertIn("3 courses tracked", body)
+        self.assertIn("2026-11-23", body)  # last healthy time, from last_ok_timestamp
+
+    def test_missing_heartbeat_is_reported_cleanly(self) -> None:
+        self.assertFalse(self.heartbeat_path.exists())
+
+        status, body = self.get()
+
+        self.assertEqual(status, 200)
+        self.assertIn("no heartbeat", body.lower())
+
+    def test_corrupt_heartbeat_is_reported_cleanly(self) -> None:
+        self.heartbeat_path.write_text("{not json", encoding="utf-8")
+
+        status, body = self.get()
+
+        self.assertEqual(status, 200)
+        self.assertIn("unreadable", body.lower())
+
+    def test_heartbeat_that_is_not_an_object_is_reported_cleanly(self) -> None:
+        self.heartbeat_path.write_text("[1, 2, 3]", encoding="utf-8")
+
+        status, body = self.get()
+
+        self.assertEqual(status, 200)
+        self.assertIn("unreadable", body.lower())
+
+    def test_stale_heartbeat_is_flagged(self) -> None:
+        self.write_heartbeat(timestamp=time.time() - 3600, last_ok_timestamp=None)
+
+        status, body = self.get()
+
+        self.assertEqual(status, 200)
+        self.assertIn("stale", body.lower())
+        self.assertIn("never", body.lower())  # no healthy timestamp recorded
+
+    def test_waiting_for_session_status_is_flagged_as_needing_a_cookie(self) -> None:
+        self.write_heartbeat(status="waiting_for_session", detail="session expired")
+
+        status, body = self.get()
+
+        self.assertEqual(status, 200)
+        self.assertIn("waiting_for_session", body)
+        self.assertIn("session expired", body)
+        self.assertIn("cookie", body.lower())
+
+    def test_never_renders_stored_session_or_notifier_token(self) -> None:
+        self.write_heartbeat()
+
+        status, body = self.get()
+
+        self.assertEqual(status, 200)
+        self.assertNotIn(SECRET_SESSION, body)
+        self.assertNotIn(SECRET_TOKEN, body)
+
+    def test_unknown_path_is_404(self) -> None:
+        status, _ = self.get("/nope")
+
+        self.assertEqual(status, 404)
+
+    def test_get_is_read_only_and_never_writes_env(self) -> None:
+        before = self.env_bytes()
+
+        self.get()
+
+        self.assertEqual(self.env_bytes(), before)
+
+
+class SaveSessionTests(_ServerTestCase):
+    """`POST /` verifies through the portal seam, then rewrites only one line."""
+
+    def test_raw_value_is_saved_and_only_the_session_line_changes(self) -> None:
+        watcher = config.EnvWatcher(self.env_path, environ={})
+        self.assertFalse(watcher.check(environ={}).changed)
+
+        status, body = self.post("fresh_session_value")
+
+        self.assertEqual(status, 200)
+        self.assertIn("saved", body.lower())
+        self.assertIn("3", body)  # course count
+        expected = ENV_TEXT.replace(
+            f"SIS_SESSION_ID={SECRET_SESSION}", "SIS_SESSION_ID=fresh_session_value"
+        )
+        self.assertEqual(self.env_path.read_text(encoding="utf-8"), expected)
+
+        reload = watcher.check(environ={})
+        self.assertTrue(reload.changed)
+        self.assertEqual(reload.config.session_id, "fresh_session_value")
+
+    def test_asp_net_session_id_pair_is_accepted(self) -> None:
+        status, body = self.post("ASP.NET_SessionId=pair_value")
+
+        self.assertEqual(status, 200)
+        self.assertIn("saved", body.lower())
+        self.assertIn("SIS_SESSION_ID=pair_value\n", self.env_path.read_text(encoding="utf-8"))
+
+    def test_full_cookie_header_is_accepted(self) -> None:
+        status, body = self.post(
+            "Cookie: ASP.NET_SessionId=header_value; ARRAffinity=node1; other=1"
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn("saved", body.lower())
+        self.assertIn("SIS_SESSION_ID=header_value\n", self.env_path.read_text(encoding="utf-8"))
+
+    def test_saved_response_never_echoes_the_submitted_cookie(self) -> None:
+        status, body = self.post("never_echoed_cookie_value")
+
+        self.assertEqual(status, 200)
+        self.assertNotIn("never_echoed_cookie_value", body)
+        self.assertNotIn(SECRET_SESSION, body)
+
+    def test_missing_env_file_is_created_owner_only(self) -> None:
+        self.env_path.unlink()
+
+        status, body = self.post("created_fresh")
+
+        self.assertEqual(status, 200)
+        self.assertIn("saved", body.lower())
+        self.assertEqual(
+            self.env_path.read_text(encoding="utf-8"), "SIS_SESSION_ID=created_fresh\n"
+        )
+        self.assertEqual(self.env_path.stat().st_mode & 0o777, 0o600)
+
+
+class RejectedSessionTests(_ServerTestCase):
+    """Every rejection leaves `.env` byte-for-byte unchanged."""
+
+    def assert_env_unchanged(self, before: bytes) -> None:
+        self.assertEqual(self.env_bytes(), before)
+
+    def test_blank_input_is_rejected_without_touching_the_file(self) -> None:
+        before = self.env_bytes()
+
+        status, body = self.post("   ")
+
+        self.assertGreaterEqual(status, 400)
+        self.assertLess(status, 500)
+        self.assertIn("cookie", body.lower())
+        self.assert_env_unchanged(before)
+        self.assertEqual(self.portal.request_count, 0)
+
+    def test_placeholder_input_is_rejected_without_touching_the_file(self) -> None:
+        before = self.env_bytes()
+
+        status, body = self.post(config.SESSION_PLACEHOLDER)
+
+        self.assertEqual(status, 400)
+        self.assertIn("placeholder", body.lower())
+        self.assert_env_unchanged(before)
+        self.assertEqual(self.portal.request_count, 0)
+
+    def test_expired_session_from_portal_is_rejected(self) -> None:
+        before = self.env_bytes()
+        self.portal.expire_sessions = {"rejected_cookie"}
+
+        status, body = self.post("rejected_cookie")
+
+        self.assertEqual(status, 400)
+        self.assertIn("expired", body.lower())
+        self.assertIn("unchanged", body.lower())
+        self.assert_env_unchanged(before)
+        self.assertNotIn("rejected_cookie", body)
+
+    def test_portal_http_error_is_rejected_with_502(self) -> None:
+        from sis_client import PortalHttpError
+
+        before = self.env_bytes()
+        self.portal.failures = {"/Courses": PortalHttpError("HTTP 503 fetching /Courses")}
+
+        status, body = self.post("some_cookie")
+
+        self.assertEqual(status, 502)
+        self.assertIn("unchanged", body.lower())
+        self.assert_env_unchanged(before)
+        self.assertNotIn("some_cookie", body)
+
+    def test_transport_timeout_is_rejected_without_touching_the_file(self) -> None:
+        before = self.env_bytes()
+        self.portal.failures = {"/Courses": TimeoutError("timed out")}
+
+        status, body = self.post("timeout_cookie")
+
+        self.assertEqual(status, 502)
+        self.assertIn("unchanged", body.lower())
+        self.assert_env_unchanged(before)
+        self.assertNotIn("timeout_cookie", body)
+
+
+class LogHygieneTests(_ServerTestCase):
+    """Server output never contains a submitted cookie value."""
+
+    def test_no_cookie_value_in_the_request_log(self) -> None:
+        self.write_heartbeat()
+
+        self.get()
+        self.post("log_leak_candidate_value")
+        self.post("")
+
+        logged = self.log_stream.getvalue()
+        self.assertNotIn("log_leak_candidate_value", logged)
+        self.assertNotIn(SECRET_SESSION, logged)
+        self.assertNotIn(SECRET_TOKEN, logged)
+        # The request still has to be visible for operations, without secrets.
+        self.assertIn("POST / -> 200", logged)
+        self.assertIn("GET / -> 200", logged)
+
+    def test_cookie_in_a_hand_crafted_query_string_is_not_logged(self) -> None:
+        self.get("/?session_id=query_leak_candidate")
+
+        logged = self.log_stream.getvalue()
+        self.assertNotIn("query_leak_candidate", logged)
+        self.assertIn("GET / -> 200", logged)
+
+    def test_no_cookie_value_on_stdout_or_stderr(self) -> None:
+        captured_out = io.StringIO()
+        captured_err = io.StringIO()
+
+        with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err):
+            status, _ = self.post("stderr_leak_candidate")
+
+        self.assertEqual(status, 200)
+        combined = captured_out.getvalue() + captured_err.getvalue()
+        self.assertNotIn("stderr_leak_candidate", combined)
+        self.assertNotIn(SECRET_SESSION, combined)
+
+
+class RequestGateSeamTests(_ServerTestCase):
+    """Every request passes one gate, so a future check can be added in one place.
+
+    Ticket #17 adds the Tailscale-user and CSRF checks; this test proves the seam
+    it will use is real: an override of ``guard_request`` blocks `GET` and `POST`
+    alike before any status render or `.env` write happens.
+    """
+
+    def build_app(self, portal) -> "session_ui.SessionUiApp":
+        base = super().build_app(portal)
+
+        class _GatedApp(session_ui.SessionUiApp):
+            def guard_request(self, request):
+                return session_ui.Response(status=403, body="<p>blocked by gate</p>")
+
+        gated = _GatedApp(
+            base.env_path,
+            base.heartbeat_path,
+            transport=base.transport,
+            environ=base.environ,
+            portal_timeout=base.portal_timeout,
+        )
+        return gated
+
+    def test_gate_blocks_get_and_post_before_any_side_effect(self) -> None:
+        self.write_heartbeat()
+        before = self.env_bytes()
+
+        get_status, get_body = self.get()
+        post_status, post_body = self.post("gated_cookie")
+
+        self.assertEqual(get_status, 403)
+        self.assertEqual(post_status, 403)
+        self.assertIn("blocked by gate", get_body)
+        self.assertNotIn("3 courses tracked", get_body)  # status never rendered
+        self.assertEqual(self.env_bytes(), before)
+        self.assertEqual(self.portal.request_count, 0)  # portal never contacted
+
+
+class BindAddressTests(_ServerTestCase):
+    """Startup binds loopback only unless explicitly opted in."""
+
+    def test_defaults_to_loopback(self) -> None:
+        settings = session_ui.load_settings(environ={})
+
+        self.assertEqual(settings.host, "127.0.0.1")
+
+    def test_refuses_non_loopback_bind_without_opt_in(self) -> None:
+        app = self.build_app(self.portal)
+
+        with self.assertRaises(session_ui.BindRefusedError):
+            session_ui.create_server(app, host="0.0.0.0", port=0)
+
+        with self.assertRaises(session_ui.BindRefusedError):
+            session_ui.create_server(app, host="192.168.1.10", port=0)
+
+    def test_allows_non_loopback_bind_with_explicit_opt_in(self) -> None:
+        self.assertEqual(
+            session_ui.resolve_bind_host("0.0.0.0", environ={"SESSION_UI_ALLOW_NON_LOOPBACK": "1"}),
+            "0.0.0.0",
+        )
+        self.assertEqual(
+            session_ui.resolve_bind_host("0.0.0.0", environ={"SESSION_UI_ALLOW_NON_LOOPBACK": "yes"}),
+            "0.0.0.0",
+        )
+        # Opt-in must be explicit; "0"/blank are not.
+        for falsy in ("", "0", "false", "no"):
+            with self.assertRaises(session_ui.BindRefusedError):
+                session_ui.resolve_bind_host(
+                    "0.0.0.0", environ={"SESSION_UI_ALLOW_NON_LOOPBACK": falsy}
+                )
+
+    def test_loopback_variants_are_accepted(self) -> None:
+        for host in ("127.0.0.1", "127.0.0.53", "::1", "localhost"):
+            self.assertEqual(session_ui.resolve_bind_host(host, environ={}), host)
+
+    def test_main_refuses_non_loopback_and_exits_nonzero(self) -> None:
+        env = {
+            "ENV_FILE": str(self.env_path),
+            "HEARTBEAT_FILE": str(self.heartbeat_path),
+            "SESSION_UI_HOST": "0.0.0.0",
+            "SESSION_UI_PORT": "0",
+        }
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            rc = session_ui.main([], environ=env)
+
+        self.assertNotEqual(rc, 0)
+        self.assertIn("loopback", stderr.getvalue().lower())
+
+    def test_port_from_settings(self) -> None:
+        settings = session_ui.load_settings(environ={"SESSION_UI_PORT": "9123"})
+
+        self.assertEqual(settings.port, 9123)
+        self.assertEqual(session_ui.load_settings(environ={}).port, 8765)
+
+
+class SettingsTests(unittest.TestCase):
+    """Environment-driven settings, injected as a mapping (never os.environ)."""
+
+    def test_portal_timeout_is_bounded(self) -> None:
+        default = session_ui.load_settings(environ={})
+        self.assertGreater(default.portal_timeout, 0)
+        self.assertLessEqual(default.portal_timeout, 60)
+
+        huge = session_ui.load_settings(environ={"SESSION_UI_PORTAL_TIMEOUT": "9999"})
+        self.assertLessEqual(huge.portal_timeout, 60)
+
+        tiny = session_ui.load_settings(environ={"SESSION_UI_PORTAL_TIMEOUT": "0.01"})
+        self.assertGreaterEqual(tiny.portal_timeout, 1.0)
+
+    def test_bad_port_falls_back_to_default(self) -> None:
+        self.assertEqual(
+            session_ui.load_settings(environ={"SESSION_UI_PORT": "not-a-port"}).port, 8765
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

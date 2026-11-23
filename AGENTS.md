@@ -31,6 +31,7 @@ local, but that is incidental — do not treat it as a second permitted leaf.
 | `tracker.py` | Daemon loop, `run_cycle`, CLI. Orchestration only. |
 | `notifiers.py` | Push backends + `dispatch_all`. |
 | `probe.py` | Standalone diagnostic CLI; the one sanctioned raw-HTML consumer. |
+| `session_ui.py` | Opt-in renewal page (`http.server`, loopback-only). `GET /` renders `heartbeat.json` read-only; `POST /` normalizes a pasted cookie, verifies it with `SisClient.fetch_roster()`, then rewrites only `SIS_SESSION_ID` via `config.write_session_id()`. One `guard_request` gate. No Docker access. |
 
 `ARCHITECTURE.md` is the reference for behaviour and failure modes. Read it before changing
 policy or the duplication rules.
