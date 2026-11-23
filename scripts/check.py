@@ -260,21 +260,57 @@ def _looks_like_type_union(node: ast.BinOp) -> bool:
 def _is_type_operand(node: ast.AST) -> bool:
     """True when ``node`` reads as a type rather than a runtime value.
 
-    ``Class``/``int``/``list[int]`` qualify; ``re.IGNORECASE`` and
-    ``fcntl.LOCK_EX`` do not, which is why the test is "starts with a capital
-    and is not ALL_CAPS" -- constants and flag sets are the common lawful
-    ``|`` expressions in this codebase.
+    ``Class``/``int``/``list[int]`` qualify; ``re.IGNORECASE``,
+    ``fcntl.LOCK_EX`` and ``rows[0]`` do not. Two rules do the work:
+
+    * a bare name or attribute counts only when it is capitalised and not
+      ALL_CAPS -- constants and flag sets are the common lawful ``|``
+      expressions in this codebase;
+    * a subscript counts only when it is a *generic type*: the value is a known
+      type name closing over types (``list[int]``, ``Optional[Config]``). A
+      subscript slicing a runtime container (``rows[0]``, ``env["A"]``) is not,
+      and treating every subscript as a type was a false alarm the docstring
+      above explicitly forbids.
     """
     if isinstance(node, ast.Name):
         return _looks_like_type_name(node.id)
     if isinstance(node, ast.Attribute):
         return _looks_like_type_name(node.attr)
+    if isinstance(node, ast.Constant):
+        # ``X | None`` is the common optional-union spelling; no other literal
+        # is a type.
+        return node.value is None
     if isinstance(node, ast.Subscript):
-        # ``list[int] | None`` and friends.
-        return True
+        return _is_generic_type(node)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
         return _looks_like_type_union(node)
     return False
+
+
+def _is_generic_type(node: ast.Subscript) -> bool:
+    """``list[int]``/``Optional[Config]`` yes; ``rows[0]``/``env["A"]`` no.
+
+    The base must itself read as a type, and every subscripted argument must be
+    either a type or an ``int`` (``tuple[int, str]``) -- so a container indexed
+    by a variable or a string literal is excluded.
+    """
+    return _is_type_operand(node.value) and all(
+        _is_type_argument(child) for child in _slice_elements(node.slice)
+    )
+
+
+def _slice_elements(node: ast.AST) -> list[ast.AST]:
+    """The subscript arguments, flattened from a tuple when present."""
+    if isinstance(node, ast.Tuple):
+        return list(node.elts)
+    return [node]
+
+
+def _is_type_argument(node: ast.AST) -> bool:
+    """A generic argument: a type, or an ``int`` literal for fixed tuples."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, int) and not isinstance(node.value, bool)
+    return _is_type_operand(node)
 
 
 def _looks_like_type_name(name: str) -> bool:
@@ -334,9 +370,14 @@ def check_shipped_modules(root: Path) -> list[str]:
 def _dockerfile_copies(root: Path) -> set[str] | None:
     """Top-level module names the Dockerfile's ``COPY`` instructions ship.
 
-    Handles backslash-continued instructions and ``--chown``-style flags. Only
-    explicitly named ``.py`` sources are collected: a directory or glob source
-    cannot be enumerated statically, so it contributes nothing.
+    Handles backslash-continued instructions and ``--chown``-style flags. Two
+    source shapes are understood:
+
+    * explicitly named ``*.py`` sources (``config.py``) contribute that name;
+    * a glob or bare directory source (``*.py ./``) is expanded against the
+      root, so a Dockerfile that copies everything is compared by what it
+      actually copies instead of reporting the literal ``*.py`` as a module
+      that is missing from the allowlist.
     """
     try:
         text = (root / "Dockerfile").read_text(encoding="utf-8")
@@ -351,9 +392,20 @@ def _dockerfile_copies(root: Path) -> set[str] | None:
         if len(parts) < 2:
             continue
         for source in parts[:-1]:
-            if source.endswith(".py"):
-                names.add(Path(source).stem)
+            names |= _copied_module_names(root, source)
     return names
+
+
+def _copied_module_names(root: Path, source: str) -> set[str]:
+    """The module names one ``COPY`` source contributes."""
+    if any(ch in source for ch in "*?["):
+        # A glob: expand it, so `*.py ./` compares by what it matches.
+        return {path.stem for path in root.glob(source) if path.name.endswith(".py")}
+    if source == "." or source == "./" or source.endswith("/"):
+        return {path.stem for path in root.glob("*.py")}
+    if source.endswith(".py"):
+        return {Path(source).stem}
+    return set()
 
 
 def run_checks(root: Path) -> tuple[list[str], str]:

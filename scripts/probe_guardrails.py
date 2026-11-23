@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Callable
 
@@ -26,8 +27,12 @@ CHECK = ROOT / "scripts" / "check.py"
 # The guardrail reads sources, the Dockerfile, and tests/ -- nothing else.
 COPIED_PATTERNS = ("*.py", "Dockerfile", "tests/*.py", "scripts/*.py")
 
-MUST_FAIL = "fail"
-MUST_PASS = "pass"
+
+class Expectation(Enum):
+    """What a well-behaved guardrail does with the probe's broken checkout."""
+
+    MUST_FAIL = "fail"
+    MUST_PASS = "pass"
 
 
 @dataclass(frozen=True)
@@ -36,7 +41,7 @@ class Probe:
 
     label: str
     break_it: Callable[[Path], None]
-    expectation: str = MUST_FAIL
+    expectation: Expectation = Expectation.MUST_FAIL
 
 
 def _write(root: Path, relative: str, source: str) -> None:
@@ -60,10 +65,48 @@ def _set_dockerfile(root: Path, transform: Callable[[str], str]) -> None:
     dockerfile.write_text(updated, encoding="utf-8")
 
 
+def _replace_copy_line(text: str, replacement: str) -> str:
+    """Swap the first ``COPY ... .py ...`` instruction for ``replacement``."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().upper().startswith("COPY") and ".py" in line:
+            lines[index] = replacement
+            return "\n".join(lines) + "\n"
+    raise AssertionError("probe precondition failed: Dockerfile has no COPY of .py files")
+
+
 PROBES = (
     Probe(
         "syntax error is reported, not raised",
         lambda root: _write(root, "zz_syntax.py", "def broken(:\n    pass\n"),
+    ),
+    Probe(
+        "3.10 match statement",
+        lambda root: _write(
+            root,
+            "zz_match.py",
+            "from __future__ import annotations\n"
+            "def pick(x):\n"
+            "    match x:\n"
+            "        case 1:\n"
+            "            return 'one'\n"
+            "    return None\n",
+        ),
+    ),
+    Probe(
+        "3.11 except* statement",
+        lambda root: _write(
+            root,
+            "zz_except_star.py",
+            "from __future__ import annotations\n"
+            "try:\n    pass\nexcept* TypeError:\n    pass\n",
+        ),
+    ),
+    Probe(
+        "3.12 type alias statement",
+        lambda root: _write(
+            root, "zz_typealias.py", "from __future__ import annotations\ntype X = int\n"
+        ),
     ),
     Probe(
         "non-UTF-8 bytes are reported, not raised",
@@ -96,7 +139,7 @@ PROBES = (
             "import math\nimport secrets\nimport configparser\n"
             "import statistics\nimport zoneinfo\nimport graphlib\n",
         ),
-        expectation=MUST_PASS,
+        expectation=Expectation.MUST_PASS,
     ),
     Probe(
         "test helper imported from a shipped module",
@@ -123,10 +166,32 @@ PROBES = (
         lambda root: _write(
             root,
             "zz_bitflags.py",
-            "from __future__ import annotations\nimport re\n"
-            "FLAGS = re.IGNORECASE | re.DOTALL\n",
+            "from __future__ import annotations\nimport re\nimport fcntl\n"
+            "FLAGS = re.IGNORECASE | re.DOTALL\nLOCK = fcntl.LOCK_EX | fcntl.LOCK_NB\n",
         ),
-        expectation=MUST_PASS,
+        expectation=Expectation.MUST_PASS,
+    ),
+    Probe(
+        "legal bit-or on indexed values is not a union",
+        lambda root: _write(
+            root,
+            "zz_subscript.py",
+            "from __future__ import annotations\n"
+            "rows = [{1}, {2}]\n"
+            "env = {'A': 1, 'B': 2}\n"
+            "Mask = rows[0] | rows[1]\n"
+            "Both = env['A'] | env['B']\n",
+        ),
+        expectation=Expectation.MUST_PASS,
+    ),
+    Probe(
+        "subscripted type annotation is a union",
+        lambda root: _write(
+            root,
+            "zz_generic.py",
+            "from __future__ import annotations\n"
+            "Alias = list[int] | None\n",
+        ),
     ),
     Probe(
         "Dockerfile drops a module",
@@ -135,6 +200,14 @@ PROBES = (
     Probe(
         "Dockerfile copies an unlisted module",
         lambda root: _set_dockerfile(root, lambda text: text + "\nCOPY zz_ghost.py ./\n"),
+    ),
+    Probe(
+        "Dockerfile glob COPY is compared by what it matches",
+        lambda root: _set_dockerfile(
+            root,
+            lambda text: _replace_copy_line(text, "COPY *.py ./"),
+        ),
+        expectation=Expectation.MUST_PASS,
     ),
 )
 
@@ -165,30 +238,21 @@ def _first_fail_line(output: str) -> str:
     return stripped[0] if stripped else "(no output)"
 
 
-def _judge(probe: Probe, result: subprocess.CompletedProcess[str]) -> str | None:
-    """Return a failure message, or None when the probe behaved."""
+def _outcome(probe: Probe, result: subprocess.CompletedProcess[str]) -> tuple[str | None, str]:
+    """Judge one probe: (failure message or None, the line worth printing)."""
     output = result.stdout + result.stderr
-    if probe.expectation == MUST_PASS:
+    if probe.expectation is Expectation.MUST_PASS:
         if result.returncode != 0:
-            return f"rejected a case it should accept ({_first_fail_line(output)})"
-        return None
+            fail = _first_fail_line(output)
+            return f"rejected a case it should accept ({fail})", fail
+        return None, "exit 0"
     if result.returncode == 0:
-        return "guardrail passed a case it should reject (exit 0)"
+        return "guardrail passed a case it should reject (exit 0)", "exit 0 (not caught)"
     if "Traceback (most recent call last)" in output:
-        return "raised a traceback instead of reporting a [FAIL] line"
+        return "raised a traceback instead of reporting a [FAIL] line", "traceback, not [FAIL]"
     if "[FAIL]" not in output:
-        return "failed without a [FAIL] line"
-    return None
-
-
-def _report(probe: Probe, result: subprocess.CompletedProcess[str], problem: str | None) -> None:
-    output = result.stdout + result.stderr
-    if problem:
-        print(f"[FAIL] {probe.label}: {problem}")
-    elif probe.expectation == MUST_PASS:
-        print(f"[PASS] {probe.label}: exit 0")
-    else:
-        print(f"[PASS] {probe.label}: {_first_fail_line(output)}")
+        return "failed without a [FAIL] line", output.strip()
+    return None, _first_fail_line(output)
 
 
 def main() -> int:
@@ -214,10 +278,12 @@ def main() -> int:
                 print(f"[SKIP] {probe.label}: {exc}")
                 continue
             result = _run(root)
-        problem = _judge(probe, result)
+        problem, detail = _outcome(probe, result)
         if problem:
             failures.append(f"{probe.label}: {problem}")
-        _report(probe, result, problem)
+            print(f"[FAIL] {probe.label}: {problem}")
+        else:
+            print(f"[PASS] {probe.label}: {detail}")
 
     total = len(PROBES) + 1
     if failures:

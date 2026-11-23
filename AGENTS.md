@@ -4,7 +4,7 @@
 
 ```bash
 python3 scripts/check.py                      # guardrails: 3.9 grammar, deferred annotations, stdlib-only, image parity
-python3 scripts/probe_guardrails.py           # proves check.py fails in every direction it claims
+python3 scripts/probe_guardrails.py           # 18 probes: proves check.py fails in every direction it claims
 python3 -m unittest discover -s tests -v      # the test suite
 ```
 
@@ -55,8 +55,10 @@ policy or the duplication rules.
 - **The stdlib allowlist is the 3.9 stdlib, not the running interpreter's.** A module added
   after 3.9 (`tomllib` in 3.11, `interpreters` in 3.14) must not be imported even though
   local dev has it — the image is 3.13 and the floor is 3.9.
-- **`Dockerfile` and `LOCAL_MODULES` move together.** Add a root module and you edit both,
-  or the image ships without it (`check.py` cross-checks the `COPY` line).
+- **`Dockerfile` `COPY`, `LOCAL_MODULES`, and the two doc tables move together.** Adding a root
+  module means editing `Dockerfile`, `LOCAL_MODULES` in `scripts/check.py`, the module map
+  here, and the module table in `ARCHITECTURE.md`. `check.py` enforces the first two; the
+  tables are on you.
 
 ## Tests
 
