@@ -96,6 +96,12 @@ STDLIB_MODULES = frozenset(
 
 _COPY_INSTRUCTION = re.compile(r"^\s*COPY\b(.*)$", re.IGNORECASE)
 
+# One module-map row, e.g. ``| `config.py` | Leaf. ... |``. Both ``AGENTS.md``
+# and ``ARCHITECTURE.md`` write their tables this way, and anchoring on the
+# leading pipe keeps prose mentions of a module from counting as a row.
+_DOC_MODULE_ROW = re.compile(r"^\|\s*`(\w+)\.py`\s*\|", re.MULTILINE)
+
+
 
 def _sources(root: Path) -> list[Path]:
     files: list[Path] = []
@@ -486,6 +492,45 @@ def _copied_module_names(root: Path, source: str) -> set[str]:
     return set()
 
 
+def check_doc_module_tables(root: Path) -> list[str]:
+    """The two documentation tables must list exactly the shipped modules.
+
+    ``AGENTS.md`` told the reader that ``check.py`` enforced only the Dockerfile
+    and ``LOCAL_MODULES``, leaving the tables "on you" -- and a subagent duly
+    skipped the ``AGENTS.md`` row while reporting the ticket done. A rule the
+    machine cannot see is a rule that rots: the module map is where an agent
+    learns what a module is for, so a missing row is a navigation hole, not a
+    cosmetic drift.
+
+    Rows are matched as ``| `name.py` |`` at the start of a line, which is how
+    both tables are written. A table is only checked when the file and its
+    header exist, so a doc that stops carrying a module map is reported rather
+    than silently skipped.
+    """
+    problems: list[str] = []
+    for doc in ("AGENTS.md", "ARCHITECTURE.md"):
+        path = root / doc
+        if not path.exists():
+            problems.append(f"{doc}: missing, cannot verify the module table")
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            problems.append(f"{doc}: unreadable, cannot verify the module table ({exc})")
+            continue
+        listed = set(_DOC_MODULE_ROW.findall(text))
+        if not listed:
+            problems.append(f"{doc}: no module table rows found")
+            continue
+        for name in sorted(LOCAL_MODULES - listed):
+            problems.append(f"{doc}: {name}.py ships but has no row in the module table")
+        for name in sorted(listed - LOCAL_MODULES):
+            problems.append(
+                f"{doc}: {name}.py has a module table row but is not a local module"
+            )
+    return problems
+
+
 def run_checks(root: Path) -> tuple[list[str], str]:
     """Return (problems, success summary) for one checkout."""
     paths = _sources(root)
@@ -495,10 +540,11 @@ def run_checks(root: Path) -> tuple[list[str], str]:
     problems += check_stdlib_only(root, trees)
     problems += check_import_graph(root, trees)
     problems += check_shipped_modules(root)
+    problems += check_doc_module_tables(root)
     summary = (
         f"OK: {len(trees)} files parse as Python {PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]}, "
         "annotations are deferred, imports are stdlib-only, module graph is acyclic, "
-        "local modules all ship."
+        "local modules all ship, and both module tables list them."
     )
     return problems, summary
 
