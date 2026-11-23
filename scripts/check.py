@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """Static guardrails for the COMSATS Portal Tracker.
 
-Three checks that the test suite cannot make for itself:
+Four checks that the test suite cannot make for itself:
 
 1. Python 3.9 grammar -- the container image runs a newer interpreter than the
    floor this project promises, so a 3.10+ construct (``match``, ``X | Y``
    annotations at runtime) would pass locally and break in the wild.
-2. Standard-library-only imports -- the project has no third-party
+2. Mandatory ``from __future__ import annotations`` -- what makes a ``X | Y``
+   annotation safe on 3.9. ``ast.parse(..., feature_version=(3, 9))`` accepts
+   ``int | str`` as ordinary bitwise-OR syntax, so the grammar check alone
+   cannot see the hazard; the future import is checked instead.
+3. Standard-library-only imports -- the project has no third-party
    dependencies by design; one stray ``pip install`` would break the image.
-3. Local module graph -- the flat modules must stay importable from a clean
-   checkout, which means no import of a module that is not shipped.
+   Test-sibling modules are only importable from files under ``tests/``.
+4. Shipped-module integrity -- every name in ``LOCAL_MODULES`` must exist as
+   ``<name>.py`` and appear in the ``Dockerfile``'s ``COPY``, and the
+   ``Dockerfile`` must copy nothing the allowlist does not know about.
+
+Each file is read and parsed once, so the checks all see the same syntax tree
+and a file that does not parse is reported instead of crashing the run.
 
 Run directly (``python3 scripts/check.py``) or via CI. Exit code 0 means clean.
 """
@@ -17,6 +26,7 @@ Run directly (``python3 scripts/check.py``) or via CI. Exit code 0 means clean.
 from __future__ import annotations
 
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -55,6 +65,8 @@ STDLIB_MODULES = frozenset(
     """.split()
 )
 
+_COPY_LINE = re.compile(r"^\s*COPY\b(.*)$", re.IGNORECASE)
+
 
 def _sources() -> list[Path]:
     files: list[Path] = []
@@ -63,26 +75,67 @@ def _sources() -> list[Path]:
     return [path for path in files if "__pycache__" not in path.parts]
 
 
-def check_grammar(paths: list[Path]) -> list[str]:
-    """Every file must parse under the oldest interpreter we support."""
+def _parse(paths: list[Path]) -> tuple[dict[Path, ast.AST], list[str]]:
+    """Parse every file once under the floor grammar.
+
+    Returns the trees that parsed plus the problems for the ones that did not.
+    Files that fail to parse are absent from the tree map, so later checks skip
+    them rather than crashing on the same syntax error a second time.
+    """
+    trees: dict[Path, ast.AST] = {}
     problems: list[str] = []
     for path in paths:
         try:
-            ast.parse(path.read_text(encoding="utf-8"), feature_version=PYTHON_FLOOR)
+            trees[path] = ast.parse(
+                path.read_text(encoding="utf-8"), feature_version=PYTHON_FLOOR
+            )
         except SyntaxError as exc:
             problems.append(
                 f"{path.relative_to(ROOT)}:{exc.lineno}: "
                 f"not valid Python {PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]}: {exc.msg}"
             )
+    return trees, problems
+
+
+def check_future_annotations(trees: dict[Path, ast.AST]) -> list[str]:
+    """Every file must opt into deferred annotations.
+
+    On 3.9 ``x: int | str`` evaluates ``int | str`` at function-definition time
+    and raises ``TypeError``; with the future import the annotation is a string
+    and never evaluates. The grammar floor cannot catch it, so the import is
+    mandatory -- the same rule ``AGENTS.md`` states.
+    """
+    problems: list[str] = []
+    for path, tree in trees.items():
+        if _has_future_annotations(tree):
+            continue
+        problems.append(
+            f"{path.relative_to(ROOT)}:1: missing 'from __future__ import annotations' "
+            f"(required: keeps 'X | Y' annotations from evaluating on "
+            f"{PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]})"
+        )
     return problems
 
 
-def check_stdlib_only(paths: list[Path]) -> list[str]:
+def _has_future_annotations(tree: ast.AST) -> bool:
+    for node in getattr(tree, "body", []):
+        if not isinstance(node, ast.ImportFrom) or node.module != "__future__":
+            continue
+        if any(alias.name == "annotations" for alias in node.names):
+            return True
+    return False
+
+
+def check_stdlib_only(trees: dict[Path, ast.AST]) -> list[str]:
     """No third-party imports: every top-level package must be stdlib or local."""
-    allowed = set(STDLIB_MODULES) | LOCAL_MODULES | _test_module_names(paths)
+    test_modules = _test_module_names()
     problems: list[str] = []
-    for path in paths:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    for path, tree in trees.items():
+        allowed = set(STDLIB_MODULES) | LOCAL_MODULES
+        if _is_test_file(path):
+            # Sibling helpers (``support_*``, ``test_*``) are only importable
+            # from inside tests/ -- shipped modules must not reach into them.
+            allowed |= test_modules
         for node in ast.walk(tree):
             for name in _imported_roots(node):
                 if name not in allowed:
@@ -93,9 +146,16 @@ def check_stdlib_only(paths: list[Path]) -> list[str]:
     return problems
 
 
-def _test_module_names(paths: list[Path]) -> set[str]:
+def _is_test_file(path: Path) -> bool:
+    return path.parent.name == "tests"
+
+
+def _test_module_names() -> set[str]:
     """Sibling test helpers are local modules too (``support_*``, ``test_*``)."""
-    return {path.stem for path in paths if path.parent.name == "tests"}
+    tests_dir = ROOT / "tests"
+    if not tests_dir.is_dir():
+        return set()
+    return {path.stem for path in tests_dir.glob("*.py")}
 
 
 def _imported_roots(node: ast.AST) -> list[str]:
@@ -110,24 +170,65 @@ def _imported_roots(node: ast.AST) -> list[str]:
 
 
 def check_shipped_modules() -> list[str]:
-    """Local imports must name a module that actually ships."""
+    """Local modules, the checkout, and the Dockerfile must agree."""
     problems: list[str] = []
     for name in sorted(LOCAL_MODULES):
         if not (ROOT / f"{name}.py").exists():
             problems.append(f"{name}.py: listed as a local module but missing")
+    copied = _dockerfile_copies()
+    if copied is None:
+        problems.append("Dockerfile: unreadable, cannot verify the image ships the modules")
+        return problems
+    for name in sorted(LOCAL_MODULES - copied):
+        problems.append(
+            f"{name}.py: listed as a local module but the Dockerfile does not COPY it"
+        )
+    for name in sorted(copied - LOCAL_MODULES):
+        problems.append(
+            f"{name}.py: COPY'd by the Dockerfile but missing from LOCAL_MODULES"
+        )
     return problems
+
+
+def _dockerfile_copies() -> set[str] | None:
+    """Top-level module names the Dockerfile's ``COPY`` instructions ship.
+
+    Handles backslash-continued instructions and ``--chown``-style flags. Only
+    explicitly named ``.py`` sources are collected: a directory or glob source
+    cannot be enumerated statically, so it contributes nothing.
+    """
+    dockerfile = ROOT / "Dockerfile"
+    if not dockerfile.is_file():
+        return None
+    text = dockerfile.read_text(encoding="utf-8").replace("\\\n", " ")
+    names: set[str] = set()
+    for line in text.splitlines():
+        match = _COPY_LINE.match(line)
+        if not match:
+            continue
+        parts = [part for part in match.group(1).split() if not part.startswith("--")]
+        if len(parts) < 2:
+            continue
+        for source in parts[:-1]:
+            if not source.endswith(".py"):
+                continue
+            names.add(Path(source).stem)
+    return names
 
 
 def main() -> int:
     paths = _sources()
-    problems = check_grammar(paths) + check_stdlib_only(paths) + check_shipped_modules()
+    trees, problems = _parse(paths)
+    problems += check_future_annotations(trees)
+    problems += check_stdlib_only(trees)
+    problems += check_shipped_modules()
     if problems:
         for problem in problems:
             print(f"[FAIL] {problem}", file=sys.stderr)
         print(f"\n{len(problems)} problem(s) found.", file=sys.stderr)
         return 1
-    print(f"OK: {len(paths)} files parse as Python {PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]}, "
-          f"imports are stdlib-only, local modules all ship.")
+    print(f"OK: {len(trees)} files parse as Python {PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]}, "
+          "annotations are deferred, imports are stdlib-only, local modules all ship.")
     return 0
 
 
