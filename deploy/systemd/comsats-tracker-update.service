@@ -1,0 +1,30 @@
+# Copy to /etc/systemd/system/comsats-tracker-update.service and adjust the two
+# paths in WorkingDirectory and ExecStart. Everything else can stay as is.
+#
+# One shot: pull, recreate only if the image ID moved, prune superseded images.
+# The timer beside this file runs it every fifteen minutes.
+#
+# The prune inside the script is restricted to images carrying this project's
+# org.opencontainers.image.source label. That restriction is deliberate and
+# load-bearing: this host also runs unrelated services (media servers, download
+# clients, ...), and an unscoped `docker image prune` -- or one filtered by name
+# or tag prefix -- would delete their images. Do not widen it.
+[Unit]
+Description=COMSATS Portal Tracker image update
+Documentation=https://github.com/Fe4rlessCloak/COMSATS-Portal-Tracker
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Adjust to the directory holding docker-compose.yml, .env and data/.
+WorkingDirectory=/path/to/COMSATS-Portal-Tracker
+ExecStart=/usr/bin/env bash /path/to/COMSATS-Portal-Tracker/deploy/systemd/comsats-tracker-update.sh
+# A pull over a slow link can outlast the default; the job is idempotent, so a
+# timeout costs one interval and nothing else.
+TimeoutStartSec=300
+# The tracker's own log lives in `docker compose logs`; this unit's stdout goes
+# to the journal, which is what `journalctl -u comsats-tracker-update` reads.
+StandardOutput=journal
+StandardError=journal
