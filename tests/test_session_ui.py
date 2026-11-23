@@ -823,6 +823,61 @@ class CrossSitePostTests(_ServerTestCase):
             self.assertNotIn(token, body)
         self.assertNotIn("quiet_cookie", body)
 
+    def test_proxied_https_origin_matching_host_is_accepted(self) -> None:
+        """Behind `tailscale serve` the browser sends https:// while we are http://.
+
+        The Origin/Host comparison must therefore ignore the scheme, or every real
+        submission through the proxy would be refused.
+        """
+        status, _ = self.post(
+            "proxied_cookie",
+            headers={
+                "Origin": f"https://{self.host_header}",
+                "Sec-Fetch-Site": "same-origin",
+                "Host": self.host_header,
+            },
+        )
+
+        self.assertEqual(status, 200)
+
+    def test_null_origin_is_refused(self) -> None:
+        """`Origin: null` is an opaque origin (sandboxed frame, file://) — never us."""
+        status, _ = self.post(
+            "null_origin_cookie",
+            headers={
+                "Origin": "null",
+                "Sec-Fetch-Site": "same-origin",
+                "Host": self.host_header,
+            },
+        )
+
+        self.assertEqual(status, 403)
+
+    def test_origin_with_userinfo_does_not_match(self) -> None:
+        status, _ = self.post(
+            "userinfo_cookie",
+            headers={
+                "Origin": f"https://evil.example@{self.host_header}",
+                "Sec-Fetch-Site": "same-origin",
+                "Host": self.host_header,
+            },
+        )
+
+        self.assertEqual(status, 403)
+
+    def test_origin_scheme_only_difference_is_allowed_but_host_must_match(self) -> None:
+        """A different host with the same scheme is still cross-site."""
+        status, _ = self.post(
+            "other_host_cookie",
+            headers={
+                "Origin": "https://elsewhere.example",
+                "Sec-Fetch-Site": "same-origin",
+                "Host": self.host_header,
+            },
+        )
+
+        self.assertEqual(status, 403)
+
 
 class GateOrderTests(_ServerTestCase):
     """The user check runs first, so a wrong login never reaches the CSRF path."""

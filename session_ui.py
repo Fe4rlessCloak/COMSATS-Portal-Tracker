@@ -196,9 +196,11 @@ def _origin_authority(origin: str) -> str:
         return ""
     if not parts.scheme or not parts.netloc:
         return ""
-    # Drop any userinfo; a browser never sends it, and it must not help a match.
-    authority = parts.netloc.rsplit("@", 1)[-1]
-    return authority.lower()
+    # A browser never puts userinfo in Origin, and stripping it would let
+    # ``https://evil.example@our-host`` match us. Refuse rather than normalize.
+    if "@" in parts.netloc:
+        return ""
+    return parts.netloc.lower()
 
 
 def _is_loopback(host: str) -> bool:
