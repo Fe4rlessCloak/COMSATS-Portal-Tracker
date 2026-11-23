@@ -28,11 +28,35 @@
 # Nothing is deleted if a container is still using it: `docker image rm` without
 # `--force` refuses in-use images, and this script never forces. A refused
 # removal is a warning, not a failure; the next run retries.
+#
+# Why the opt-in profile is detected rather than always passed
+# -----------------------------------------------------------
+# `session-ui` is a Compose *profile*: plain `docker compose pull` and
+# `docker compose up -d` act on the default profile only and are documented to
+# leave profiled services alone. A host that ran
+# `docker compose --profile session-ui up -d` would therefore keep the previous
+# image in `comsats-session-ui` forever while the tracker moved to the new one
+# -- the two containers would share a tag but run different builds, silently.
+# Passing `--profile session-ui` unconditionally would fix that by *starting a
+# service the operator never enabled*, which is worse: the default install must
+# stay tracker-only.
+#
+# So the script asks the daemon whether that container exists at all
+# (`docker inspect`, which fails when it does not) and adds the profile to both
+# the pull and the up only when it does. A tracker-only host's Compose
+# invocations stay byte-identical, and an enabled host's UI is updated in the
+# same run that updates the tracker. A container that exists but was stopped by
+# hand still counts as enabled -- otherwise stopping the page once would strand
+# it on a stale image.
 
 set -euo pipefail
 
 IMAGE="ghcr.io/fe4rlesscloak/comsats-portal-tracker:latest"
 CONTAINER="comsats-portal-tracker"
+# The opt-in service, as declared in docker-compose.yml. Different name on
+# purpose: `docker inspect` must be able to tell the two apart.
+SESSION_UI_CONTAINER="comsats-session-ui"
+SESSION_UI_PROFILE="session-ui"
 SOURCE_LABEL="org.opencontainers.image.source=https://github.com/Fe4rlessCloak/COMSATS-Portal-Tracker"
 PRUNE_FILTER="label=${SOURCE_LABEL}"
 
@@ -69,8 +93,17 @@ log() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 
 compose() {
-    "$DOCKER" compose --project-directory "$STACK_DIR" -f "$COMPOSE_FILE" "$@"
+    "$DOCKER" compose --project-directory "$STACK_DIR" -f "$COMPOSE_FILE" \
+        ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} "$@"
 }
+
+# `--profile` is a global Compose flag, so it has to sit with `-f` and before
+# the subcommand -- hence the array threaded through `compose()` rather than a
+# suffix on each call. Empty unless the opt-in container exists (see the header).
+PROFILE_ARGS=()
+if "$DOCKER" inspect --format '{{.Name}}' "$SESSION_UI_CONTAINER" >/dev/null 2>&1; then
+    PROFILE_ARGS=(--profile "$SESSION_UI_PROFILE")
+fi
 
 # `docker images -q` is not consistent about the digest algorithm prefix: with
 # `--no-trunc` some daemons print the bare hex, while `image inspect {{.Id}}`
@@ -93,6 +126,11 @@ container_image_id() {
 
 if [ "$DRY_RUN" -eq 1 ]; then
     log "dry run: no pull, no recreate, no deletion"
+    if [ "${#PROFILE_ARGS[@]}" -gt 0 ]; then
+        log "compose scope: default profile + ${SESSION_UI_PROFILE} (${SESSION_UI_CONTAINER} exists)"
+    else
+        log "compose scope: default profile only (${SESSION_UI_CONTAINER} absent)"
+    fi
 else
     log "pulling ${IMAGE}"
     compose pull
