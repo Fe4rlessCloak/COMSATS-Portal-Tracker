@@ -54,10 +54,14 @@ SERVICE_UNIT = DEPLOY / "comsats-tracker-update.service"
 TIMER_UNIT = DEPLOY / "comsats-tracker-update.timer"
 UPDATE_SCRIPT = DEPLOY / "comsats-tracker-update.sh"
 README = ROOT / "README.md"
+ENV_EXAMPLE = ROOT / ".env.example"
 
 IMAGE = "ghcr.io/fe4rlesscloak/comsats-portal-tracker:latest"
 IMAGE_REPO = "ghcr.io/fe4rlesscloak/comsats-portal-tracker"
 CONTAINER = "comsats-portal-tracker"
+SESSION_UI = "session-ui"
+SESSION_UI_CONTAINER = "comsats-session-ui"
+SESSION_UI_PROFILE = "session-ui"
 REPO_URL = "https://github.com/Fe4rlessCloak/COMSATS-Portal-Tracker"
 SOURCE_LABEL = f"org.opencontainers.image.source={REPO_URL}"
 PRUNE_FILTER = f"label={SOURCE_LABEL}"
@@ -67,6 +71,29 @@ ENVIRONMENT = {
     "STATE_FILE": "/app/data/state.json",
     "HEARTBEAT_FILE": "/app/data/heartbeat.json",
 }
+
+# The UI container cannot be reached through a published port while it binds the
+# container's own loopback, so it binds 0.0.0.0 *inside* the container and the
+# host side of the mapping is what restricts it to 127.0.0.1.
+#
+# `SESSION_UI_ALLOWED_USER` is interpolated from the host's .env rather than
+# hardcoded: `session_ui.py` reads its settings from the process environment, so
+# without this the allowlist documented in .env would be a silent no-op inside
+# the container. `SIS_SESSION_ID` and the notifier tokens are deliberately NOT
+# interpolated -- they stay in the mounted file, out of `docker inspect`.
+SESSION_UI_ENVIRONMENT = {
+    "ENV_FILE": "/app/config/.env",
+    "HEARTBEAT_FILE": "/app/data/heartbeat.json",
+    "SESSION_UI_HOST": "0.0.0.0",
+    "SESSION_UI_PORT": "${SESSION_UI_PORT:-8765}",
+    "SESSION_UI_PORTAL_TIMEOUT": "${SESSION_UI_PORTAL_TIMEOUT:-15}",
+    "SESSION_UI_ALLOW_NON_LOOPBACK": "1",
+    "SESSION_UI_ALLOWED_USER": "${SESSION_UI_ALLOWED_USER:-}",
+}
+
+SESSION_UI_PORTS = [
+    "127.0.0.1:${SESSION_UI_PORT:-8765}:${SESSION_UI_PORT:-8765}"
+]
 
 CURRENT = "sha256:" + "1" * 64
 PREVIOUS = "sha256:" + "2" * 64
@@ -142,6 +169,105 @@ class ComposeShapeTests(unittest.TestCase):
             self.assertNotIn(key, _tracker(_compose_yaml(OVERRIDE)), key)
 
 
+class SessionUiComposeShapeTests(unittest.TestCase):
+    """The opt-in service, read straight from the shipped file.
+
+    `session-ui` must be a *second* service in the same file under a profile:
+    a separate Compose file would drift from `tracker`'s image and mounts, and
+    no profile would put the UI on a host that only ever ran the tracker.
+    """
+
+    def setUp(self) -> None:
+        self.document = _compose_yaml(COMPOSE)
+        self.service = self.document["services"][SESSION_UI]
+
+    def test_lives_under_the_session_ui_profile(self) -> None:
+        self.assertEqual(self.service["profiles"], [SESSION_UI_PROFILE])
+
+    def test_reuses_the_tracker_image_and_never_builds_it(self) -> None:
+        self.assertEqual(self.service["image"], IMAGE)
+        self.assertNotIn("build", self.service)
+        self.assertNotIn("pull_policy", self.service)
+
+    def test_has_its_own_container_name_and_restart_policy(self) -> None:
+        self.assertEqual(self.service["container_name"], SESSION_UI_CONTAINER)
+        self.assertEqual(self.service["restart"], "unless-stopped")
+        self.assertNotEqual(self.service["container_name"], CONTAINER)
+
+    def test_publishes_only_on_host_loopback(self) -> None:
+        """A bare `8765:8765` would publish on every interface, not just loopback."""
+        self.assertEqual(self.service["ports"], SESSION_UI_PORTS)
+        for mapping in self.service["ports"]:
+            self.assertTrue(
+                str(mapping).startswith("127.0.0.1:"),
+                f"{mapping!r} must name 127.0.0.1 as the host address",
+            )
+
+    def test_mounts_config_read_write_and_data_read_only(self) -> None:
+        self.assertEqual(
+            _volume_map(self.service), {"/app/config": False, "/app/data": True}
+        )
+
+    def test_tracker_keeps_its_read_only_config_mount(self) -> None:
+        self.assertEqual(
+            _volume_map(_tracker(self.document)), {"/app/config": True, "/app/data": False}
+        )
+
+    def test_grants_no_docker_access(self) -> None:
+        text = COMPOSE.read_text(encoding="utf-8")
+        self.assertNotIn("docker.sock", text)
+        for key in ("privileged", "pid", "network_mode", "cap_add", "devices"):
+            self.assertNotIn(key, self.service, key)
+
+    def test_runs_the_module_with_the_shared_env_contract(self) -> None:
+        self.assertEqual(_env_map(self.service), SESSION_UI_ENVIRONMENT)
+        command = " ".join(str(part) for part in self.service["command"])
+        self.assertIn("session_ui.py", command)
+        self.assertIn("-u", command.split())
+
+    def test_binds_the_container_wildcard_only_with_the_opt_in(self) -> None:
+        """The loopback guarantee now lives in the port mapping, not the bind.
+
+        A process bound to the container's own 127.0.0.1 is unreachable through
+        a published port (Docker forwards to the container's eth0), so this
+        service binds 0.0.0.0 *inside* and the `127.0.0.1:` host prefix is what
+        keeps it off the LAN and off other Tailscale ports.
+        """
+        environment = _env_map(self.service)
+        self.assertEqual(environment["SESSION_UI_HOST"], "0.0.0.0")
+        self.assertEqual(environment["SESSION_UI_ALLOW_NON_LOOPBACK"], "1")
+        self.assertTrue(self.service["ports"][0].startswith("127.0.0.1:"))
+
+    def test_declares_no_tracker_only_setting(self) -> None:
+        """STATE_FILE would point at a read-only mount the UI never needs."""
+        self.assertNotIn("STATE_FILE", _env_map(self.service))
+
+    def test_never_interpolates_a_secret_into_the_container_environment(self) -> None:
+        """`docker inspect` prints environment; .env's secrets must not be there.
+
+        Only the UI's own allowlist and port are interpolated. The session
+        cookie and notifier tokens stay in the mounted `/app/config/.env`,
+        which the process reads itself.
+        """
+        service = self.service
+        environment = _env_map(service)
+        for forbidden in ("SIS_SESSION_ID", "SIS_USER_AGENT", "NTFY_TOKEN", "WEBHOOK_URL"):
+            self.assertNotIn(forbidden, environment, forbidden)
+        interpolated = re.findall(r"\$\{([A-Z_]+)", COMPOSE.read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(interpolated),
+            {"SESSION_UI_PORT", "SESSION_UI_PORTAL_TIMEOUT", "SESSION_UI_ALLOWED_USER"},
+        )
+
+    def test_port_mapping_and_listener_use_the_same_variable(self) -> None:
+        """A host port and container port that disagreed would be a dead page."""
+        environment = _env_map(self.service)
+        mapping = self.service["ports"][0]
+        self.assertEqual(environment["SESSION_UI_PORT"], "${SESSION_UI_PORT:-8765}")
+        self.assertEqual(mapping, "127.0.0.1:${SESSION_UI_PORT:-8765}:${SESSION_UI_PORT:-8765}")
+
+
+
 def _docker_compose_available() -> bool:
     if shutil.which("docker") is None:
         return False
@@ -161,10 +287,14 @@ def _docker_compose_available() -> bool:
 class ComposeResolutionTests(unittest.TestCase):
     """`docker compose config` is what the host runs -- assert on its output."""
 
-    def _resolve(self, *files: str) -> Dict[str, Any]:
+    def _resolve(
+        self, *files: str, profiles: tuple = ()
+    ) -> Dict[str, Any]:
         command = ["docker", "compose"]
         for name in files:
             command += ["-f", name]
+        for profile in profiles:
+            command += ["--profile", profile]
         command += ["config", "--format", "json"]
         result = subprocess.run(
             command, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -199,6 +329,55 @@ class ComposeResolutionTests(unittest.TestCase):
             }
             self.assertEqual(volumes, {"/app/config": True, "/app/data": False}, files)
 
+    def test_default_shape_omits_the_session_ui_service(self) -> None:
+        """The whole point of the profile: plain `up -d` starts only the tracker."""
+        services = self._resolve("docker-compose.yml")["services"]
+        self.assertNotIn(SESSION_UI, services)
+        self.assertIn("tracker", services)
+
+    def test_both_default_shapes_omit_the_session_ui_service(self) -> None:
+        for files in (
+            ("docker-compose.yml",),
+            ("docker-compose.yml", "docker-compose.local.yml"),
+        ):
+            services = self._resolve(*files)["services"]
+            self.assertNotIn(SESSION_UI, services, files)
+
+    def test_profile_shape_publishes_the_ui_on_host_loopback(self) -> None:
+        service = self._resolve("docker-compose.yml", profiles=(SESSION_UI_PROFILE,))[
+            "services"
+        ][SESSION_UI]
+        self.assertEqual(service["image"], IMAGE)
+        host_ips = [port.get("host_ip") for port in service["ports"]]
+        self.assertEqual(host_ips, ["127.0.0.1"])
+        published = [port.get("published") for port in service["ports"]]
+        self.assertEqual(published, ["8765"])
+        self.assertEqual(service["container_name"], SESSION_UI_CONTAINER)
+        volumes = {
+            volume["target"]: volume.get("read_only", False)
+            for volume in service["volumes"]
+        }
+        self.assertEqual(volumes, {"/app/config": False, "/app/data": True})
+
+    def test_profile_shape_grants_no_docker_socket(self) -> None:
+        resolved = self._resolve("docker-compose.yml", profiles=(SESSION_UI_PROFILE,))
+        self.assertNotIn("docker.sock", json.dumps(resolved))
+
+    def test_all_four_shapes_resolve(self) -> None:
+        """`--profile` and `-f` layering are orthogonal; every pair must parse."""
+        for files in (
+            ("docker-compose.yml",),
+            ("docker-compose.yml", "docker-compose.local.yml"),
+        ):
+            for profiles in ((), (SESSION_UI_PROFILE,)):
+                resolved = self._resolve(*files, profiles=profiles)
+                self.assertIn("tracker", resolved["services"], (files, profiles))
+                self.assertEqual(
+                    SESSION_UI in resolved["services"],
+                    bool(profiles),
+                    (files, profiles),
+                )
+
 
 # A stub `docker` that answers the four questions the update script asks and logs
 # every invocation, so the script's behaviour is assertable offline: no daemon,
@@ -217,8 +396,14 @@ if [ "$1" = "image" ]; then
   exit 0
 fi
 if [ "$1" = "inspect" ]; then
-  if [ -f "$STUB_DIR/container_id" ]; then cat "$STUB_DIR/container_id"; else exit 1; fi
-  exit 0
+  # The container name is the last argument; a per-name file lets a test keep a
+  # tracker-only host and an enabled session-ui host apart.
+  for arg in "$@"; do name="$arg"; done
+  if [ -f "$STUB_DIR/container_id.$name" ]; then cat "$STUB_DIR/container_id.$name"; exit 0; fi
+  if [ "$name" = "comsats-portal-tracker" ] && [ -f "$STUB_DIR/container_id" ]; then
+    cat "$STUB_DIR/container_id"; exit 0
+  fi
+  exit 1
 fi
 if [ "$1" = "images" ]; then
   cat "$STUB_DIR/label_ids" 2>/dev/null || exit 0
@@ -228,8 +413,8 @@ exit 0
 """
 
 
-class UpdateScriptTests(unittest.TestCase):
-    """Drive the script against a stub `docker` and read the call log."""
+class UpdateScriptCase(unittest.TestCase):
+    """Shared harness: a stub `docker`, a temp stack, and a recorded call log."""
 
     def setUp(self) -> None:
         self.assertTrue(
@@ -299,6 +484,10 @@ class UpdateScriptTests(unittest.TestCase):
             if call.startswith("compose") and f" {verb} " in call + " "
         ]
 
+
+class UpdateScriptTests(UpdateScriptCase):
+    """Drive the script against a stub `docker` and read the call log."""
+
     def test_runs_compose_from_the_stack_directory(self) -> None:
         self._state(CURRENT, CURRENT)
         self._labels(CURRENT)
@@ -313,8 +502,13 @@ class UpdateScriptTests(unittest.TestCase):
         self._labels(CURRENT, PREVIOUS)
         self._run()
         calls = self._calls()
-        self.assertTrue(calls[0].startswith("compose"), calls)
-        self.assertIn("pull", calls[0])
+        # A `docker inspect` probe for the opt-in UI container comes first; the
+        # ordering that matters is pull -> up -> prune, never a deletion before
+        # the pull that could still need the old image.
+        compose_calls = [call for call in calls if call.startswith("compose")]
+        self.assertTrue(compose_calls, calls)
+        self.assertIn(" pull ", compose_calls[0] + " ")
+        self.assertLess(calls.index(compose_calls[0]), calls.index(self._compose_calls("up")[0]))
 
     def test_unchanged_image_does_not_recreate_the_container(self) -> None:
         self._state(CURRENT, CURRENT)
@@ -466,6 +660,107 @@ class UpdateScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
 
+class UpdateScriptProfileTests(UpdateScriptCase):
+    """An enabled `session-ui` must be pulled and recreated by the same update.
+
+    `docker compose pull` and `docker compose up -d` without `--profile` act on
+    the default profile only, so a host that once ran
+    `docker compose --profile session-ui up -d` would keep the *old* image in
+    that container forever -- the tracker would update and the UI beside it
+    would silently not. The script therefore probes for the container and adds
+    the profile to both calls only when it exists, which keeps a tracker-only
+    host's call log byte-identical.
+    """
+
+    def _ui_container(self, running: bool = True) -> None:
+        (self.state / f"container_id.{SESSION_UI_CONTAINER}").write_text(
+            "true" if running else "false", encoding="utf-8"
+        )
+
+    def test_tracker_only_host_passes_no_profile(self) -> None:
+        self._state(CURRENT, PREVIOUS)
+        self._labels(CURRENT, PREVIOUS)
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        for call in self._compose_calls("pull") + self._compose_calls("up"):
+            self.assertNotIn("--profile", call, call)
+
+    def test_enabled_ui_pulls_and_recreates_with_the_profile(self) -> None:
+        self._state(CURRENT, PREVIOUS)
+        self._labels(CURRENT, PREVIOUS)
+        self._ui_container()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        pulls = self._compose_calls("pull")
+        ups = self._compose_calls("up")
+        self.assertEqual(len(pulls), 1, self._calls())
+        self.assertEqual(len(ups), 1, self._calls())
+        for call in (pulls[0], ups[0]):
+            self.assertIn(f"--profile {SESSION_UI_PROFILE}", call, call)
+
+    def test_profile_is_passed_after_the_file_flag_not_before_it(self) -> None:
+        """`--profile` is a global flag; it belongs beside `-f`, before `pull`."""
+        self._state(CURRENT, PREVIOUS)
+        self._labels(CURRENT, PREVIOUS)
+        self._ui_container()
+        self._run()
+        call = self._compose_calls("pull")[0]
+        self.assertLess(call.index("-f"), call.index("--profile"), call)
+        self.assertLess(call.index("--profile"), call.index("pull"), call)
+
+    def test_enabled_ui_alone_does_not_force_a_recreate(self) -> None:
+        """An unchanged image stays untouched, UI present or not."""
+        self._state(CURRENT, CURRENT)
+        self._labels(CURRENT)
+        self._ui_container()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self._compose_calls("up"), [])
+        self.assertIn(f"--profile {SESSION_UI_PROFILE}", self._compose_calls("pull")[0])
+
+    def test_a_stopped_ui_container_still_counts_as_enabled(self) -> None:
+        """Stopping it by hand must not strand it on the previous image."""
+        self._state(CURRENT, PREVIOUS)
+        self._labels(CURRENT, PREVIOUS)
+        self._ui_container(running=False)
+        self._run()
+        self.assertIn(
+            f"--profile {SESSION_UI_PROFILE}", self._compose_calls("up")[0]
+        )
+
+    def test_dry_run_names_the_profile_it_would_use(self) -> None:
+        self._state(CURRENT, PREVIOUS)
+        self._labels(CURRENT, PREVIOUS)
+        self._ui_container()
+        result = self._run("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self._compose_calls("pull"), [])
+        # Assert the resolved scope message, not a bare substring: the
+        # container name `comsats-session-ui` also contains "session-ui", so a
+        # substring check would pass on the wrong branch.
+        self.assertIn(f"default profile + {SESSION_UI_PROFILE}", result.stdout)
+
+    def test_dry_run_says_tracker_only_when_the_ui_is_absent(self) -> None:
+        self._state(CURRENT, PREVIOUS)
+        self._labels(CURRENT, PREVIOUS)
+        result = self._run("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("compose scope: default profile only", result.stdout)
+        self.assertNotIn(f"+ {SESSION_UI_PROFILE}", result.stdout)
+
+    def test_probe_asks_only_about_the_ui_container(self) -> None:
+        self._state(CURRENT, CURRENT)
+        self._labels(CURRENT)
+        self._run()
+        probes = [
+            call
+            for call in self._calls()
+            if call.startswith("inspect") and SESSION_UI_CONTAINER in call
+        ]
+        self.assertEqual(len(probes), 1, self._calls())
+        self.assertIn(SESSION_UI_CONTAINER, probes[0])
+
+
 class UpdateScriptTextTests(unittest.TestCase):
     """The safety properties a call log cannot show: what it refuses to do."""
 
@@ -590,6 +885,66 @@ class ReadmeTests(unittest.TestCase):
         self.assertRegex(self.text, r"(?i)(no|without a|not)\b.{0,40}(source )?checkout")
 
 
+class ReadmeSessionUiTests(unittest.TestCase):
+    """The operator-facing guide for the opt-in profile (#13 story 17)."""
+
+    def setUp(self) -> None:
+        self.text = README.read_text(encoding="utf-8")
+
+    def test_has_an_optional_session_ui_section(self) -> None:
+        self.assertRegex(
+            self.text, r"(?m)^### Optional: session-renewal web page\b"
+        )
+
+    def test_documents_enabling_the_profile(self) -> None:
+        self.assertIn("--profile session-ui", self.text)
+
+    def test_documents_the_allowed_user_setting(self) -> None:
+        self.assertIn("SESSION_UI_ALLOWED_USER", self.text)
+
+    def test_documents_tailscale_serve(self) -> None:
+        self.assertRegex(self.text, r"tailscale serve")
+        self.assertRegex(self.text, r"(?m)^#{4} Publishing it privately with Tailscale Serve\b")
+
+    def test_pairs_the_profile_with_the_local_build_override(self) -> None:
+        self.assertIn(
+            "docker compose --profile session-ui -f docker-compose.yml "
+            "-f docker-compose.local.yml up -d --build",
+            self.text,
+        )
+
+    def test_states_the_page_is_off_by_default(self) -> None:
+        """An operator must learn it is opt-in before copying any command."""
+        self.assertRegex(self.text, r"(?i)\*\*off by default\*\*")
+        self.assertRegex(self.text, r"(?i)starts only the `tracker` service")
+
+    def test_names_no_real_host_or_unrelated_port(self) -> None:
+        for forbidden in ("100.", "192.168.", "10.0.0.", "8080", "9000", "32400"):
+            self.assertNotIn(forbidden, self.text, forbidden)
+
+
+class EnvExampleSessionUiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.text = ENV_EXAMPLE.read_text(encoding="utf-8")
+
+    def test_documents_the_profile_enablement(self) -> None:
+        self.assertIn("--profile session-ui", self.text)
+
+    def test_documents_allowed_user_once(self) -> None:
+        self.assertEqual(self.text.count("SESSION_UI_ALLOWED_USER="), 1)
+        self.assertIn("SESSION_UI_ALLOWED_USER=you@example.com", self.text)
+
+    def test_does_not_duplicate_the_lockdown_block(self) -> None:
+        """#17 documented the five settings; #18 extends, never repeats them."""
+        for name in (
+            "SESSION_UI_HOST=",
+            "SESSION_UI_PORT=",
+            "SESSION_UI_PORTAL_TIMEOUT=",
+            "SESSION_UI_ALLOW_NON_LOOPBACK=",
+        ):
+            self.assertEqual(self.text.count(name), 1, name)
+
+
 class HygieneTests(unittest.TestCase):
     """Committed templates and docs must carry no personal or secret material."""
 
@@ -601,6 +956,7 @@ class HygieneTests(unittest.TestCase):
             TIMER_UNIT,
             UPDATE_SCRIPT,
             README,
+            ENV_EXAMPLE,
         ]
 
     def test_no_credentials(self) -> None:
@@ -616,21 +972,37 @@ class HygieneTests(unittest.TestCase):
                 self.assertIsNone(re.search(pattern, text), f"{path.name}: {pattern}")
 
     def test_no_email_addresses(self) -> None:
-        for path in self.files:
-            self.assertIsNone(
-                re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", path.read_text(encoding="utf-8")),
-                path.name,
-            )
+        """`you@example.com` is documentation; anything routable is not.
 
-    def test_only_loopback_ip_literals(self) -> None:
+        `example.com`/`example.org`/`example.net` are IANA-reserved for exactly
+        this purpose, so the placeholder is exempt and a real address is not.
+        """
         for path in self.files:
-            found = set(
-                re.findall(
-                    r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
-                    path.read_text(encoding="utf-8"),
+            for found in re.findall(
+                r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", path.read_text(encoding="utf-8")
+            ):
+                domain = found.partition("@")[2].lower()
+                self.assertIn(
+                    domain,
+                    {"example.com", "example.org", "example.net"},
+                    f"{path.name}: {found}",
                 )
+
+    def test_only_loopback_and_unspecified_ip_literals(self) -> None:
+        """No routable address may be committed: no LAN, tailnet or public IP.
+
+        ``0.0.0.0`` is allowed but not as a published port: it is the *container*
+        bind the `session-ui` service needs for its published port to be
+        reachable, and a host-side ``0.0.0.0`` mapping would expose the page to
+        the whole network, which is what the loopback mapping exists to prevent.
+        """
+        for path in self.files:
+            text = path.read_text(encoding="utf-8")
+            found = set(
+                re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", text)
             )
-            self.assertEqual(found - {"127.0.0.1"}, set(), path.name)
+            self.assertEqual(found - {"127.0.0.1", "0.0.0.0"}, set(), path.name)
+            self.assertNotRegex(text, r"\"0\.0\.0\.0:\d", path.name)
 
     def test_no_host_specific_paths(self) -> None:
         for path in self.files:
