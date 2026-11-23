@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import sys
 import tempfile
 import threading
@@ -38,6 +39,16 @@ from support_portal_pages import SimulatedPortal  # noqa: E402
 SECRET_SESSION = "stored_session_sentinel_do_not_render"
 SECRET_TOKEN = "ntfy_token_sentinel_do_not_render"
 
+#: Marker telling the harness to fetch a real per-form token before submitting.
+_TOKEN_AUTO = object()
+
+#: The hidden per-form token a browser would echo back on submit.
+CSRF_INPUT_RE = re.compile(
+    r'<input[^>]*name="%s"[^>]*value="([^"]*)"'
+    % re.escape(session_ui.CSRF_FIELD),
+    re.IGNORECASE,
+)
+
 ENV_TEXT = (
     "# Tracker configuration — keep this comment\n"
     "\n"
@@ -62,6 +73,8 @@ class _ServerTestCase(unittest.TestCase):
 
     courses = COURSES
     env_text: Optional[str] = ENV_TEXT
+    #: Extra entries merged into the app's injected environment (never os.environ).
+    extra_environ: Optional[Dict[str, str]] = None
 
     def setUp(self) -> None:
         self.log_stream = io.StringIO()
@@ -79,16 +92,22 @@ class _ServerTestCase(unittest.TestCase):
     def make_portal(self) -> SimulatedPortal:
         return SimulatedPortal(courses=self.courses)
 
+    def app_environ(self) -> Dict[str, str]:
+        environ = {"SIS_BASE_URL": "https://sis.example.test"}
+        environ.update(self.extra_environ or {})
+        return environ
+
     def build_app(self, portal) -> "session_ui.SessionUiApp":
         return session_ui.build_app(
             self.env_path,
             self.heartbeat_path,
             transport=portal,
-            environ={"SIS_BASE_URL": "https://sis.example.test"},
+            environ=self.app_environ(),
         )
 
     def start_server(self, portal) -> Tuple["session_ui.ThreadingHTTPServer", threading.Thread]:
         app = self.build_app(portal)
+        self.app = app
         server = session_ui.create_server(app, port=0, log_stream=self.log_stream)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -108,15 +127,20 @@ class _ServerTestCase(unittest.TestCase):
 
     # -- HTTP -----------------------------------------------------------------
     def http(
-        self, method: str, path: str = "/", data: Optional[Dict[str, str]] = None
+        self,
+        method: str,
+        path: str = "/",
+        data: Optional[Dict[str, str]] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Tuple[int, str]:
         payload = None
-        headers = {"Accept": "text/html"}
+        sent = {"Accept": "text/html"}
         if data is not None:
             payload = urllib.parse.urlencode(data).encode("utf-8")
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            sent["Content-Type"] = "application/x-www-form-urlencoded"
+        sent.update(headers or {})
         request = urllib.request.Request(
-            self.base_url + path, data=payload, headers=headers, method=method
+            self.base_url + path, data=payload, headers=sent, method=method
         )
         try:
             with urllib.request.urlopen(request, timeout=10.0) as response:
@@ -127,11 +151,60 @@ class _ServerTestCase(unittest.TestCase):
             finally:
                 error.close()
 
-    def get(self, path: str = "/") -> Tuple[int, str]:
-        return self.http("GET", path)
+    def get(
+        self, path: str = "/", headers: Optional[Dict[str, str]] = None
+    ) -> Tuple[int, str]:
+        return self.http("GET", path, headers=headers)
 
-    def post(self, value: str) -> Tuple[int, str]:
-        return self.http("POST", data={session_ui.SESSION_FIELD: value})
+    @property
+    def host_header(self) -> str:
+        """The authority a browser would send as ``Host`` for this server."""
+        host, port = self.server.server_address[:2]
+        return f"{host}:{port}"
+
+    def same_origin_headers(self) -> Dict[str, str]:
+        """The headers a real browser sends when submitting this page's own form."""
+        return {
+            "Origin": f"http://{self.host_header}",
+            "Sec-Fetch-Site": "same-origin",
+            "Host": self.host_header,
+        }
+
+    def csrf_token(self, headers: Optional[Dict[str, str]] = None) -> Optional[str]:
+        """Fetch the form like a browser does and read its hidden token."""
+        _, body = self.get(headers=headers)
+        match = CSRF_INPUT_RE.search(body)
+        return match.group(1) if match else None
+
+    def wait_for_log(self, fragment: str, timeout: float = 5.0) -> str:
+        """Wait until ``fragment`` appears in the request log, then return it.
+
+        The server writes its one log line after flushing the response body, so a
+        client can return slightly before the line lands; this removes that race
+        without patching anything.
+        """
+        deadline = time.monotonic() + timeout
+        logged = self.log_stream.getvalue()
+        while fragment not in logged and time.monotonic() < deadline:
+            time.sleep(0.01)
+            logged = self.log_stream.getvalue()
+        return logged
+
+    def post(
+        self,
+        value: str,
+        headers: Optional[Dict[str, str]] = None,
+        token: object = _TOKEN_AUTO,
+    ) -> Tuple[int, str]:
+        """Submit the form the way the rendered page would, token included."""
+        data = {session_ui.SESSION_FIELD: value}
+        if headers is None:
+            headers = self.same_origin_headers()
+        if token is _TOKEN_AUTO:
+            token = self.csrf_token(headers=headers)
+        if isinstance(token, str):
+            data[session_ui.CSRF_FIELD] = token
+        return self.http("POST", data=data, headers=headers)
 
     # -- heartbeat ------------------------------------------------------------
     def write_heartbeat(self, **overrides) -> None:
@@ -431,6 +504,422 @@ class RequestGateSeamTests(_ServerTestCase):
         self.assertEqual(self.portal.request_count, 0)  # portal never contacted
 
 
+class TailscaleUserGateTests(_ServerTestCase):
+    """`SESSION_UI_ALLOWED_USER` gates every request on `Tailscale-User-Login`."""
+
+    extra_environ = {"SESSION_UI_ALLOWED_USER": "ahmed@example.com"}
+
+    def test_allowed_header_gets_the_status_page(self) -> None:
+        self.write_heartbeat()
+
+        status, body = self.get(headers={"Tailscale-User-Login": "ahmed@example.com"})
+
+        self.assertEqual(status, 200)
+        self.assertIn("3 courses tracked", body)
+
+    def test_missing_header_is_forbidden_without_side_effects(self) -> None:
+        self.write_heartbeat()
+        before = self.env_bytes()
+
+        get_status, get_body = self.get()
+        post_status, post_body = self.post("allowed_cookie")
+
+        self.assertEqual(get_status, 403)
+        self.assertEqual(post_status, 403)
+        self.assertIn("forbidden", get_body.lower())
+        self.assertEqual(self.env_bytes(), before)
+        self.assertEqual(self.portal.request_count, 0)
+
+    def test_mismatched_header_is_forbidden_without_side_effects(self) -> None:
+        before = self.env_bytes()
+
+        get_status, _ = self.get(headers={"Tailscale-User-Login": "someone@example.com"})
+        post_status, body = self.post(
+            "allowed_cookie", headers={"Tailscale-User-Login": "someone@example.com"}
+        )
+
+        self.assertEqual(get_status, 403)
+        self.assertEqual(post_status, 403)
+        self.assertIn("forbidden", body.lower())
+        self.assertEqual(self.env_bytes(), before)
+        self.assertEqual(self.portal.request_count, 0)
+
+    def test_case_insensitive_exact_match_succeeds(self) -> None:
+        status, _ = self.get(headers={"Tailscale-User-Login": "Ahmed@Example.COM"})
+
+        self.assertEqual(status, 200)
+
+    def test_allowlist_entry_case_does_not_matter(self) -> None:
+        app = session_ui.build_app(
+            self.env_path,
+            self.heartbeat_path,
+            transport=self.portal,
+            environ={"SESSION_UI_ALLOWED_USER": "AHMED@example.com"},
+        )
+
+        self.assertIsNone(
+            app.guard_request(
+                session_ui.Request(
+                    method="GET", path="/", headers={"Tailscale-User-Login": "ahmed@EXAMPLE.com"}
+                )
+            )
+        )
+
+    def test_prefix_and_suffix_logins_do_not_match(self) -> None:
+        """Lowercasing must not turn the comparison into a substring match."""
+        for impostor in (
+            "evil-ahmed@example.com",
+            "ahmed@example.com.evil.test",
+            "ahmed@example.co",
+            "ahmed@example.com,ahmed2@example.com",
+            "ahmed",
+        ):
+            with self.subTest(login=impostor):
+                status, _ = self.get(headers={"Tailscale-User-Login": impostor})
+                self.assertEqual(status, 403)
+
+    def test_padded_login_is_not_trimmed_into_a_match(self) -> None:
+        """An HTTP client strips OWS, so assert the comparison itself is strict."""
+        app = session_ui.build_app(
+            self.env_path,
+            self.heartbeat_path,
+            transport=self.portal,
+            environ={"SESSION_UI_ALLOWED_USER": "ahmed@example.com"},
+        )
+
+        for padded in (" ahmed@example.com", "ahmed@example.com ", "\tahmed@example.com"):
+            with self.subTest(login=padded):
+                blocked = app.guard_request(
+                    session_ui.Request(
+                        method="GET", path="/", headers={"Tailscale-User-Login": padded}
+                    )
+                )
+                self.assertIsNotNone(blocked)
+                self.assertEqual(blocked.status, 403)
+
+    def test_header_name_is_case_insensitive(self) -> None:
+        status, _ = self.get(headers={"tailscale-user-login": "ahmed@example.com"})
+
+        self.assertEqual(status, 200)
+
+    def test_unset_setting_leaves_the_page_open(self) -> None:
+        app = session_ui.build_app(
+            self.env_path, self.heartbeat_path, transport=self.portal, environ={}
+        )
+
+        self.assertIsNone(
+            app.guard_request(session_ui.Request(method="GET", path="/", headers={}))
+        )
+
+    def test_blank_setting_is_treated_as_unset(self) -> None:
+        app = session_ui.build_app(
+            self.env_path,
+            self.heartbeat_path,
+            transport=self.portal,
+            environ={"SESSION_UI_ALLOWED_USER": "   "},
+        )
+
+        self.assertIsNone(
+            app.guard_request(session_ui.Request(method="GET", path="/", headers={}))
+        )
+
+    def test_denied_response_never_leaks_the_expected_login(self) -> None:
+        status, body = self.get(headers={"Tailscale-User-Login": "someone@example.com"})
+
+        self.assertEqual(status, 403)
+        self.assertNotIn("ahmed@example.com", body)
+        self.assertNotIn("someone@example.com", body)
+        logged = self.wait_for_log("GET / -> 403")
+        self.assertNotIn("ahmed@example.com", logged)
+        self.assertNotIn("someone@example.com", logged)
+
+
+class CrossSitePostTests(_ServerTestCase):
+    """`POST /` rejects cross-site submissions and needs a per-form token."""
+
+    def same_origin_headers(self) -> Dict[str, str]:
+        return {
+            "Origin": f"http://{self.host_header}",
+            "Sec-Fetch-Site": "same-origin",
+            "Host": self.host_header,
+        }
+
+    def test_same_origin_browser_submission_succeeds(self) -> None:
+        status, body = self.post("same_origin_cookie", headers=self.same_origin_headers())
+
+        self.assertEqual(status, 200)
+        self.assertIn("saved", body.lower())
+        self.assertIn("SIS_SESSION_ID=same_origin_cookie\n", self.env_path.read_text("utf-8"))
+
+    def test_foreign_origin_is_forbidden_without_side_effects(self) -> None:
+        before = self.env_bytes()
+
+        status, body = self.post(
+            "cross_site_cookie",
+            headers={
+                "Origin": "https://evil.example",
+                "Sec-Fetch-Site": "cross-site",
+                "Host": self.host_header,
+            },
+        )
+
+        self.assertEqual(status, 403)
+        self.assertIn("forbidden", body.lower())
+        self.assertEqual(self.env_bytes(), before)
+        self.assertEqual(self.portal.request_count, 0)
+
+    def test_cross_site_fetch_site_is_forbidden(self) -> None:
+        for value in ("cross-site", "same-site"):
+            with self.subTest(sec_fetch_site=value):
+                before = self.env_bytes()
+                status, body = self.post(
+                    "cross_site_cookie",
+                    headers={
+                        "Origin": f"http://{self.host_header}",
+                        "Sec-Fetch-Site": value,
+                        "Host": self.host_header,
+                    },
+                )
+                self.assertEqual(status, 403)
+                self.assertIn("forbidden", body.lower())
+                self.assertEqual(self.env_bytes(), before)
+                self.assertEqual(self.portal.request_count, 0)
+
+    def test_missing_token_is_forbidden(self) -> None:
+        before = self.env_bytes()
+
+        status, body = self.post(
+            "tokenless_cookie", headers=self.same_origin_headers(), token=None
+        )
+
+        self.assertEqual(status, 403)
+        self.assertIn("forbidden", body.lower())
+        self.assertEqual(self.env_bytes(), before)
+        self.assertEqual(self.portal.request_count, 0)
+
+    def test_invalid_token_is_forbidden(self) -> None:
+        before = self.env_bytes()
+
+        status, _ = self.post(
+            "forged_cookie", headers=self.same_origin_headers(), token="forged-token"
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(self.env_bytes(), before)
+        self.assertEqual(self.portal.request_count, 0)
+
+    def test_token_from_a_previous_visit_still_works(self) -> None:
+        """The token is the app's, not one-shot: a stale tab must not 403 unfairly."""
+        first = self.csrf_token()
+
+        status, _ = self.post(
+            "second_visit_cookie", headers=self.same_origin_headers(), token=first
+        )
+
+        self.assertEqual(status, 200)
+
+    def test_bare_post_with_no_origin_and_no_fetch_site_is_forbidden(self) -> None:
+        """Absent headers are untrusted, not implicitly same-origin."""
+        before = self.env_bytes()
+
+        status, body = self.post("bare_cookie", headers={"Host": self.host_header})
+
+        self.assertEqual(status, 403)
+        self.assertIn("forbidden", body.lower())
+        self.assertEqual(self.env_bytes(), before)
+        self.assertEqual(self.portal.request_count, 0)
+
+    def test_direct_navigation_origin_absent_with_token_succeeds(self) -> None:
+        """`Sec-Fetch-Site: none` + a real token is a genuine browser form post."""
+        status, _ = self.post(
+            "direct_nav_cookie",
+            headers={"Sec-Fetch-Site": "none", "Host": self.host_header},
+        )
+
+        self.assertEqual(status, 200)
+
+    def test_form_renders_the_hidden_token_the_post_expects(self) -> None:
+        _, body = self.get()
+
+        token = self.csrf_token()
+        self.assertIsNotNone(token)
+        self.assertGreaterEqual(len(token or ""), 16)
+        self.assertIn(f'name="{session_ui.CSRF_FIELD}"', body)
+        self.assertIn('type="hidden"', body)
+
+    def test_token_is_html_escaped_when_rendered(self) -> None:
+        _, body = self.get()
+
+        match = CSRF_INPUT_RE.search(body)
+        self.assertIsNotNone(match)
+        self.assertNotIn('"', match.group(1))
+
+    def test_cross_site_rejection_is_logged_without_the_token(self) -> None:
+        token = self.csrf_token() or ""
+
+        self.post(
+            "logged_cookie",
+            headers={
+                "Origin": "https://evil.example",
+                "Sec-Fetch-Site": "cross-site",
+                "Host": self.host_header,
+            },
+        )
+
+        logged = self.wait_for_log("POST / -> 403")
+        self.assertIn("POST / -> 403", logged)
+        self.assertNotIn("logged_cookie", logged)
+        if token:
+            self.assertNotIn(token, logged)
+
+
+    def test_cross_site_path_is_gated_before_routing(self) -> None:
+        """The gate precedes routing, so even an unknown path needs the token."""
+        for path in ("/nope", "/index.html"):
+            with self.subTest(path=path):
+                status, _ = self.http(
+                    "POST", path, data={session_ui.SESSION_FIELD: "x"}, headers={
+                        "Origin": "https://evil.example",
+                        "Sec-Fetch-Site": "cross-site",
+                        "Host": self.host_header,
+                    }
+                )
+                self.assertEqual(status, 403)
+
+    def test_get_needs_no_token_even_from_a_cross_site_context(self) -> None:
+        """`GET /` is read-only, so the CSRF rule is POST-only by design."""
+        status, body = self.get(
+            headers={
+                "Origin": "https://evil.example",
+                "Sec-Fetch-Site": "cross-site",
+                "Host": self.host_header,
+            }
+        )
+
+        self.assertEqual(status, 200)
+        self.assertNotIn(SECRET_SESSION, body)
+
+    def test_each_process_gets_its_own_token(self) -> None:
+        other = session_ui.build_app(
+            self.env_path, self.heartbeat_path, transport=self.portal, environ={}
+        )
+
+        self.assertNotEqual(other.csrf_token, self.app.csrf_token)
+
+    def test_forbidden_body_carries_no_token_and_no_login(self) -> None:
+        token = self.csrf_token() or ""
+
+        status, body = self.post(
+            "quiet_cookie",
+            headers={
+                "Origin": "https://evil.example",
+                "Sec-Fetch-Site": "cross-site",
+                "Host": self.host_header,
+            },
+        )
+
+        self.assertEqual(status, 403)
+        if token:
+            self.assertNotIn(token, body)
+        self.assertNotIn("quiet_cookie", body)
+
+    def test_proxied_https_origin_matching_host_is_accepted(self) -> None:
+        """Behind `tailscale serve` the browser sends https:// while we are http://.
+
+        The Origin/Host comparison must therefore ignore the scheme, or every real
+        submission through the proxy would be refused.
+        """
+        status, _ = self.post(
+            "proxied_cookie",
+            headers={
+                "Origin": f"https://{self.host_header}",
+                "Sec-Fetch-Site": "same-origin",
+                "Host": self.host_header,
+            },
+        )
+
+        self.assertEqual(status, 200)
+
+    def test_null_origin_is_refused(self) -> None:
+        """`Origin: null` is an opaque origin (sandboxed frame, file://) — never us."""
+        status, _ = self.post(
+            "null_origin_cookie",
+            headers={
+                "Origin": "null",
+                "Sec-Fetch-Site": "same-origin",
+                "Host": self.host_header,
+            },
+        )
+
+        self.assertEqual(status, 403)
+
+    def test_origin_with_userinfo_does_not_match(self) -> None:
+        status, _ = self.post(
+            "userinfo_cookie",
+            headers={
+                "Origin": f"https://evil.example@{self.host_header}",
+                "Sec-Fetch-Site": "same-origin",
+                "Host": self.host_header,
+            },
+        )
+
+        self.assertEqual(status, 403)
+
+    def test_origin_scheme_only_difference_is_allowed_but_host_must_match(self) -> None:
+        """A different host with the same scheme is still cross-site."""
+        status, _ = self.post(
+            "other_host_cookie",
+            headers={
+                "Origin": "https://elsewhere.example",
+                "Sec-Fetch-Site": "same-origin",
+                "Host": self.host_header,
+            },
+        )
+
+        self.assertEqual(status, 403)
+
+
+class GateOrderTests(_ServerTestCase):
+    """The user check runs first, so a wrong login never reaches the CSRF path."""
+
+    extra_environ = {"SESSION_UI_ALLOWED_USER": "ahmed@example.com"}
+
+    def test_wrong_user_with_a_valid_token_is_still_forbidden(self) -> None:
+        before = self.env_bytes()
+        _, body = self.get(headers={"Tailscale-User-Login": "ahmed@example.com"})
+        token = CSRF_INPUT_RE.search(body)
+        self.assertIsNotNone(token)
+
+        status, _ = self.post(
+            "gated_cookie",
+            headers={
+                "Tailscale-User-Login": "someone@example.com",
+                "Origin": f"http://{self.host_header}",
+                "Sec-Fetch-Site": "same-origin",
+                "Host": self.host_header,
+            },
+            token=token.group(1) if token else None,
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(self.env_bytes(), before)
+        self.assertEqual(self.portal.request_count, 0)
+
+    def test_allowed_user_with_valid_token_and_origin_succeeds(self) -> None:
+        status, body = self.post(
+            "fully_valid_cookie",
+            headers={
+                "Tailscale-User-Login": "ahmed@example.com",
+                "Origin": f"http://{self.host_header}",
+                "Sec-Fetch-Site": "same-origin",
+                "Host": self.host_header,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn("saved", body.lower())
+
+
 class BindAddressTests(_ServerTestCase):
     """Startup binds loopback only unless explicitly opted in."""
 
@@ -506,6 +995,15 @@ class SettingsTests(unittest.TestCase):
     def test_bad_port_falls_back_to_default(self) -> None:
         self.assertEqual(
             session_ui.load_settings(environ={"SESSION_UI_PORT": "not-a-port"}).port, 8765
+        )
+
+    def test_allowed_user_defaults_to_empty_and_is_trimmed(self) -> None:
+        self.assertEqual(session_ui.load_settings(environ={}).allowed_user, "")
+        self.assertEqual(
+            session_ui.load_settings(
+                environ={"SESSION_UI_ALLOWED_USER": "  ahmed@example.com  "}
+            ).allowed_user,
+            "ahmed@example.com",
         )
 
 

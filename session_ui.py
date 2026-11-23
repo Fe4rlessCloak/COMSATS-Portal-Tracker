@@ -26,6 +26,8 @@ Settings come from the process environment (inject one for tests):
 ``SESSION_UI_PORT``              ``8765``   Bind port (``0`` = ephemeral).
 ``SESSION_UI_PORTAL_TIMEOUT``    ``15``     Seconds for the live portal check (1–60).
 ``SESSION_UI_ALLOW_NON_LOOPBACK`` unset     Opt-in to a non-loopback bind (``1/true/yes/on``).
+``SESSION_UI_ALLOWED_USER``      unset      Require this exact, case-insensitive
+                                            ``Tailscale-User-Login`` on every request.
 ===============================  =========  ==========================================
 
 ``ENV_FILE``/``STATE_FILE``/``HEARTBEAT_FILE`` are resolved by ``config``.
@@ -34,10 +36,12 @@ Settings come from the process environment (inject one for tests):
 from __future__ import annotations
 
 import argparse
+import hmac
 import html
 import ipaddress
 import json
 import os
+import secrets
 import socket
 import sys
 import urllib.parse
@@ -45,7 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from config import (
     DEFAULT_BASE_URL,
@@ -62,6 +66,7 @@ from sis_client import PortalHttpError, PortalTransport, SessionExpiredError, Si
 
 __all__ = [
     "APP_NAME",
+    "CSRF_FIELD",
     "SESSION_FIELD",
     "BindRefusedError",
     "HeartbeatView",
@@ -83,12 +88,25 @@ APP_NAME = "session-ui"
 #: The one form field a browser posts the pasted cookie in.
 SESSION_FIELD = "session_id"
 
+#: Hidden per-form field carrying the anti-CSRF token.
+CSRF_FIELD = "csrf_token"
+
+#: The identity header `tailscale serve` injects after authenticating the peer.
+TAILSCALE_LOGIN_HEADER = "Tailscale-User-Login"
+
+#: `Sec-Fetch-Site` values a legitimate same-origin form post can carry.
+#: ``none`` is a direct navigation (a top-level load of the page itself), which
+#: is still our own page; ``same-origin``/``same-site`` are our own fetches.
+#: ``cross-site`` is a different site and is always refused.
+TRUSTED_FETCH_SITES = frozenset({"same-origin", "none"})
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_PORTAL_TIMEOUT = 15.0
 PORTAL_TIMEOUT_MINIMUM = 1.0
 PORTAL_TIMEOUT_MAXIMUM = 60.0
 MAX_REQUEST_BODY = 8 * 1024
+CSRF_TOKEN_BYTES = 32
 
 # Statuses the daemon writes when it cannot scan without a fresh cookie.
 NEEDS_COOKIE_STATUSES = frozenset(
@@ -114,6 +132,7 @@ class SessionUiSettings:
     port: int = DEFAULT_PORT
     portal_timeout: float = DEFAULT_PORTAL_TIMEOUT
     allow_non_loopback: bool = False
+    allowed_user: str = ""
     env_path: Optional[Path] = None
     heartbeat_path: Optional[Path] = None
 
@@ -153,9 +172,35 @@ def load_settings(environ: Optional[Mapping[str, str]] = None) -> SessionUiSetti
         port=_parse_port(env.get("SESSION_UI_PORT", "")),
         portal_timeout=_parse_portal_timeout(env.get("SESSION_UI_PORTAL_TIMEOUT", "")),
         allow_non_loopback=_flag(env.get("SESSION_UI_ALLOW_NON_LOOPBACK", "")),
+        allowed_user=(env.get("SESSION_UI_ALLOWED_USER") or "").strip(),
         env_path=resolve_env_file(root, env),
         heartbeat_path=resolve_heartbeat_file(state_path, env),
     )
+
+
+def _origin_authority(origin: str) -> str:
+    """Reduce an ``Origin`` header to lowercase ``host[:port]``, or ``""``.
+
+    Handles the ``null`` opaque origin (a sandboxed frame, a ``file://`` page) by
+    returning ``""``, which never matches a real ``Host``. Comparison is on the
+    authority only, deliberately ignoring scheme: the page is reached over
+    ``tailscale serve`` HTTPS while the loopback socket behind it is HTTP, so
+    requiring an exact scheme match would reject every real browser submit.
+    """
+    candidate = (origin or "").strip()
+    if not candidate or candidate.lower() == "null":
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(candidate)
+    except ValueError:
+        return ""
+    if not parts.scheme or not parts.netloc:
+        return ""
+    # A browser never puts userinfo in Origin, and stripping it would let
+    # ``https://evil.example@our-host`` match us. Refuse rather than normalize.
+    if "@" in parts.netloc:
+        return ""
+    return parts.netloc.lower()
 
 
 def _is_loopback(host: str) -> bool:
@@ -313,9 +358,9 @@ class SessionUiApp:
     """The whole web application: one request entry point, two behaviours.
 
     ``handle()`` is the only public request surface. It delegates the pre-flight
-    decision to :meth:`guard_request`, which is where a future operator check
-    (Tailscale user header) and CSRF check belong, and then routes ``GET /``
-    (status) and ``POST /`` (save a cookie).
+    decision to :meth:`guard_request` — the Tailscale-user check and the
+    cross-site ``POST`` check — and then routes ``GET /`` (status) and ``POST /``
+    (save a cookie).
     """
 
     def __init__(
@@ -325,12 +370,24 @@ class SessionUiApp:
         transport: Optional[PortalTransport] = None,
         environ: Optional[Mapping[str, str]] = None,
         portal_timeout: float = DEFAULT_PORTAL_TIMEOUT,
+        allowed_user: Optional[str] = None,
     ) -> None:
         self.env_path = Path(env_path)
         self.heartbeat_path = Path(heartbeat_path)
         self.transport = transport
         self.environ = environ
         self.portal_timeout = portal_timeout
+        # An explicit argument wins; otherwise read the environment once at build
+        # time so a per-request guard never re-reads mutable process state.
+        self.allowed_user = (
+            (allowed_user or "").strip()
+            if allowed_user is not None
+            else load_settings(environ).allowed_user
+        )
+        #: Per-process form token. Not one-shot, so an open tab keeps working
+        #: across saves; it is unguessable and never logged or rendered anywhere
+        #: except as the hidden input of the form.
+        self.csrf_token = secrets.token_urlsafe(CSRF_TOKEN_BYTES)
 
     # -- the one entry point ---------------------------------------------------
     def handle(self, request: Request) -> Response:
@@ -351,11 +408,58 @@ class SessionUiApp:
     def guard_request(self, request: Request) -> Optional[Response]:
         """Pre-flight gate for every request; returning a response blocks it.
 
-        Deliberately a single named seam: the ``SESSION_UI_ALLOWED_USER``
-        ``Tailscale-User-Login`` check and the cross-site ``POST`` check are
-        added here (and only here) without touching routing or the form.
+        Runs before routing, so ``GET`` and ``POST`` are gated identically. Two
+        independent checks, in this order:
+
+        1. **Operator check** — when ``SESSION_UI_ALLOWED_USER`` is set, the
+           request must carry a ``Tailscale-User-Login`` header equal to it after
+           lowercasing. Not a substring, prefix or suffix test: ``evil-ahmed@…``
+           must not satisfy ``ahmed@…``. A missing or different login is
+           ``403`` and stops here, so the portal is never contacted and ``.env``
+           is never touched.
+        2. **Cross-site check** (``POST`` only) — a submission needs a browser
+           context that proves it came from this page: ``Origin``, if present,
+           must name the authority in ``Host``; ``Sec-Fetch-Site``, if present,
+           must be ``same-origin`` or ``none``; and the hidden
+           :data:`CSRF_FIELD` token must match this process's token. A request
+           with neither ``Origin`` nor ``Sec-Fetch-Site`` is untrusted — absent
+           headers are not evidence of a same-origin submit — so it is refused
+           even with a plausible token. ``GET`` is read-only and needs no token.
         """
+        if self.allowed_user and not self._login_matches(request.header(TAILSCALE_LOGIN_HEADER)):
+            return self._forbidden()
+        if request.method == "POST" and not self._post_is_same_origin(request):
+            return self._forbidden()
         return None
+
+    def _login_matches(self, provided: str) -> bool:
+        """Exact, case-insensitive, constant-time comparison of Tailscale logins."""
+        if not provided:
+            return False
+        return hmac.compare_digest(
+            self.allowed_user.lower().encode("utf-8", "surrogatepass"),
+            provided.lower().encode("utf-8", "surrogatepass"),
+        )
+
+    def _post_is_same_origin(self, request: Request) -> bool:
+        """True only for a submission this page could have produced itself."""
+        origin = request.header("Origin").strip()
+        fetch_site = request.header("Sec-Fetch-Site").strip().lower()
+
+        if origin:
+            authority = _origin_authority(origin)
+            host = request.header("Host").strip().lower()
+            if not authority or not host or authority != host:
+                return False
+        if fetch_site and fetch_site not in TRUSTED_FETCH_SITES:
+            return False
+        if not origin and not fetch_site:
+            return False  # no browser context at all: untrusted
+
+        submitted = self._read_form(request).get(CSRF_FIELD, "")
+        if not submitted:
+            return False
+        return hmac.compare_digest(self.csrf_token, submitted)
 
     # -- GET -------------------------------------------------------------------
     def render_status(self) -> Response:
@@ -404,7 +508,7 @@ class SessionUiApp:
             f"{banner}<table class=\"status\">{table}</table>"
             '<p class="hint">This page is read-only: it never displays the stored '
             "session cookie or any other setting.</p>"
-            f"{self._form_html()}"
+            f"{self._form_html(self.csrf_token)}"
         )
         return self._page(200, "Tracker status", inner)
 
@@ -524,10 +628,16 @@ class SessionUiApp:
         return {key: values[0] for key, values in parsed.items() if values}
 
     @staticmethod
-    def _form_html() -> str:
+    def _form_html(token: str = "") -> str:
         placeholder = html.escape(SESSION_PLACEHOLDER)
+        hidden = (
+            f'<input type="hidden" name="{CSRF_FIELD}" value="{html.escape(token, quote=True)}">'
+            if token
+            else ""
+        )
         return (
             '<form method="post" action="/" autocomplete="off">'
+            f"{hidden}"
             f'<label for="{SESSION_FIELD}">New ASP.NET_SessionId</label>'
             f'<textarea id="{SESSION_FIELD}" name="{SESSION_FIELD}" rows="3" '
             f'placeholder="{placeholder}" spellcheck="false"></textarea>'
@@ -536,6 +646,21 @@ class SessionUiApp:
             "portal before anything is saved, and is never echoed back.</p>"
             '<button type="submit">Verify and save</button>'
             "</form>"
+        )
+
+    @staticmethod
+    def _forbidden() -> Response:
+        """The one 403 body. Deliberately says nothing about why, or about who.
+
+        Naming the expected login — or the one presented — would turn the gate
+        into a lookup oracle for anyone who can reach the port.
+        """
+        return SessionUiApp._page(
+            403,
+            "Forbidden",
+            "<p>This page is not available to this request. If you reached it over "
+            "Tailscale, sign in as the account this server allows. Nothing was "
+            "saved; .env is unchanged.</p>",
         )
 
     @staticmethod
@@ -567,21 +692,23 @@ def build_app(
     transport: Optional[PortalTransport] = None,
     environ: Optional[Mapping[str, str]] = None,
     portal_timeout: Optional[float] = None,
+    allowed_user: Optional[str] = None,
 ) -> SessionUiApp:
     """Build the application with explicit paths and an optional portal transport.
 
     ``transport`` is the test seam: pass ``SimulatedPortal`` to drive the real
     ``SisClient`` offline; leave it ``None`` for production ``UrllibTransport``.
+    ``allowed_user`` overrides ``SESSION_UI_ALLOWED_USER`` when given explicitly.
     """
-    timeout = (
-        load_settings(environ).portal_timeout if portal_timeout is None else portal_timeout
-    )
+    settings = load_settings(environ)
+    timeout = settings.portal_timeout if portal_timeout is None else portal_timeout
     return SessionUiApp(
         env_path=env_path,
         heartbeat_path=heartbeat_path,
         transport=transport,
         environ=environ,
         portal_timeout=timeout,
+        allowed_user=settings.allowed_user if allowed_user is None else allowed_user,
     )
 
 
