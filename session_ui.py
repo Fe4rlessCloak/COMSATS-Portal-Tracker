@@ -192,6 +192,7 @@ def _parse_portal_timeout(raw: str) -> float:
 
 def _setting_values(
     environ: Optional[Mapping[str, str]] = None,
+    env_path: Optional[Path] = None,
 ) -> Tuple[Dict[str, str], Path]:
     """Merge ``.env`` values under the process environment for the five settings.
 
@@ -200,27 +201,41 @@ def _setting_values(
     non-empty process-environment value is overlaid on top, so Compose (which
     passes them as environment entries) still wins over the mounted file, and a
     bare ``python3 session_ui.py`` run still reads ``.env`` as documented.
+
+    ``env_path`` is the CLI's ``--env-file`` value when it has one. It must be
+    honoured here, not only at the write site: the settings are resolved before
+    ``argparse`` runs, so a flag-only run would otherwise read the default
+    ``.env`` and silently lose its allowlist.
     """
     env = _env(environ)
-    env_path = resolve_env_file(Path(__file__).resolve().parent, env)
+    resolved = env_path if env_path is not None else resolve_env_file(
+        Path(__file__).resolve().parent, env
+    )
     values = {
         key: value
-        for key, value in load_env_dict(env_path, environ=env).items()
+        for key, value in load_env_dict(resolved, environ=env).items()
         if key in SESSION_UI_KEYS
     }
     for key in SESSION_UI_KEYS:
         raw = (env.get(key) or "").strip()
         if raw:
             values[key] = raw
-    return values, env_path
+    return values, resolved
 
 
-def load_settings(environ: Optional[Mapping[str, str]] = None) -> SessionUiSettings:
-    """Build settings from the process environment and ``.env`` (never writes)."""
+def load_settings(
+    environ: Optional[Mapping[str, str]] = None,
+    env_file: Optional[Path] = None,
+) -> SessionUiSettings:
+    """Build settings from the process environment and ``.env`` (never writes).
+
+    ``env_file`` is an explicit path (the CLI's ``--env-file``), which outranks
+    ``ENV_FILE`` from the environment so the flag means what it says.
+    """
     env = _env(environ)
     root = Path(__file__).resolve().parent
     state_path = resolve_state_file(root, env)
-    values, env_path = _setting_values(environ)
+    values, env_path = _setting_values(environ, env_file)
     host = (values.get("SESSION_UI_HOST") or "").strip() or DEFAULT_HOST
     return SessionUiSettings(
         host=host,
@@ -778,8 +793,11 @@ def build_app(
     ``transport`` is the test seam: pass ``SimulatedPortal`` to drive the real
     ``SisClient`` offline; leave it ``None`` for production ``UrllibTransport``.
     ``allowed_user`` overrides ``SESSION_UI_ALLOWED_USER`` when given explicitly.
+
+    Settings are read from the ``env_path`` this run will actually update, so the
+    allowlist and the write target can never come from two different files.
     """
-    settings = load_settings(environ)
+    settings = load_settings(environ, env_file=Path(env_path))
     timeout = settings.portal_timeout if portal_timeout is None else portal_timeout
     return SessionUiApp(
         env_path=env_path,
@@ -987,14 +1005,20 @@ def _paths_for(
 def main(
     argv: Optional[list] = None, environ: Optional[Mapping[str, str]] = None
 ) -> int:
-    """CLI entry point: ``python3 session_ui.py [--host H] [--port P]``."""
-    settings = load_settings(environ)
+    """CLI entry point: ``python3 session_ui.py [--host H] [--port P]``.
+
+    Arguments are parsed *before* settings are resolved: ``--env-file`` names the
+    file the run will write, and every setting must be read from that same file.
+    """
     parser = argparse.ArgumentParser(description="Opt-in session-renewal web page")
     parser.add_argument("--host", default=None, help="bind address (loopback only)")
     parser.add_argument("--port", type=int, default=None, help="bind port (0 = ephemeral)")
     parser.add_argument("--env-file", default=None, help="path to .env to update")
     parser.add_argument("--heartbeat-file", default=None, help="path to heartbeat.json")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+
+    explicit_env = Path(args.env_file) if args.env_file else None
+    settings = load_settings(environ, env_file=explicit_env)
 
     env_path, heartbeat_path = _paths_for(args.env_file, args.heartbeat_file, settings)
     app = build_app(

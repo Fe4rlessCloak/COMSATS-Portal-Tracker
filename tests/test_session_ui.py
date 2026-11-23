@@ -1331,6 +1331,21 @@ class SettingsFromEnvFileTests(unittest.TestCase):
         self.assertIsInstance(settings.heartbeat_path, Path)
         self.assertTrue(settings.heartbeat_path.name.endswith(".json"))
 
+    def test_env_file_flag_is_honoured_without_an_ENV_FILE_variable(self) -> None:
+        """`--env-file` must feed the settings, not only the write target.
+
+        The CLI resolves settings *before* `argparse` runs, so a run that points
+        at another `.env` with `--env-file` and has no `ENV_FILE` in its process
+        environment would otherwise read the default path -- silently switching
+        the allowlist off while the page still writes to the intended file.
+        """
+        self._write_env("SESSION_UI_ALLOWED_USER=from_the_flag@example.com\n")
+        # No ENV_FILE: only the explicit argument names the file.
+        settings = session_ui.load_settings(environ={}, env_file=self.env_path)
+
+        self.assertEqual(settings.allowed_user, "from_the_flag@example.com")
+        self.assertEqual(settings.env_path, self.env_path)
+
 
 class EnvFileAllowlistGateTests(_ServerTestCase):
     """End to end: an allowlist that exists only in `.env` still blocks `GET /`."""
