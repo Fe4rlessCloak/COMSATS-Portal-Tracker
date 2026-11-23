@@ -1160,6 +1160,75 @@ class BindAddressTests(_ServerTestCase):
         self.assertEqual(session_ui.load_settings(environ=self.no_env).port, 8765)
 
 
+class MethodRoutingTests(_ServerTestCase):
+    """The routing policy in `handle()` and the HTTP method surface.
+
+    `handle()` is the documented single request surface, so its 405 branch is
+    exercised directly: over HTTP an unhandled method never reaches it (the
+    base class answers 501 for a `do_*` that does not exist), but the app-level
+    policy still has to be right and tested.
+
+    `HEAD` is served: a status page is exactly what an uptime probe polls, and
+    a 501 from the base class is a poor answer. It must return the GET headers
+    with no body.
+    """
+
+    def test_unsupported_methods_get_a_405_from_the_app(self) -> None:
+        for method in ("PUT", "DELETE", "PATCH"):
+            with self.subTest(method=method):
+                response = self.app.handle(
+                    session_ui.Request(method=method, path="/", headers={})
+                )
+
+                self.assertEqual(response.status, 405)
+                self.assertIn("Method not allowed", response.body)
+
+    def test_unsupported_methods_are_501_over_http(self) -> None:
+        """The base class answers first; documenting 501 keeps the two in step."""
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        self.addCleanup(conn.close)
+
+        for method in ("PUT", "DELETE"):
+            with self.subTest(method=method):
+                conn.request(method, "/")
+                response = conn.getresponse()
+                response.read()
+                self.assertEqual(response.status, 501)
+                self.assertNotIn(
+                    "Traceback", self.log_stream.getvalue()
+                )
+
+    def test_head_returns_the_get_headers_without_a_body(self) -> None:
+        self.write_heartbeat()
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        self.addCleanup(conn.close)
+
+        conn.request("HEAD", "/")
+        response = conn.getresponse()
+        body = response.read()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(body, b"")
+        self.assertGreater(int(response.getheader("Content-Length") or 0), 0)
+        self.assertEqual(response.getheader("Cache-Control"), "no-store")
+
+    def test_head_of_an_unknown_path_is_a_bodyless_404(self) -> None:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        self.addCleanup(conn.close)
+
+        conn.request("HEAD", "/nope")
+        response = conn.getresponse()
+
+        self.assertEqual(response.status, 404)
+        self.assertEqual(response.read(), b"")
+
+
 class SettingsFromEnvFileTests(unittest.TestCase):
     """The `.env` file is a real settings source, not just the process environment.
 
@@ -1227,6 +1296,47 @@ class SettingsFromEnvFileTests(unittest.TestCase):
         self._write_env('export SESSION_UI_ALLOWED_USER = "ahmed@example.com"  # mine\n')
 
         self.assertEqual(self._settings().allowed_user, "ahmed@example.com")
+
+    def test_main_uses_the_resolved_settings_paths(self) -> None:
+        """`main()` has no path fallbacks of its own; the settings supply them."""
+        heartbeat = self.tmpdir / "heartbeat.json"
+        settings = session_ui.load_settings(
+            environ={
+                "ENV_FILE": str(self.env_path),
+                "HEARTBEAT_FILE": str(heartbeat),
+            }
+        )
+
+        env_path, heartbeat_path = session_ui._paths_for(None, None, settings)
+
+        self.assertEqual(env_path, self.env_path)
+        self.assertEqual(heartbeat_path, heartbeat)
+
+    def test_explicit_flags_override_the_resolved_paths(self) -> None:
+        heartbeat = self.tmpdir / "heartbeat.json"
+        other_env = self.tmpdir / "other.env"
+        other_hb = self.tmpdir / "other.json"
+        settings = session_ui.load_settings(
+            environ={
+                "ENV_FILE": str(self.env_path),
+                "HEARTBEAT_FILE": str(heartbeat),
+            }
+        )
+
+        env_path, heartbeat_path = session_ui._paths_for(
+            str(other_env), str(other_hb), settings
+        )
+
+        self.assertEqual(env_path, other_env)
+        self.assertEqual(heartbeat_path, other_hb)
+
+    def test_settings_always_carry_both_paths(self) -> None:
+        """The dataclass requires them, so `main()` needs no `or` fallback."""
+        settings = session_ui.load_settings(environ={"ENV_FILE": str(self.env_path)})
+
+        self.assertIsInstance(settings.env_path, Path)
+        self.assertIsInstance(settings.heartbeat_path, Path)
+        self.assertTrue(settings.heartbeat_path.name.endswith(".json"))
 
 
 class EnvFileAllowlistGateTests(_ServerTestCase):

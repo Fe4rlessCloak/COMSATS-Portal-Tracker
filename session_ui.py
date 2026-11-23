@@ -141,15 +141,19 @@ class BindRefusedError(RuntimeError):
 
 @dataclass(frozen=True)
 class SessionUiSettings:
-    """Resolved process settings for the session UI server."""
+    """Resolved process settings for the session UI server.
 
+    Both paths are required: ``load_settings`` always resolves them, so a
+    ``None`` here would only ever be a bug that a later caller had to paper over.
+    """
+
+    env_path: Path
+    heartbeat_path: Path
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     portal_timeout: float = DEFAULT_PORTAL_TIMEOUT
     allow_non_loopback: bool = False
     allowed_user: str = ""
-    env_path: Optional[Path] = None
-    heartbeat_path: Optional[Path] = None
 
 
 def _env(environ: Optional[Mapping[str, str]]) -> Mapping[str, str]:
@@ -471,13 +475,16 @@ class SessionUiApp:
             return blocked
 
         path = urllib.parse.urlparse(request.path).path or "/"
-        if request.method == "GET" and path in ("/", "/index.html"):
+        # HEAD is routed exactly like GET: RFC 9110 defines it as GET's response
+        # without the body, and the transport omits the body for it. That keeps
+        # `Content-Length` honest for an uptime probe.
+        if request.method in ("GET", "HEAD") and path in ("/", "/index.html"):
             return self.render_status()
         if request.method == "POST" and path == "/":
             return self.save_session(request)
-        if request.method in ("GET", "POST"):
+        if request.method in ("GET", "HEAD", "POST"):
             return self._page(404, "Not found", "There is nothing at that address.")
-        return self._page(405, "Method not allowed", "Only GET and POST are supported.")
+        return self._page(405, "Method not allowed", "Only GET, HEAD and POST are supported.")
 
     def guard_request(self, request: Request) -> Optional[Response]:
         """Pre-flight gate for every request; returning a response blocks it.
@@ -899,6 +906,10 @@ def _make_handler_class(app: SessionUiApp, log_stream: Optional[Any] = None) -> 
         def do_GET(self) -> None:  # noqa: N802 - http.server contract
             self._respond("GET")
 
+        def do_HEAD(self) -> None:  # noqa: N802 - http.server contract
+            """Answer HEAD with GET's headers and no body, for uptime probes."""
+            self._respond("HEAD")
+
         def do_POST(self) -> None:  # noqa: N802 - http.server contract
             self._respond("POST")
 
@@ -955,7 +966,6 @@ def create_server(
         address_family = _address_family_for(bind_host)
 
     server = _Server((bind_host, bind_port), handler)
-    server.app = app  # type: ignore[attr-defined]
     return server
 
 
@@ -976,6 +986,21 @@ def serve_forever(
     return 0
 
 
+def _paths_for(
+    env_file: Optional[str], heartbeat_file: Optional[str], settings: SessionUiSettings
+) -> Tuple[Path, Path]:
+    """Resolve the two file paths a run will use.
+
+    ``--env-file``/``--heartbeat-file`` override; otherwise the settings already
+    resolved them (from the process environment, else ``config``'s defaults).
+    There is no third fallback: :class:`SessionUiSettings` requires both, which
+    is what keeps this branch reachable and worth its own test.
+    """
+    env_path = Path(env_file) if env_file else settings.env_path
+    heartbeat_path = Path(heartbeat_file) if heartbeat_file else settings.heartbeat_path
+    return env_path, heartbeat_path
+
+
 def main(
     argv: Optional[list] = None, environ: Optional[Mapping[str, str]] = None
 ) -> int:
@@ -988,18 +1013,7 @@ def main(
     parser.add_argument("--heartbeat-file", default=None, help="path to heartbeat.json")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
-    root = Path(__file__).resolve().parent
-    env_path = (
-        Path(args.env_file)
-        if args.env_file
-        else settings.env_path or resolve_env_file(root, environ)
-    )
-    heartbeat_path = (
-        Path(args.heartbeat_file)
-        if args.heartbeat_file
-        else settings.heartbeat_path
-        or resolve_heartbeat_file(resolve_state_file(root, environ), environ)
-    )
+    env_path, heartbeat_path = _paths_for(args.env_file, args.heartbeat_file, settings)
     app = build_app(
         env_path,
         heartbeat_path,
