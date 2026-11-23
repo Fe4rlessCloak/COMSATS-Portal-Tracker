@@ -27,7 +27,28 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Static guardrails (3.9 grammar, deferred annotations, stdlib-only, module graph, Dockerfile COPY)
+      # `check.py` reports on the files it reads, never on the interpreter
+      # running it, so a leg that silently fell back to /usr/bin/python3 (3.12
+      # on this image) would still pass and prove nothing about its own floor.
+      # Assert the interpreter the job claims to be.
+      - name: Assert the interpreter is the one this leg asked for
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          want = os.environ["EXPECTED"]
+          got = "%d.%d" % sys.version_info[:2]
+          print("running %s (wanted %s): %s" % (got, want, sys.version.split()[0]))
+          if got != want:
+              sys.exit("this leg must run Python %s, got %s" % (want, got))
+          PY
+        env:
+          EXPECTED: ${{ matrix.python-version }}
+
+      # The step name is the audit surface: it must name only the checks
+      # `check.py` actually runs, or it advertises enforcement that does not
+      # exist. Today: 3.9 grammar, deferred annotations, eager unions,
+      # stdlib-only imports, Dockerfile <-> LOCAL_MODULES parity.
+      - name: Static guardrails (3.9 grammar, deferred annotations, stdlib-only, Dockerfile COPY)
         run: python3 scripts/check.py
 
       - name: Guardrail self-tests
