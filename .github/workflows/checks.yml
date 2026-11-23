@@ -1,0 +1,32 @@
+name: checks
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.9 enforces the promised minimum Python version; 3.13 matches the
+      # Dockerfile runtime. Local dev runs a newer interpreter, so without the
+      # 3.9 leg the floor promise is never actually executed.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Static guardrails (3.9 grammar, deferred annotations, stdlib-only, module graph, Dockerfile COPY)
+        run: python3 scripts/check.py
+
+      - name: Guardrail self-tests
+        run: python3 scripts/probe_guardrails.py
+
+      - name: Test suite
+        run: python3 -m unittest discover -s tests -v
