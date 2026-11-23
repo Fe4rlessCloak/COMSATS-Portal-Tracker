@@ -108,6 +108,9 @@ DEFAULT_PORTAL_TIMEOUT = 15.0
 PORTAL_TIMEOUT_MINIMUM = 1.0
 PORTAL_TIMEOUT_MAXIMUM = 60.0
 MAX_REQUEST_BODY = 8 * 1024
+#: Hard cap on form fields, handed to ``parse_qs`` as ``max_num_fields``. The
+#: page posts exactly two; anything past this is not this form.
+MAX_FORM_FIELDS = 32
 CSRF_TOKEN_BYTES = 32
 
 # Statuses the daemon writes when it cannot scan without a fresh cookie.
@@ -513,7 +516,14 @@ class SessionUiApp:
         submitted = self._read_form(request).get(CSRF_FIELD, "")
         if not submitted:
             return False
-        return hmac.compare_digest(self.csrf_token, submitted)
+        # Compare bytes, not str: ``hmac.compare_digest`` raises TypeError for a
+        # str holding any non-ASCII character, so a submitted token like
+        # ``tökén`` would escape the gate as an unhandled exception instead of a
+        # plain 403. Encoding both sides keeps the comparison constant-time.
+        return hmac.compare_digest(
+            self.csrf_token.encode("utf-8", "surrogatepass"),
+            submitted.encode("utf-8", "surrogatepass"),
+        )
 
     # -- GET -------------------------------------------------------------------
     def render_status(self) -> Response:
@@ -671,14 +681,22 @@ class SessionUiApp:
     # -- helpers ---------------------------------------------------------------
     @staticmethod
     def _read_form(request: Request) -> Dict[str, str]:
-        """Parse the url-encoded body into a plain dict of the first values."""
+        """Parse the url-encoded body into a plain dict of the first values.
+
+        Never raises: ``parse_qs`` raises ``ValueError`` past
+        ``max_num_fields``, and a caller that let that escape would drop the
+        connection instead of answering. An unparseable body simply carries no
+        fields, which fails the token check and becomes a plain ``403``.
+        """
         if not request.body:
             return {}
         try:
             text = request.body.decode("utf-8", errors="replace")
-        except (UnicodeDecodeError, AttributeError):
+            parsed = urllib.parse.parse_qs(
+                text, keep_blank_values=True, max_num_fields=MAX_FORM_FIELDS
+            )
+        except (UnicodeDecodeError, AttributeError, ValueError):
             return {}
-        parsed = urllib.parse.parse_qs(text, keep_blank_values=True, max_num_fields=32)
         return {key: values[0] for key, values in parsed.items() if values}
 
     @staticmethod

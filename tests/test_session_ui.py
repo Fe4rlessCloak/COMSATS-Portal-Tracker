@@ -11,6 +11,7 @@ bytes on disk, and `config.EnvWatcher.check()`.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import io
 import json
 import re
@@ -236,6 +237,94 @@ class _ServerTestCase(unittest.TestCase):
 
     def env_bytes(self) -> bytes:
         return self.env_path.read_bytes()
+
+
+class MalformedPostTests(_ServerTestCase):
+    """A hostile `POST` body must not become an unhandled exception.
+
+    Both cases here are reachable with a single forged `Sec-Fetch-Site:
+    same-origin` header -- no browser needed -- and spec #17 requires a missing
+    or invalid token to be a plain `403` with no portal call and no `.env`
+    write. A dropped connection or a traceback is neither.
+    """
+
+    def raw_post(
+        self, body: bytes, headers: Optional[Dict[str, str]] = None
+    ) -> Tuple[int, str]:
+        """Send an exact byte body, so the form can be as malformed as we like."""
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        self.addCleanup(conn.close)
+        sent = {"Content-Type": "application/x-www-form-urlencoded"}
+        sent.update(self.same_origin_headers())
+        sent.update(headers or {})
+        conn.request("POST", "/", body=body, headers=sent)
+        response = conn.getresponse()
+        return response.status, response.read().decode("utf-8", errors="replace")
+
+    def test_a_body_with_more_fields_than_the_parser_allows_is_a_plain_403(self) -> None:
+        before = self.env_bytes()
+        body = urllib.parse.urlencode(
+            {f"field{i}": "value" for i in range(33)}
+        ).encode("utf-8")
+
+        status, text = self.raw_post(body)
+
+        self.assertEqual(status, 403)
+        self.assertIn("forbidden", text.lower())
+        self.assertEqual(self.env_bytes(), before)
+        self.assertEqual(self.portal.request_count, 0)
+
+    def test_a_non_ascii_token_is_a_plain_403(self) -> None:
+        """`hmac.compare_digest` raises TypeError on non-ASCII `str` input."""
+        before = self.env_bytes()
+        body = urllib.parse.urlencode(
+            {session_ui.SESSION_FIELD: "non_ascii_cookie", session_ui.CSRF_FIELD: "tökén"}
+        ).encode("utf-8")
+
+        status, text = self.raw_post(body)
+
+        self.assertEqual(status, 403)
+        self.assertIn("forbidden", text.lower())
+        self.assertEqual(self.env_bytes(), before)
+        self.assertEqual(self.portal.request_count, 0)
+
+    def test_a_malformed_paste_is_rejected_cleanly_by_the_route_too(self) -> None:
+        """The same defensiveness must hold on the path that parses a real form."""
+        token = self.csrf_token() or ""
+        body = urllib.parse.urlencode(
+            {session_ui.SESSION_FIELD: "x", session_ui.CSRF_FIELD: token, **{
+                "pad%d" % i: "y" for i in range(31)
+            }}
+        ).encode("utf-8")
+
+        status, text = self.raw_post(body)
+
+        # Either a 403 from the gate or a 400 from the route is fine; a dropped
+        # connection and a traceback are not.
+        self.assertIn(status, (400, 403), text[:200])
+        self.assertNotIn("Traceback", text)
+
+    def test_the_connection_survives_a_refused_post(self) -> None:
+        body = urllib.parse.urlencode({f"field{i}": "value" for i in range(33)}).encode()
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        self.addCleanup(conn.close)
+        headers = self.same_origin_headers()
+
+        conn.request("POST", "/", body=body, headers=headers)
+        first = conn.getresponse()
+        first.read()
+        self.assertEqual(first.status, 403)
+
+        conn.request("GET", "/", headers=headers)
+        follow_up = conn.getresponse()
+        try:
+            self.assertEqual(follow_up.status, 200)
+        finally:
+            follow_up.close()
 
 
 class StatusPageTests(_ServerTestCase):
