@@ -93,9 +93,21 @@ class _ServerTestCase(unittest.TestCase):
         return SimulatedPortal(courses=self.courses)
 
     def app_environ(self) -> Dict[str, str]:
-        environ = {"SIS_BASE_URL": "https://sis.example.test"}
+        environ = {
+            "ENV_FILE": str(self.env_path),
+            "SIS_BASE_URL": "https://sis.example.test",
+        }
         environ.update(self.extra_environ or {})
         return environ
+
+    @property
+    def no_env(self) -> Dict[str, str]:
+        """An environment whose `.env` path does not exist, so defaults are real.
+
+        `load_settings` now consults `.env`, so an empty mapping would silently
+        read whatever file happens to sit at the repo root.
+        """
+        return {"ENV_FILE": str(self.tmpdir / "absent.env")}
 
     def build_app(self, portal) -> "session_ui.SessionUiApp":
         return session_ui.build_app(
@@ -924,7 +936,7 @@ class BindAddressTests(_ServerTestCase):
     """Startup binds loopback only unless explicitly opted in."""
 
     def test_defaults_to_loopback(self) -> None:
-        settings = session_ui.load_settings(environ={})
+        settings = session_ui.load_settings(environ=self.no_env)
 
         self.assertEqual(settings.host, "127.0.0.1")
 
@@ -932,30 +944,40 @@ class BindAddressTests(_ServerTestCase):
         app = self.build_app(self.portal)
 
         with self.assertRaises(session_ui.BindRefusedError):
-            session_ui.create_server(app, host="0.0.0.0", port=0)
+            session_ui.create_server(app, host="0.0.0.0", port=0, environ=self.no_env)
 
         with self.assertRaises(session_ui.BindRefusedError):
-            session_ui.create_server(app, host="192.168.1.10", port=0)
+            session_ui.create_server(app, host="192.168.1.10", port=0, environ=self.no_env)
 
     def test_allows_non_loopback_bind_with_explicit_opt_in(self) -> None:
         self.assertEqual(
-            session_ui.resolve_bind_host("0.0.0.0", environ={"SESSION_UI_ALLOW_NON_LOOPBACK": "1"}),
+            session_ui.resolve_bind_host("0.0.0.0", environ=self.no_env, allow_non_loopback=True),
             "0.0.0.0",
         )
+        # The opt-in may also come from the file, which is why this goes through
+        # settings rather than a raw environment key.
+        opt_in_path = self.tmpdir / "opt-in.env"
+        opt_in_path.write_text("SESSION_UI_ALLOW_NON_LOOPBACK=1\n", encoding="utf-8")
+        environ = {"ENV_FILE": str(opt_in_path)}
+        self.assertEqual(session_ui.resolve_bind_host("0.0.0.0", environ=environ), "0.0.0.0")
         self.assertEqual(
-            session_ui.resolve_bind_host("0.0.0.0", environ={"SESSION_UI_ALLOW_NON_LOOPBACK": "yes"}),
+            session_ui.resolve_bind_host(
+                "0.0.0.0", environ={"SESSION_UI_ALLOW_NON_LOOPBACK": "yes"}
+            ),
             "0.0.0.0",
         )
         # Opt-in must be explicit; "0"/blank are not.
         for falsy in ("", "0", "false", "no"):
             with self.assertRaises(session_ui.BindRefusedError):
                 session_ui.resolve_bind_host(
-                    "0.0.0.0", environ={"SESSION_UI_ALLOW_NON_LOOPBACK": falsy}
+                    "0.0.0.0",
+                    environ={"SESSION_UI_ALLOW_NON_LOOPBACK": falsy},
+                    allow_non_loopback=False,
                 )
 
     def test_loopback_variants_are_accepted(self) -> None:
         for host in ("127.0.0.1", "127.0.0.53", "::1", "localhost"):
-            self.assertEqual(session_ui.resolve_bind_host(host, environ={}), host)
+            self.assertEqual(session_ui.resolve_bind_host(host, environ=self.no_env), host)
 
     def test_main_refuses_non_loopback_and_exits_nonzero(self) -> None:
         env = {
@@ -972,36 +994,158 @@ class BindAddressTests(_ServerTestCase):
         self.assertIn("loopback", stderr.getvalue().lower())
 
     def test_port_from_settings(self) -> None:
-        settings = session_ui.load_settings(environ={"SESSION_UI_PORT": "9123"})
+        settings = session_ui.load_settings(
+            environ={"SESSION_UI_PORT": "9123", "ENV_FILE": str(self.tmpdir / "absent.env")}
+        )
 
         self.assertEqual(settings.port, 9123)
-        self.assertEqual(session_ui.load_settings(environ={}).port, 8765)
+        self.assertEqual(session_ui.load_settings(environ=self.no_env).port, 8765)
+
+
+class SettingsFromEnvFileTests(unittest.TestCase):
+    """The `.env` file is a real settings source, not just the process environment.
+
+    `.env.example`, the README and `docker-compose.yml` all tell an operator to
+    put `SESSION_UI_ALLOWED_USER` in `.env`, and a bare `python3 session_ui.py`
+    run has no process environment to read it from -- so the file has to be
+    consulted, with the process environment still winning where both are set.
+    These tests inject `ENV_FILE` and never touch `os.environ`.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmpdir = Path(self._tmp.name)
+        self.env_path = self.tmpdir / ".env"
+
+    def _write_env(self, text: str, encoding: str = "utf-8") -> None:
+        self.env_path.write_bytes(text.encode(encoding))
+
+    def _settings(self, **extra: str) -> "session_ui.SessionUiSettings":
+        environ = {"ENV_FILE": str(self.env_path)}
+        environ.update(extra)
+        return session_ui.load_settings(environ=environ)
+
+    def test_allowed_user_is_read_from_the_env_file_alone(self) -> None:
+        self._write_env(
+            "SIS_SESSION_ID=stored_cookie\n"
+            "SESSION_UI_ALLOWED_USER=ahmed@example.com\n"
+        )
+
+        self.assertEqual(self._settings().allowed_user, "ahmed@example.com")
+
+    def test_all_five_session_ui_settings_come_from_the_env_file(self) -> None:
+        self._write_env(
+            "SESSION_UI_HOST=127.0.0.1\n"
+            "SESSION_UI_PORT=9123\n"
+            "SESSION_UI_PORTAL_TIMEOUT=42\n"
+            "SESSION_UI_ALLOW_NON_LOOPBACK=yes\n"
+            "SESSION_UI_ALLOWED_USER=ahmed@example.com\n"
+        )
+
+        settings = self._settings()
+
+        self.assertEqual(settings.host, "127.0.0.1")
+        self.assertEqual(settings.port, 9123)
+        self.assertEqual(settings.portal_timeout, 42.0)
+        self.assertTrue(settings.allow_non_loopback)
+        self.assertEqual(settings.allowed_user, "ahmed@example.com")
+
+    def test_process_env_overrides_the_env_file_value(self) -> None:
+        self._write_env("SESSION_UI_ALLOWED_USER=from_file@example.com\n")
+
+        settings = self._settings(SESSION_UI_ALLOWED_USER="from_process@example.com")
+
+        self.assertEqual(settings.allowed_user, "from_process@example.com")
+
+    def test_a_missing_env_file_still_yields_defaults(self) -> None:
+        settings = self._settings()
+
+        self.assertEqual(settings.host, session_ui.DEFAULT_HOST)
+        self.assertEqual(settings.port, session_ui.DEFAULT_PORT)
+        self.assertEqual(settings.allowed_user, "")
+
+    def test_env_file_settings_are_trimmed_and_quotes_are_stripped(self) -> None:
+        self._write_env('export SESSION_UI_ALLOWED_USER = "ahmed@example.com"  # mine\n')
+
+        self.assertEqual(self._settings().allowed_user, "ahmed@example.com")
+
+
+class EnvFileAllowlistGateTests(_ServerTestCase):
+    """End to end: an allowlist that exists only in `.env` still blocks `GET /`."""
+
+    env_text = (
+        "# only the file carries the allowlist\n"
+        f"SIS_SESSION_ID={SECRET_SESSION}\n"
+        "SIS_BASE_URL=https://sis.example.test\n"
+        "SESSION_UI_ALLOWED_USER=ahmed@example.com\n"
+    )
+
+    def app_environ(self) -> Dict[str, str]:
+        # Deliberately no SESSION_UI_ALLOWED_USER: the file is the only source.
+        return {"ENV_FILE": str(self.env_path)}
+
+    def test_unauthenticated_get_is_forbidden_when_only_the_file_sets_it(self) -> None:
+        self.write_heartbeat()
+
+        status, body = self.get()
+
+        self.assertEqual(status, 403)
+        self.assertIn("forbidden", body.lower())
+
+    def test_the_named_user_still_gets_the_page(self) -> None:
+        self.write_heartbeat()
+
+        status, body = self.get(headers={"Tailscale-User-Login": "ahmed@example.com"})
+
+        self.assertEqual(status, 200)
+        self.assertIn("3 courses tracked", body)
+
+    def test_unauthenticated_post_cannot_reach_the_portal(self) -> None:
+        before = self.env_bytes()
+
+        status, _ = self.post("env_file_cookie")
+
+        self.assertEqual(status, 403)
+        self.assertEqual(self.env_bytes(), before)
+        self.assertEqual(self.portal.request_count, 0)
 
 
 class SettingsTests(unittest.TestCase):
     """Environment-driven settings, injected as a mapping (never os.environ)."""
 
+    #: No `.env` anywhere in play, so "default" means the built-in default and
+    #: not whatever file a developer happens to keep at the repo root.
+    NO_ENV = {"ENV_FILE": str(Path(tempfile.gettempdir()) / "definitely-absent-session-ui.env")}
+
     def test_portal_timeout_is_bounded(self) -> None:
-        default = session_ui.load_settings(environ={})
+        default = session_ui.load_settings(environ=self.NO_ENV)
         self.assertGreater(default.portal_timeout, 0)
         self.assertLessEqual(default.portal_timeout, 60)
 
-        huge = session_ui.load_settings(environ={"SESSION_UI_PORTAL_TIMEOUT": "9999"})
+        huge = session_ui.load_settings(
+            environ=dict(self.NO_ENV, SESSION_UI_PORTAL_TIMEOUT="9999")
+        )
         self.assertLessEqual(huge.portal_timeout, 60)
 
-        tiny = session_ui.load_settings(environ={"SESSION_UI_PORTAL_TIMEOUT": "0.01"})
+        tiny = session_ui.load_settings(
+            environ=dict(self.NO_ENV, SESSION_UI_PORTAL_TIMEOUT="0.01")
+        )
         self.assertGreaterEqual(tiny.portal_timeout, 1.0)
 
     def test_bad_port_falls_back_to_default(self) -> None:
         self.assertEqual(
-            session_ui.load_settings(environ={"SESSION_UI_PORT": "not-a-port"}).port, 8765
+            session_ui.load_settings(
+                environ=dict(self.NO_ENV, SESSION_UI_PORT="not-a-port")
+            ).port,
+            8765,
         )
 
     def test_allowed_user_defaults_to_empty_and_is_trimmed(self) -> None:
-        self.assertEqual(session_ui.load_settings(environ={}).allowed_user, "")
+        self.assertEqual(session_ui.load_settings(environ=self.NO_ENV).allowed_user, "")
         self.assertEqual(
             session_ui.load_settings(
-                environ={"SESSION_UI_ALLOWED_USER": "  ahmed@example.com  "}
+                environ=dict(self.NO_ENV, SESSION_UI_ALLOWED_USER="  ahmed@example.com  ")
             ).allowed_user,
             "ahmed@example.com",
         )

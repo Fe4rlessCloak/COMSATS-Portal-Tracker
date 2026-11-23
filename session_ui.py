@@ -19,7 +19,9 @@ Security posture, by construction:
   edit required;
 * there is no Docker access, no restart endpoint, and no other ``.env`` writer.
 
-Settings come from the process environment (inject one for tests):
+Settings come from the process environment first and the ``.env`` file second
+(so ``SESSION_UI_ALLOWED_USER`` in ``.env`` is not a silent no-op for a bare
+``python3 session_ui.py`` run), and an ``environ`` mapping is injected for tests:
 
 ===============================  =========  ==========================================
 ``SESSION_UI_HOST``              ``127.0.0.1``  Bind address (must be loopback).
@@ -141,6 +143,20 @@ def _env(environ: Optional[Mapping[str, str]]) -> Mapping[str, str]:
     return os.environ if environ is None else environ
 
 
+#: Every setting this page reads, in one place. ``load_settings`` consults each
+#: from the process environment first and the ``.env`` file second, so the
+#: documented "set it in .env" story is true for a bare ``python3 session_ui.py``
+#: run as well as inside a container (where Compose puts them in the process
+#: environment instead).
+SESSION_UI_KEYS = (
+    "SESSION_UI_HOST",
+    "SESSION_UI_PORT",
+    "SESSION_UI_PORTAL_TIMEOUT",
+    "SESSION_UI_ALLOW_NON_LOOPBACK",
+    "SESSION_UI_ALLOWED_USER",
+)
+
+
 def _flag(raw: str) -> bool:
     return raw.strip().lower() in _TRUTHY
 
@@ -161,19 +177,45 @@ def _parse_portal_timeout(raw: str) -> float:
     return max(PORTAL_TIMEOUT_MINIMUM, min(PORTAL_TIMEOUT_MAXIMUM, value))
 
 
+def _setting_values(
+    environ: Optional[Mapping[str, str]] = None,
+) -> Tuple[Dict[str, str], Path]:
+    """Merge ``.env`` values under the process environment for the five settings.
+
+    The file is read with ``config.load_env_dict`` so it gets the same BOM,
+    ``export``, quoting and inline-comment handling as every other setting. A
+    non-empty process-environment value is overlaid on top, so Compose (which
+    passes them as environment entries) still wins over the mounted file, and a
+    bare ``python3 session_ui.py`` run still reads ``.env`` as documented.
+    """
+    env = _env(environ)
+    env_path = resolve_env_file(Path(__file__).resolve().parent, env)
+    values = {
+        key: value
+        for key, value in load_env_dict(env_path, environ=env).items()
+        if key in SESSION_UI_KEYS
+    }
+    for key in SESSION_UI_KEYS:
+        raw = (env.get(key) or "").strip()
+        if raw:
+            values[key] = raw
+    return values, env_path
+
+
 def load_settings(environ: Optional[Mapping[str, str]] = None) -> SessionUiSettings:
-    """Build settings from an injected/process environment (never writes to it)."""
+    """Build settings from the process environment and ``.env`` (never writes)."""
     env = _env(environ)
     root = Path(__file__).resolve().parent
     state_path = resolve_state_file(root, env)
-    host = (env.get("SESSION_UI_HOST") or "").strip() or DEFAULT_HOST
+    values, env_path = _setting_values(environ)
+    host = (values.get("SESSION_UI_HOST") or "").strip() or DEFAULT_HOST
     return SessionUiSettings(
         host=host,
-        port=_parse_port(env.get("SESSION_UI_PORT", "")),
-        portal_timeout=_parse_portal_timeout(env.get("SESSION_UI_PORTAL_TIMEOUT", "")),
-        allow_non_loopback=_flag(env.get("SESSION_UI_ALLOW_NON_LOOPBACK", "")),
-        allowed_user=(env.get("SESSION_UI_ALLOWED_USER") or "").strip(),
-        env_path=resolve_env_file(root, env),
+        port=_parse_port(values.get("SESSION_UI_PORT", "")),
+        portal_timeout=_parse_portal_timeout(values.get("SESSION_UI_PORTAL_TIMEOUT", "")),
+        allow_non_loopback=_flag(values.get("SESSION_UI_ALLOW_NON_LOOPBACK", "")),
+        allowed_user=(values.get("SESSION_UI_ALLOWED_USER") or "").strip(),
+        env_path=env_path,
         heartbeat_path=resolve_heartbeat_file(state_path, env),
     )
 
@@ -214,13 +256,25 @@ def _is_loopback(host: str) -> bool:
 
 
 def resolve_bind_host(
-    host: str, environ: Optional[Mapping[str, str]] = None
+    host: str,
+    environ: Optional[Mapping[str, str]] = None,
+    allow_non_loopback: Optional[bool] = None,
 ) -> str:
-    """Return ``host`` if it is loopback or the opt-in is set; raise otherwise."""
+    """Return ``host`` if it is loopback or the opt-in is set; raise otherwise.
+
+    ``allow_non_loopback`` lets a caller that already resolved settings pass the
+    value it read (from the process environment *or* ``.env``) instead of the
+    opt-in being looked up twice from two different places.
+    """
     candidate = (host or "").strip()
     if _is_loopback(candidate):
         return candidate or DEFAULT_HOST
-    if _flag(_env(environ).get("SESSION_UI_ALLOW_NON_LOOPBACK", "")):
+    permitted = (
+        load_settings(environ).allow_non_loopback
+        if allow_non_loopback is None
+        else allow_non_loopback
+    )
+    if permitted:
         return candidate
     raise BindRefusedError(
         f"refusing to bind {candidate!r}: only a loopback address is allowed. "
@@ -801,7 +855,11 @@ def create_server(
 ) -> ThreadingHTTPServer:
     """Create (but do not start) the HTTP server, enforcing the loopback rule."""
     settings = load_settings(environ)
-    bind_host = resolve_bind_host(settings.host if host is None else host, environ)
+    bind_host = resolve_bind_host(
+        settings.host if host is None else host,
+        environ,
+        allow_non_loopback=settings.allow_non_loopback,
+    )
     bind_port = settings.port if port is None else port
     handler = _make_handler_class(app, log_stream=log_stream)
 
