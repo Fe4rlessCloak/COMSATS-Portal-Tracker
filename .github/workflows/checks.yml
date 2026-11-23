@@ -7,7 +7,12 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`. GitHub's 3.9 builds stop at Ubuntu 24.04 —
+    # `ubuntu-latest` is now 26.04, where setup-python cannot find a 3.9 at all
+    # ("The version '3.9' with architecture 'x64' was not found for Ubuntu
+    # 26.04"). Since the 3.9 leg is the whole point, the runner is the floor for
+    # the floor. Revisit this pin when 24.04 is retired.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
