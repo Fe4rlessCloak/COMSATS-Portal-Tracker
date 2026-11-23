@@ -99,8 +99,10 @@ TAILSCALE_LOGIN_HEADER = "Tailscale-User-Login"
 
 #: `Sec-Fetch-Site` values a legitimate same-origin form post can carry.
 #: ``none`` is a direct navigation (a top-level load of the page itself), which
-#: is still our own page; ``same-origin``/``same-site`` are our own fetches.
-#: ``cross-site`` is a different site and is always refused.
+#: is still our own page; ``same-origin`` is our own fetch. ``same-site`` is
+#: deliberately *absent*: a sibling subdomain on the same registrable site is a
+#: different origin, and a test asserts it is refused. ``cross-site`` is a
+#: different site and is always refused.
 TRUSTED_FETCH_SITES = frozenset({"same-origin", "none"})
 
 DEFAULT_HOST = "127.0.0.1"

@@ -65,26 +65,33 @@ services:
       # side of `ports:` below: `127.0.0.1:8765:8765` makes the daemon listen
       # on the host's loopback only. Never reduce it to `8765:8765`, which
       # would publish on every interface and hand the page to the whole
-      # network. Inside the container there is nothing else listening, and the
-      # container has no route to anything but its own namespace.
+      # network. Inside the container there is nothing else listening.
+      #
+      # The boundary stops at the host, not at the namespace: no separate
+      # network is declared, so on the default Compose bridge another container
+      # on that network *can* reach `comsats-session-ui:8765` (the host loopback
+      # mapping does not prevent that). `SESSION_UI_ALLOWED_USER` is what stops
+      # such a peer -- which is why it is strongly recommended whenever anything
+      # else runs on the same Docker host.
       - SESSION_UI_HOST=0.0.0.0
       # Width of the published port pair below. Interpolated from the .env
       # beside this file (Compose's own project .env) so that setting
-      # `SESSION_UI_PORT` there actually moves the container's listener --
-      # `session_ui.py` reads its settings from the process environment, which
-      # in a container is exactly this block, not /app/config/.env. A host port
-      # and a container port that disagreed would be a dead page.
+      # `SESSION_UI_PORT` there actually moves the container's listener.
+      # `session_ui.py` reads its settings from the process environment first
+      # and `/app/config/.env` second, so this block wins over the mounted file
+      # rather than being the only source. A host port and a container port
+      # that disagreed would be a dead page.
       - SESSION_UI_PORT=${SESSION_UI_PORT:-8765}
       - SESSION_UI_PORTAL_TIMEOUT=${SESSION_UI_PORTAL_TIMEOUT:-15}
       - SESSION_UI_ALLOW_NON_LOOPBACK=1
-      # The allowlist, and the one reason this file reads the host's .env at
-      # all. `session_ui.py` takes it from the environment, so leaving it out
-      # here would make `SESSION_UI_ALLOWED_USER` in .env a silent no-op; a bare
-      # `python3 session_ui.py` run reads it from .env only because that process
-      # is not containerised. Interpolation passes this single value and
-      # nothing else -- in particular not SIS_SESSION_ID or any notifier token,
-      # which stay in the mounted file and never enter the container's
-      # environment (where `docker inspect` would expose them).
+      # The allowlist. Interpolated here so the value Compose was given is
+      # unambiguous, and so `docker inspect` shows what is actually enforced;
+      # with the process environment taking precedence, an interpolated empty
+      # string would otherwise shadow a value in the mounted file. Interpolation
+      # passes this single value and nothing else -- in particular not
+      # SIS_SESSION_ID or any notifier token, which stay in the mounted file and
+      # never enter the container's environment (where `docker inspect` would
+      # expose them).
       # Empty or absent disables the check, which is the documented default.
       - SESSION_UI_ALLOWED_USER=${SESSION_UI_ALLOWED_USER:-}
     ports:

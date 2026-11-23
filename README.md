@@ -207,7 +207,7 @@ SESSION_UI_ALLOWED_USER=you@example.com
 SESSION_UI_PORT=8765
 ```
 
-Compose reads that same `.env` to fill in the service's environment and port mapping, so the container's listener, the published host port, and the settings the page itself enforces all come from one place. Only the page's own settings are passed through — `SIS_SESSION_ID` and your notifier tokens stay in the mounted file and never enter the container's environment.
+Compose reads that same `.env` to fill in the service's environment and port mapping, so the container's listener, the published host port, and the settings the page itself enforces all come from one place — and a bare `python3 session_ui.py` run reads the same keys from `.env`, with the process environment winning where both are set. Only the page's own settings are passed through — `SIS_SESSION_ID` and your notifier tokens stay in the mounted file and never enter the container's environment.
 
 With `SESSION_UI_ALLOWED_USER` set, every request without a matching `Tailscale-User-Login` header gets `403 Forbidden` — including one that reaches the loopback port by some other route, which is why it must be paired with the loopback-only publish below rather than trusted on its own.
 
