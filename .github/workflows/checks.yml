@@ -44,11 +44,12 @@ jobs:
         env:
           EXPECTED: ${{ matrix.python-version }}
 
-      # The step name is the audit surface: it must name only the checks
-      # `check.py` actually runs, or it advertises enforcement that does not
-      # exist. Today: 3.9 grammar, deferred annotations, eager unions,
-      # stdlib-only imports, Dockerfile <-> LOCAL_MODULES parity.
-      - name: Static guardrails (3.9 grammar, deferred annotations, stdlib-only, Dockerfile COPY)
+      # The step name is the audit surface, so it must not name a check that
+      # does not exist. It also must not enumerate them: `check.py`'s set is
+      # still moving (the module-graph check is in flight on PR #11), and this
+      # repo has already been bitten by hardcoded lists going stale. Point at
+      # the script; the log prints every check it actually ran.
+      - name: Static guardrails (scripts/check.py)
         run: python3 scripts/check.py
 
       - name: Guardrail self-tests
