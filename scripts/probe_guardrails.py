@@ -56,6 +56,18 @@ def _write_bytes(root: Path, relative: str, payload: bytes) -> None:
     path.write_bytes(payload)
 
 
+def _append(root: Path, relative: str, text: str) -> None:
+    path = root / relative
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _make_cycle(root: Path, first: str, second: str) -> None:
+    """Make ``first.py`` and ``second.py`` import each other."""
+    _append(root, f"{first}.py", f"\nimport {second}\n")
+    _append(root, f"{second}.py", f"\nimport {first}\n")
+
+
 def _set_dockerfile(root: Path, transform: Callable[[str], str]) -> None:
     dockerfile = root / "Dockerfile"
     original = dockerfile.read_text(encoding="utf-8")
@@ -196,6 +208,14 @@ PROBES = (
     Probe(
         "Dockerfile drops a module",
         lambda root: _set_dockerfile(root, lambda text: text.replace(" probe.py", "")),
+    ),
+    Probe(
+        "config.py importing a local module (leaf invariant)",
+        lambda root: _append(root, "config.py", "\nfrom notifiers import Notification\n"),
+    ),
+    Probe(
+        "local import cycle between non-leaf modules",
+        lambda root: _make_cycle(root, "notifiers", "runtime_store"),
     ),
     Probe(
         "Dockerfile copies an unlisted module",
