@@ -409,6 +409,26 @@ class UpdateScriptTests(unittest.TestCase):
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stdout)
 
+    def test_prune_removes_an_image_listed_twice_only_once(self) -> None:
+        """An image with two tags prints two IDs; a second `rm` would fail."""
+        self._state(CURRENT, PREVIOUS)
+        self._labels(CURRENT, PREVIOUS, PREVIOUS)
+        self._run()
+        removed = [c for c in self._calls() if c.startswith("image rm")]
+        self.assertEqual(removed, [f"image rm {PREVIOUS}"], self._calls())
+
+    def test_prune_matches_ids_with_or_without_the_sha256_prefix(self) -> None:
+        """`docker images -q --no-trunc` does not always print the prefix.
+
+        The in-use image must still be recognised and skipped either way.
+        """
+        bare = CURRENT.split(":", 1)[1]
+        self._state(CURRENT, CURRENT)
+        self._labels(bare, PREVIOUS)
+        self._run()
+        removed = [c for c in self._calls() if c.startswith("image rm")]
+        self.assertEqual(removed, [f"image rm {PREVIOUS}"], self._calls())
+
     def test_pull_failure_fails_the_unit_without_recreating(self) -> None:
         self.stub.write_text(
             STUB_DOCKER.replace(
