@@ -48,7 +48,14 @@ for argument in "$@"; do
     case "$argument" in
         --dry-run) DRY_RUN=1 ;;
         -h|--help)
-            sed -n '2,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            printf '%s\n' \
+                "Usage: comsats-tracker-update.sh [--dry-run]" \
+                "" \
+                "Pull ${IMAGE}, recreate ${CONTAINER} only if the image ID changed," \
+                "then delete superseded images labelled with this project's" \
+                "org.opencontainers.image.source. Other images are never touched." \
+                "" \
+                "  --dry-run   report what would change; pull, recreate and delete nothing"
             exit 0
             ;;
         *)
