@@ -3,7 +3,7 @@
 ## Commands
 
 ```bash
-python3 scripts/check.py                      # guardrails: 3.9 grammar, deferred annotations, stdlib-only, image parity
+python3 scripts/check.py                      # static guardrails (see scripts/check.py docstring)
 python3 scripts/probe_guardrails.py           # proves check.py fails in every direction it claims
 python3 -m unittest discover -s tests -v      # the test suite
 ```

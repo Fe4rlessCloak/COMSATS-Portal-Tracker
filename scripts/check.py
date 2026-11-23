@@ -362,7 +362,7 @@ def check_import_graph(root: Path, trees: dict[Path, ast.AST]) -> list[str]:
     problems: list[str] = []
     graph = _local_import_graph(root, trees)
 
-    for target in graph.get("config", ()):  # leaf invariant
+    for target in sorted(graph.get("config", ())):  # leaf invariant
         problems.append(
             f"config.py: imports {target!r} (the leaf must import nothing local "
             f"-- a local import here creates a cycle)"
@@ -417,8 +417,6 @@ def _cycles(graph: dict[str, set[str]]) -> list[list[str]]:
 
 def _canonical(cycle: list[str]) -> tuple[str, ...]:
     """Rotate a cycle so it starts at its smallest member, for deduplication."""
-    if not cycle:
-        return ()
     pivot = cycle.index(min(cycle))
     return tuple(cycle[pivot:] + cycle[:pivot])
 
@@ -498,7 +496,8 @@ def run_checks(root: Path) -> tuple[list[str], str]:
     problems += check_shipped_modules(root)
     summary = (
         f"OK: {len(trees)} files parse as Python {PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]}, "
-        "annotations are deferred, imports are stdlib-only, local modules all ship."
+        "annotations are deferred, imports are stdlib-only, module graph is acyclic, "
+        "local modules all ship."
     )
     return problems, summary
 
