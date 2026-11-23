@@ -160,6 +160,31 @@ def _decode_env_bytes(raw: bytes) -> str:
         return raw.decode("cp1252", errors="replace")
 
 
+def _env_bytes_codec(raw: bytes) -> Tuple[str, bytes]:
+    """The codec :func:`_decode_env_bytes` will use, plus the exact BOM bytes.
+
+    The writer needs both, because "touching no other byte" is only true if the
+    re-encode uses the encoding the read used -- ``raw.decode(...)`` consumes a
+    BOM, so it has to be re-attached verbatim rather than re-derived from the
+    host's byte order. ``utf-16``/``utf-32`` would encode little-endian on this
+    machine and silently rewrite a big-endian file.
+    """
+    for bom, codec in (
+        (b"\xff\xfe\x00\x00", "utf-32-le"),
+        (b"\x00\x00\xfe\xff", "utf-32-be"),
+        (b"\xff\xfe", "utf-16-le"),
+        (b"\xfe\xff", "utf-16-be"),
+        (b"\xef\xbb\xbf", "utf-8"),
+    ):
+        if raw.startswith(bom):
+            return codec, bom
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "cp1252", b""
+    return "utf-8", b""
+
+
 def _parse_quoted_env_value(val: str, quote: str) -> Optional[str]:
     """Parse a single- or double-quoted .env value, allowing trailing # comments."""
     if quote == "'":
@@ -476,11 +501,14 @@ def write_session_id(env_path: Path, session_id: str) -> SessionWrite:
 
     Preserves every comment, blank line, key order and other setting, keeps the
     line's ``export`` prefix, its quote style and its inline comment, keeps CRLF
-    line endings, and appends the key when it is absent. The write is a sibling
-    temp file plus ``os.replace``, so a running daemon's :class:`EnvWatcher` sees
-    the new inode immediately. A new file is created ``0600``; an existing file
-    keeps its mode. Raises ``ValueError`` (before any write) for a blank,
-    placeholder, or single-line-unsafe value.
+    line endings, and appends the key when it is absent. The file's own encoding
+    is preserved too -- UTF-8 (with or without a BOM), UTF-16 and UTF-32 in
+    either byte order, or the cp1252 fallback -- because the reader accepts all
+    of them and a UTF-8 rewrite would corrupt the ones it is not. The write is a
+    sibling temp file plus ``os.replace``, so a running daemon's
+    :class:`EnvWatcher` sees the new inode immediately. A new file is created
+    ``0600`` as UTF-8; an existing file keeps its mode. Raises ``ValueError``
+    (before any write) for a blank, placeholder, or single-line-unsafe value.
     """
     value = _validate_session_value(session_id)
 
@@ -491,12 +519,14 @@ def write_session_id(env_path: Path, session_id: str) -> SessionWrite:
         if env_path.exists():
             raise ValueError(f"cannot write SIS_SESSION_ID: {env_path} is a directory")
         text = ""
+        codec, bom = "utf-8", b""
     else:
         try:
             existing_mode = env_path.stat().st_mode & 0o777
         except OSError:
             existing_mode = None
         text = _decode_env_bytes(raw)
+        codec, bom = _env_bytes_codec(raw)
 
     lines = text.splitlines(keepends=True)
     replaced = False
@@ -521,7 +551,19 @@ def write_session_id(env_path: Path, session_id: str) -> SessionWrite:
             lines[-1] = lines[-1] + newline
         lines.append(f"SIS_SESSION_ID={value}{newline}")
 
-    payload = "".join(lines).encode("utf-8")
+    payload_text = "".join(lines)
+    # `_decode_env_bytes` consumes a BOM; the original bytes are re-attached
+    # verbatim below, so drop whatever `_decode_env_bytes`/`utf-8-sig` left here
+    # rather than letting it be encoded a second time.
+    if payload_text.startswith("\ufeff"):
+        payload_text = payload_text[1:]
+    try:
+        payload = bom + payload_text.encode(codec)
+    except UnicodeEncodeError:
+        raise ValueError(
+            f"SIS_SESSION_ID cannot be encoded as {codec}, which is what "
+            f"{env_path.name} is written in; nothing was saved."
+        )
     _atomic_replace_bytes(env_path, payload, 0o600 if created else existing_mode)
     return SessionWrite(path=env_path, created=created, replaced=replaced)
 

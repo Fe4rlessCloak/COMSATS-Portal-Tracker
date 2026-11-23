@@ -587,6 +587,136 @@ class SessionWriteTests(unittest.TestCase):
         self.assertFalse(result.created)
 
 
+class SessionWriteEncodingTests(unittest.TestCase):
+    """The writer must re-encode in the encoding the reader decoded.
+
+    `config._decode_env_bytes` deliberately reads UTF-32/UTF-16 BOMs and falls
+    back to cp1252, so a writer that always emits UTF-8 corrupts every file it
+    did not create itself: a UTF-16 BOM disappears and a cp1252 `0x92` becomes
+    three UTF-8 bytes. The docstring promises "touching no other byte", so the
+    bytes of every line except `SIS_SESSION_ID` must survive verbatim.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmpdir = Path(self._tmp.name)
+        self.env_path = self.tmpdir / ".env"
+
+    def _non_session_text(self, text: str) -> str:
+        """Everything except the `SIS_SESSION_ID=` line, as decoded text."""
+        return "".join(
+            line for line in text.splitlines(keepends=True) if "SIS_SESSION_ID" not in line
+        )
+
+    def _non_session_bytes(self, raw: bytes) -> bytes:
+        """Everything except the `SIS_SESSION_ID=` line, as raw bytes.
+
+        Splitting bytes on ``\\n`` only works for single-byte encodings, so the
+        text is decoded first and re-encoded with the file's own codec.
+        """
+        codec, bom = config._env_bytes_codec(raw)
+        body = raw[len(bom) :]
+        return self._non_session_text(body.decode(codec)).encode(codec)
+
+    def test_utf16_le_with_bom_keeps_its_bom_and_encoding(self) -> None:
+        text = "# Købnhavn comment\r\nSIS_SESSION_ID=old_cookie\r\nNTFY_URL=x\r\n"
+        raw = b"\xff\xfe" + text.encode("utf-16-le")
+        self.env_path.write_bytes(raw)
+
+        config.write_session_id(self.env_path, "brand_new")
+
+        written = self.env_path.read_bytes()
+        self.assertTrue(written.startswith(b"\xff\xfe"), written[:4])
+        decoded = written.decode("utf-16")
+        self.assertIn("SIS_SESSION_ID=brand_new", decoded)
+        self.assertIn("# Købnhavn comment", decoded)
+        self.assertEqual(
+            self._non_session_bytes(written), self._non_session_bytes(raw)
+        )
+
+    def test_utf16_be_with_bom_keeps_its_byte_order(self) -> None:
+        text = "SIS_SESSION_ID=old\r\nNTFY_URL=x\r\n"
+        self.env_path.write_bytes(b"\xfe\xff" + text.encode("utf-16-be"))
+
+        config.write_session_id(self.env_path, "brand_new")
+
+        written = self.env_path.read_bytes()
+        self.assertTrue(written.startswith(b"\xfe\xff"), written[:4])
+        self.assertEqual(
+            written.decode("utf-16"),
+            "SIS_SESSION_ID=brand_new\r\nNTFY_URL=x\r\n",
+        )
+
+    def test_utf32_le_with_bom_keeps_its_bom(self) -> None:
+        text = "SIS_SESSION_ID=old\nNTFY_URL=x\n"
+        self.env_path.write_bytes(b"\xff\xfe\x00\x00" + text.encode("utf-32-le"))
+
+        config.write_session_id(self.env_path, "brand_new")
+
+        written = self.env_path.read_bytes()
+        self.assertTrue(written.startswith(b"\xff\xfe\x00\x00"), written[:6])
+        self.assertEqual(
+            written.decode("utf-32"), "SIS_SESSION_ID=brand_new\nNTFY_URL=x\n"
+        )
+
+    def test_cp1252_high_bytes_survive_unchanged(self) -> None:
+        # 0x92 is a cp1252 right single quote; 0x97 an em dash. Neither is valid
+        # UTF-8, which is exactly why the reader falls back to cp1252.
+        raw = b"# COMSATS \x97 Portal \x92quoted\x92\r\nSIS_SESSION_ID=old\r\nNTFY_URL=x\r\n"
+        self.env_path.write_bytes(raw)
+
+        config.write_session_id(self.env_path, "brand_new")
+
+        written = self.env_path.read_bytes()
+        self.assertIn(b"# COMSATS \x97 Portal \x92quoted\x92\r\n", written)
+        self.assertIn(b"SIS_SESSION_ID=brand_new\r\n", written)
+        self.assertNotIn(b"\xe2\x80\x99", written, "cp1252 0x92 was re-encoded as UTF-8")
+        self.assertEqual(
+            self._non_session_bytes(written), self._non_session_bytes(raw)
+        )
+
+    def test_a_plain_utf8_file_stays_plain_utf8(self) -> None:
+        """The overwhelmingly common case must not gain a BOM."""
+        self.env_path.write_bytes(b"SIS_SESSION_ID=old\n# caf\xc3\xa9\n")
+
+        config.write_session_id(self.env_path, "brand_new")
+
+        written = self.env_path.read_bytes()
+        self.assertFalse(written.startswith(b"\xef\xbb\xbf"), written[:4])
+        self.assertEqual(written, b"SIS_SESSION_ID=brand_new\n# caf\xc3\xa9\n")
+
+    def test_the_written_file_still_reads_back_through_the_reader(self) -> None:
+        """Preserving the encoding must not break `load_config`."""
+        for encoding in ("utf-16", "utf-32", "cp1252"):
+            with self.subTest(encoding=encoding):
+                path = self.tmpdir / f"{encoding}.env"
+                text = "SIS_SESSION_ID=old\nSIS_BASE_URL=https://x.test\n"
+                if encoding == "cp1252":
+                    path.write_bytes(b"SIS_SESSION_ID=old\r\nSIS_BASE_URL=https://x.test\r\n")
+                else:
+                    path.write_bytes(text.encode(encoding))
+
+                config.write_session_id(path, "rotated")
+
+                self.assertEqual(
+                    config.load_config(path, environ={}).session_id, "rotated"
+                )
+
+    def test_appending_to_an_encoding_file_uses_that_encoding(self) -> None:
+        text = "# no session here\r\nNTFY_URL=x\r\n"
+        self.env_path.write_bytes(b"\xff\xfe" + text.encode("utf-16-le"))
+
+        config.write_session_id(self.env_path, "fresh")
+
+        written = self.env_path.read_bytes()
+        self.assertTrue(written.startswith(b"\xff\xfe"))
+        self.assertEqual(
+            written.decode("utf-16"),
+            "# no session here\r\nNTFY_URL=x\r\nSIS_SESSION_ID=fresh\r\n",
+        )
+
+
 class PortalDefaultsDriftTests(unittest.TestCase):
     """The mirrored portal defaults must not drift from the Portal module's copies.
 
