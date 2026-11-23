@@ -58,6 +58,8 @@ from config import (
     DEFAULT_BASE_URL,
     DEFAULT_USER_AGENT,
     SESSION_PLACEHOLDER,
+    heartbeat_needs_cookie,
+    heartbeat_stale_after,
     load_env_dict,
     normalize_session_id,
     resolve_env_file,
@@ -122,12 +124,6 @@ MAX_DISCARDED_BODY = 64 * 1024
 #: cannot hold a worker thread open.
 BODY_DISCARD_TIMEOUT = 5.0
 CSRF_TOKEN_BYTES = 32
-
-# Statuses the daemon writes when it cannot scan without a fresh cookie.
-NEEDS_COOKIE_STATUSES = frozenset(
-    {"waiting_for_session", "exiting_session_expired", "wedged_exiting"}
-)
-DEFAULT_HEALTHCHECK_MAX_AGE = 60
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -321,7 +317,7 @@ class HeartbeatView:
 
     @property
     def needs_cookie(self) -> bool:
-        return self.state == "ok" and self.status in NEEDS_COOKIE_STATUSES
+        return self.state == "ok" and heartbeat_needs_cookie(self.status)
 
 
 def _format_timestamp(value: Any) -> str:
@@ -353,20 +349,7 @@ def read_heartbeat(heartbeat_path: Path, now: Optional[float] = None) -> Heartbe
         return HeartbeatView(state="corrupt")
 
     current = float(now) if now is not None else datetime.now(tz=timezone.utc).timestamp()
-
-    def _as_int(key: str, default: int) -> int:
-        try:
-            return int(payload.get(key) or default)
-        except (TypeError, ValueError):
-            return default
-
-    healthcheck_max_age = _as_int("healthcheck_max_age", 0)
-    keepalive = _as_int("keepalive_interval", 120)
-    max_age = (
-        healthcheck_max_age
-        if healthcheck_max_age > 0
-        else max(keepalive, DEFAULT_HEALTHCHECK_MAX_AGE)
-    )
+    max_age = heartbeat_stale_after(payload)
     age = max(0.0, current - timestamp)
     status = str(payload.get("status") or "unknown")
     detail = str(payload.get("detail") or "")

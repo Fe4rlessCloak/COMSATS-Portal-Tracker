@@ -38,7 +38,12 @@ try:
 except ImportError:  # pragma: no cover - Windows compatibility for non-locking helpers
     fcntl = None  # type: ignore[assignment]
 
-from config import resolve_heartbeat_file
+from config import (
+    heartbeat_needs_cookie,
+    heartbeat_stale_after,
+    resolve_heartbeat_file,
+    temp_sibling_path,
+)
 from snapshot_transition import Totals
 
 DEFAULT_KEEPALIVE_INTERVAL = 120
@@ -52,9 +57,10 @@ class StateLockError(RuntimeError):
     """Raised when the state file lock cannot be acquired within timeout."""
 
 
-def _temp_path_for(path: Path) -> Path:
-    """PID/thread-scoped sibling temp path (never shared between writers)."""
-    return path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+#: The sibling temp naming is shared with ``config``'s `.env` writer, so a
+#: leftover from either writer looks the same to an operator (and to the
+#: `*.tmp.*` cleanup tests). Defined once in the leaf module.
+_temp_path_for = temp_sibling_path
 
 
 def _discard_temps(*paths: Path) -> None:
@@ -355,9 +361,9 @@ class RuntimeStore:
         if max_age_override is not None and max_age_override > 0:
             max_age = int(max_age_override)
         else:
-            hb_max = int(hb.get("healthcheck_max_age") or 0)
-            keepalive = int(hb.get("keepalive_interval") or DEFAULT_KEEPALIVE_INTERVAL)
-            max_age = hb_max if hb_max > 0 else max(keepalive, 60)
+            # The one staleness rule, shared with the session UI's status page:
+            # HEALTHCHECK_MAX_AGE when set, else max(KEEPALIVE_INTERVAL, 60).
+            max_age = heartbeat_stale_after(hb)
 
         age = max(0.0, time.time() - ts)
         if age > max_age:
@@ -365,7 +371,7 @@ class RuntimeStore:
 
         status = str(hb.get("status") or "unknown")
         detail = str(hb.get("detail") or "")
-        if status in ("waiting_for_session", "exiting_session_expired", "wedged_exiting"):
+        if heartbeat_needs_cookie(status):
             suffix = f" ({detail})" if detail else ""
             return False, f"Unhealthy status: {status}{suffix}"
 

@@ -794,13 +794,6 @@ class TailscaleUserGateTests(_ServerTestCase):
 class CrossSitePostTests(_ServerTestCase):
     """`POST /` rejects cross-site submissions and needs a per-form token."""
 
-    def same_origin_headers(self) -> Dict[str, str]:
-        return {
-            "Origin": f"http://{self.host_header}",
-            "Sec-Fetch-Site": "same-origin",
-            "Host": self.host_header,
-        }
-
     def test_same_origin_browser_submission_succeeds(self) -> None:
         status, body = self.post("same_origin_cookie", headers=self.same_origin_headers())
 

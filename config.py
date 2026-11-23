@@ -42,6 +42,56 @@ DEFAULT_USER_AGENT = (
 NOTIFIER_TIMEOUT_DEFAULT = 20.0
 NOTIFIER_TIMEOUT_MINIMUM = 1.0
 
+# ------------------------------------------------------------------ heartbeat
+# The `heartbeat.json` staleness rule, defined once because two modules read the
+# same frozen contract (AGENTS.md lists its keys and statuses as unchangeable):
+# `runtime_store.check_healthcheck` for the container HEALTHCHECK and the
+# `--healthcheck` CLI, and `session_ui.read_heartbeat` for the status page. Two
+# copies would let the page and the container disagree about whether the tracker
+# is healthy, which is the one thing the file exists to answer.
+
+#: `KEEPALIVE_INTERVAL`'s floor and fallback, mirrored wherever it is parsed.
+DEFAULT_KEEPALIVE_INTERVAL = 120
+
+#: Staleness floor when `HEALTHCHECK_MAX_AGE` is unset: never stale sooner than
+#: this, however short the keep-alive interval is.
+MINIMUM_HEALTHCHECK_MAX_AGE = 60
+
+#: Statuses the daemon writes when it cannot scan without a fresh cookie: what
+#: makes the session page worth visiting and the container unhealthy.
+NEEDS_COOKIE_STATUSES = frozenset(
+    {"waiting_for_session", "exiting_session_expired", "wedged_exiting"}
+)
+
+
+def _as_int(value: Any, default: int) -> int:
+    """Integer-or-default, tolerating the strings ``json`` can carry."""
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def heartbeat_stale_after(payload: Mapping[str, Any]) -> int:
+    """Seconds after which a heartbeat payload counts as stale.
+
+    `HEALTHCHECK_MAX_AGE` wins when it is positive; otherwise the window is
+    `max(KEEPALIVE_INTERVAL, 60)` -- one keep-alive tick, but never under a
+    minute. This is the whole rule; both readers call it rather than restating
+    it.
+    """
+    configured = _as_int(payload.get("healthcheck_max_age"), 0)
+    if configured > 0:
+        return configured
+    keepalive = _as_int(payload.get("keepalive_interval"), DEFAULT_KEEPALIVE_INTERVAL)
+    return max(keepalive, MINIMUM_HEALTHCHECK_MAX_AGE)
+
+
+def heartbeat_needs_cookie(status: Any) -> bool:
+    """True when `status` is one of the daemon's cookie-waiting statuses."""
+    return str(status or "") in NEEDS_COOKIE_STATUSES
+
+
 SESSION_PLACEHOLDER = "paste_your_ASP_NET_SessionId_here"
 
 KNOWN_ENV_KEYS = (
@@ -568,9 +618,22 @@ def write_session_id(env_path: Path, session_id: str) -> SessionWrite:
     return SessionWrite(path=env_path, created=created, replaced=replaced)
 
 
+def temp_sibling_path(path: Path) -> Path:
+    """The PID/thread-scoped sibling temp path used by both atomic writers.
+
+    ``config`` and ``runtime_store`` each stage a write in a sibling file and
+    ``os.replace`` it into place, and both must use the *same* naming: the
+    `*.tmp.<pid>.<tid>` suffix is what makes a leftover from a crash
+    distinguishable from a real runtime file, and what keeps two concurrent
+    writers from sharing one temp. This lives in ``config`` because it is the
+    leaf -- ``runtime_store`` imports it rather than keeping a second copy.
+    """
+    return path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+
+
 def _atomic_replace_bytes(path: Path, data: bytes, mode: Optional[int]) -> None:
     """Stage ``data`` in a sibling temp file with ``mode`` and ``os.replace`` it into place."""
-    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    tmp_path = temp_sibling_path(path)
     try:
         fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode or 0o600)
         with os.fdopen(fd, "wb") as handle:
