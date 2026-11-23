@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from config import NOTIFIER_TIMEOUT_DEFAULT, parse_notifier_timeout
+
 
 @dataclass(frozen=True)
 class Notification:
@@ -62,7 +64,7 @@ class NtfyNotifier(BaseNotifier):
 
     name = "ntfy"
 
-    def __init__(self, topic_url: str, token: str = "", timeout: float = 15) -> None:
+    def __init__(self, topic_url: str, token: str = "", timeout: float = NOTIFIER_TIMEOUT_DEFAULT) -> None:
         self.topic_url = topic_url.strip()
         self.token = token.strip()
         self.timeout = timeout
@@ -96,7 +98,7 @@ class WebhookNotifier(BaseNotifier):
 
     name = "webhook"
 
-    def __init__(self, webhook_url: str, timeout: float = 15) -> None:
+    def __init__(self, webhook_url: str, timeout: float = NOTIFIER_TIMEOUT_DEFAULT) -> None:
         self.webhook_url = webhook_url.strip()
         self.timeout = timeout
 
@@ -130,7 +132,7 @@ class DiscordNotifier(BaseNotifier):
 
     name = "discord"
 
-    def __init__(self, webhook_url: str, timeout: float = 15) -> None:
+    def __init__(self, webhook_url: str, timeout: float = NOTIFIER_TIMEOUT_DEFAULT) -> None:
         self.webhook_url = webhook_url.strip()
         self.timeout = timeout
 
@@ -158,7 +160,7 @@ class TelegramNotifier(BaseNotifier):
 
     name = "telegram"
 
-    def __init__(self, bot_token: str, chat_id: str, timeout: float = 15) -> None:
+    def __init__(self, bot_token: str, chat_id: str, timeout: float = NOTIFIER_TIMEOUT_DEFAULT) -> None:
         self.bot_token = bot_token.strip()
         self.chat_id = chat_id.strip()
         self.timeout = timeout
@@ -184,20 +186,18 @@ class TelegramNotifier(BaseNotifier):
             resp.read()
 
 
-def _parse_notifier_timeout(config: Dict[str, str], default: float = 15.0) -> float:
-    raw = config.get("NOTIFIER_TIMEOUT", "").strip()
-    if not raw:
-        return default
-    try:
-        return max(2.0, float(raw))
-    except ValueError:
-        return default
+def build_notifiers(
+    config: Dict[str, str], timeout: Optional[float] = None
+) -> List[BaseNotifier]:
+    """Instantiate all configured notifiers (ConsoleNotifier is always first).
 
-
-def build_notifiers(config: Dict[str, str]) -> List[BaseNotifier]:
-    """Instantiate all configured notifiers (ConsoleNotifier is always first)."""
+    ``timeout`` is the unified NOTIFIER_TIMEOUT from the Config module; when omitted
+    the caller-supplied config mapping is read through the same canonical rule
+    (default 20.0s, minimum 1.0s) so there is exactly one timeout rule in the project.
+    """
     notifiers: List[BaseNotifier] = [ConsoleNotifier()]
-    timeout = _parse_notifier_timeout(config)
+    if timeout is None:
+        timeout = parse_notifier_timeout(config)
 
     ntfy_url = config.get("NTFY_URL", "").strip()
     if ntfy_url:
@@ -258,7 +258,7 @@ def dispatch_all(
         per_timeout = (
             max(0.1, float(timeout))
             if timeout is not None
-            else float(getattr(notifier, "timeout", 15)) + 5.0
+            else float(getattr(notifier, "timeout", NOTIFIER_TIMEOUT_DEFAULT)) + 5.0
         )
         deadline = start + per_timeout
         t = threading.Thread(

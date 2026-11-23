@@ -16,9 +16,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from html.parser import HTMLParser
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 DEFAULT_BASE_URL = "https://sis.comsats.edu.pk"
 DEFAULT_USER_AGENT = (
@@ -27,12 +27,39 @@ DEFAULT_USER_AGENT = (
 )
 
 
+def _dedupe_names(*values: Optional[Iterable[str]]) -> Tuple[str, ...]:
+    """Union of cookie names across ``values``, first-seen order, blanks dropped.
+
+    The one ordered-dedupe helper: exceptions normalize their ``set_cookie_names``
+    through it, and ``fetch_page`` widens an in-flight observation list with it.
+    """
+    names: List[str] = []
+    for value in values:
+        for name in value or ():
+            if name and name not in names:
+                names.append(name)
+    return tuple(names)
+
+
 class SessionExpiredError(RuntimeError):
-    """Raised when the portal redirects to /Login or renders the login form."""
+    """Raised when the portal redirects to /Login or renders the login form.
+
+    ``set_cookie_names`` carries the ``Set-Cookie`` header names observed on the response
+    that proved the session dead, so mid-scan failures keep cookie diagnostics without
+    callers having to reach into client state.
+    """
+
+    def __init__(self, message: str, set_cookie_names: Optional[Iterable[str]] = None) -> None:
+        super().__init__(message)
+        self.set_cookie_names: Tuple[str, ...] = _dedupe_names(set_cookie_names)
 
 
 class PortalHttpError(RuntimeError):
     """Raised on unexpected HTTP/network errors."""
+
+    def __init__(self, message: str, set_cookie_names: Optional[Iterable[str]] = None) -> None:
+        super().__init__(message)
+        self.set_cookie_names: Tuple[str, ...] = _dedupe_names(set_cookie_names)
 
 
 class PortalParseError(PortalHttpError):
@@ -100,9 +127,171 @@ class AnnouncementItem:
         return asdict(self)
 
 
+@dataclass
+class RosterResult:
+    """Everything ``fetch_roster()`` observed on ``/Courses``.
+
+    ``courses`` are the parsed enrolled courses, ``semester`` is the extracted semester
+    label (empty when the dashboard omits it), and ``set_cookie_names`` are the
+    ``Set-Cookie`` header names seen while fetching the page.
+    """
+
+    courses: List[Course] = field(default_factory=list)
+    semester: str = ""
+    set_cookie_names: Tuple[str, ...] = ()
+
+
+@dataclass
+class CourseSnapshotResult:
+    """Everything ``fetch_course_snapshot()`` observed for one course.
+
+    ``announcements`` is ``None`` when the caller did not ask for them. ``diagnostic_html``
+    is already scrubbed by :func:`scrub_diagnostic_html` and ``diagnostic_preview`` by
+    :func:`extract_diagnostic_text`; both are only populated when ``marks`` is empty, so
+    raw portal HTML never crosses this seam.
+    """
+
+    marks: List[MarkItem] = field(default_factory=list)
+    resources: List[ResourceItem] = field(default_factory=list)
+    announcements: Optional[List[AnnouncementItem]] = None
+    set_cookie_names: Tuple[str, ...] = ()
+    diagnostic_html: str = ""
+    diagnostic_preview: str = ""
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+class TransportError(RuntimeError):
+    """Raised by an HTTP transport adapter when a request could not be completed at all.
+
+    Adapters must *return* a :class:`TransportResponse` for every HTTP status they receive
+    (including 3xx redirects and 4xx/5xx errors) and raise this (or an ``OSError`` /
+    ``ValueError``) only for genuine transport failures such as DNS, TLS, or socket errors.
+    """
+
+
+@dataclass(frozen=True)
+class TransportResponse:
+    """One raw HTTP exchange as seen by the Portal module.
+
+    ``headers`` is any object the Portal module can read headers from: an
+    ``email.message.Message`` (production), or a plain mapping whose values may be a
+    string or a sequence of strings (multi-value ``Set-Cookie``).
+    """
+
+    status: int
+    headers: Any
+    body: bytes = b""
+    final_url: str = ""
+
+    def header(self, name: str, default: str = "") -> str:
+        headers = self.headers
+        if headers is None:
+            return default
+        getter = getattr(headers, "get", None)
+        if getter is not None:
+            try:
+                value = getter(name)
+            except TypeError:
+                value = None
+            if value is None:
+                value = getter(name.lower())
+            if isinstance(value, (list, tuple)):
+                value = value[-1] if value else None
+            if value is not None:
+                return str(value)
+        for key, value in getattr(headers, "items", lambda: [])():
+            if str(key).lower() == name.lower():
+                if isinstance(value, (list, tuple)):
+                    value = value[-1] if value else ""
+                return str(value)
+        return default
+
+    def text(self, encoding: str = "utf-8") -> str:
+        return self.body.decode(encoding, errors="replace")
+
+    @property
+    def set_cookie_headers(self) -> Tuple[str, ...]:
+        return tuple(_get_set_cookie_headers(self.headers))
+
+    @property
+    def set_cookie_names(self) -> Tuple[str, ...]:
+        """Names of every ``Set-Cookie`` header observed on this response, in order."""
+        names: List[str] = []
+        for raw_header in self.set_cookie_headers:
+            parsed = _parse_set_cookie(raw_header)
+            if parsed is None:
+                continue
+            name = _canonical_cookie_name(parsed[0])
+            if name not in names:
+                names.append(name)
+        return tuple(names)
+
+
+class PortalTransport:
+    """Minimal HTTP transport interface the Portal module depends on.
+
+    Implementations must be stateless with respect to cookies: they send exactly the headers
+    they are given and return the raw response. Cookie staging, redirect following, login
+    detection, and error translation all stay inside :class:`SisClient`.
+    """
+
+    def fetch(
+        self, url: str, headers: Mapping[str, str], timeout: Optional[float] = None
+    ) -> TransportResponse:  # pragma: no cover - interface declaration
+        raise NotImplementedError
+
+
+class UrllibTransport(PortalTransport):
+    """Production adapter: stdlib ``urllib`` with redirect following disabled."""
+
+    def __init__(self, opener: Optional[Any] = None) -> None:
+        self._opener = opener if opener is not None else urllib.request.build_opener(_NoRedirect())
+
+    def fetch(
+        self, url: str, headers: Mapping[str, str], timeout: Optional[float] = None
+    ) -> TransportResponse:
+        request = urllib.request.Request(url, headers=dict(headers), method="GET")
+        try:
+            with self._opener.open(request, timeout=timeout) as response:
+                return TransportResponse(
+                    status=int(getattr(response, "status", 200) or 200),
+                    headers=getattr(response, "headers", None),
+                    body=response.read() or b"",
+                    final_url=response.geturl() or url,
+                )
+        except urllib.error.HTTPError as error:
+            body = b""
+            try:
+                body = error.read() or b""
+            except Exception:  # pragma: no cover - best-effort error body
+                body = b""
+            finally:
+                error.close()
+            return TransportResponse(
+                status=int(error.code),
+                headers=error.headers,
+                body=body,
+                final_url=error.geturl() or url,
+            )
+
+
+@dataclass(frozen=True)
+class PortalResponse:
+    """A portal page as returned by :meth:`SisClient.fetch_page`.
+
+    ``set_cookie_names`` is what :mod:`tracker` records for anomaly diagnostics; failures
+    carry the same names on :class:`SessionExpiredError` / :class:`PortalHttpError`.
+    """
+
+    url: str
+    final_url: str
+    status: int
+    body: str
+    set_cookie_names: Tuple[str, ...] = ()
 
 
 def _clean_text(parts: List[str]) -> str:
@@ -1055,7 +1244,21 @@ def _sanitize_header_value(val: str) -> str:
 
 
 class SisClient:
-    """HTTP client for authenticated COMSATS Student Portal requests."""
+    """HTTP client for authenticated COMSATS Student Portal requests.
+
+    The network edge is a single injectable :class:`PortalTransport` adapter. Everything
+    protocol-shaped stays in here: header sanitization, cookie-header construction, cookie
+    staging across redirect hops, committing cookies only on authenticated non-login
+    responses (never clearing ``ASP.NET_SessionId``), same-origin/no-downgrade redirect
+    safety, login-page detection, cooperative cancellation, and error translation.
+
+    Connection settings are immutable from the outside: use :meth:`reconfigure` (which the
+    daemon calls on ``.env`` hot-reload) instead of assigning ``session_id``/``base_url``/
+    ``user_agent``/``request_delay``.
+    """
+
+    _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+    _MAX_HOPS = 4
 
     def __init__(
         self,
@@ -1065,32 +1268,80 @@ class SisClient:
         request_delay: float = 0.6,
         timeout: int = 20,
         cancel_event: Optional[threading.Event] = None,
+        transport: Optional[PortalTransport] = None,
     ) -> None:
         self._session_id = ""
+        self._base_url = ""
+        self._user_agent = DEFAULT_USER_AGENT
+        self._request_delay = 0.0
+        self.timeout: int = 20
+        self.cancel_event: Optional[threading.Event] = None
         self._cookies: Dict[str, str] = {}
-        self.session_id = session_id
-        self.base_url = base_url.rstrip("/")
-        self.user_agent = user_agent or DEFAULT_USER_AGENT
-        self.request_delay = max(0.0, request_delay)
-        self.timeout = timeout
-        self.cancel_event = cancel_event
-        self._opener = urllib.request.build_opener(_NoRedirect())
+        self.reconfigure(
+            session_id=session_id,
+            base_url=base_url,
+            user_agent=user_agent,
+            request_delay=request_delay,
+            timeout=timeout,
+            cancel_event=cancel_event,
+        )
+        self.transport: PortalTransport = transport if transport is not None else UrllibTransport()
         self._last_request_ts = 0.0
-        self.last_marks_html: str = ""
-        self.last_resources_html: str = ""
-        self.last_set_cookie_names: List[str] = []
-        self.last_response_info: Dict[str, Any] = {}
-        self.last_semester: str = ""
 
+    # -- connection settings --------------------------------------------------
     @property
     def session_id(self) -> str:
+        """The session cookie currently in use (read-only; see :meth:`reconfigure`)."""
         return self._session_id
 
-    @session_id.setter
-    def session_id(self, value: str) -> None:
-        self._session_id = value
-        self._cookies = {"ASP.NET_SessionId": value} if value else {}
+    @property
+    def base_url(self) -> str:
+        return self._base_url
 
+    @property
+    def user_agent(self) -> str:
+        return self._user_agent
+
+    @property
+    def request_delay(self) -> float:
+        return self._request_delay
+
+    def reconfigure(
+        self,
+        session_id: Optional[str] = None,
+        base_url: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        request_delay: Optional[float] = None,
+        timeout: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+        reset_cookies: bool = False,
+    ) -> bool:
+        """Update connection settings in one explicit operation.
+
+        The cookie jar is reset only when the session identifier actually changes or
+        ``reset_cookies=True`` is passed (the daemon's expired-session ``.env`` change path).
+        Returns True when the jar was reset, so callers can log the effect.
+        """
+        session_changed = session_id is not None and session_id != self._session_id
+        if session_id is not None:
+            self._session_id = session_id
+        if base_url is not None:
+            self._base_url = base_url.rstrip("/")
+        if user_agent is not None:
+            self._user_agent = user_agent or DEFAULT_USER_AGENT
+        if request_delay is not None:
+            self._request_delay = max(0.0, request_delay)
+        if timeout is not None:
+            self.timeout = timeout
+        if cancel_event is not None:
+            self.cancel_event = cancel_event
+
+        if session_changed or reset_cookies:
+            self._cookies = {"ASP.NET_SessionId": self._session_id} if self._session_id else {}
+            return True
+        return False
+
+    # -- cookies -------------------------------------------------------------
     def _build_cookie_header(self, pending: Optional[Dict[str, Tuple[str, bool]]] = None) -> str:
         merged = dict(self._cookies)
         if self._session_id and "ASP.NET_SessionId" not in merged:
@@ -1134,14 +1385,15 @@ class SisClient:
         if changes:
             print(f"[INFO] Portal Set-Cookie update: {', '.join(changes)}")
 
+    # -- transport loop ------------------------------------------------------
     def _throttle(self) -> None:
         if self.cancel_event and self.cancel_event.is_set():
             raise PortalHttpError("Request cancelled.")
-        if self.request_delay <= 0:
+        if self._request_delay <= 0:
             return
         elapsed = time.monotonic() - self._last_request_ts
-        if elapsed < self.request_delay:
-            remaining = self.request_delay - elapsed
+        if elapsed < self._request_delay:
+            remaining = self._request_delay - elapsed
             if self.cancel_event is not None:
                 self.cancel_event.wait(remaining)
                 if self.cancel_event.is_set():
@@ -1149,119 +1401,241 @@ class SisClient:
             else:
                 time.sleep(remaining)
 
-    def get_html(self, path: str) -> str:
-        """Fetch an authenticated portal page, raising SessionExpiredError if redirected to Login."""
-        url = path if path.startswith("http") else f"{self.base_url}{path}"
+    def _request_headers(self, pending: Dict[str, Tuple[str, bool]]) -> Dict[str, str]:
+        headers = {
+            "User-Agent": _sanitize_header_value(self._user_agent) or DEFAULT_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": _sanitize_header_value(f"{self._base_url}/") or f"{DEFAULT_BASE_URL}/",
+        }
+        cookie_header = self._build_cookie_header(pending)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        return headers
+
+    def fetch_page(self, path: str) -> PortalResponse:
+        """Fetch an authenticated portal page, following safe redirects.
+
+        Raises :class:`SessionExpiredError` when the portal redirects to Login or renders
+        the login form, and :class:`PortalHttpError` for unsafe redirects, non-2xx statuses,
+        and transport failures. Both carry ``set_cookie_names`` observed on the way.
+        """
+        url = path if path.startswith("http") else f"{self._base_url}{path}"
         pending: Dict[str, Tuple[str, bool]] = {}
         seen_names: List[str] = []
-        for _ in range(4):
-            self._throttle()
-            req_headers = {
-                "User-Agent": _sanitize_header_value(self.user_agent) or DEFAULT_USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": _sanitize_header_value(f"{self.base_url}/") or f"{DEFAULT_BASE_URL}/",
-            }
-            cookie_hdr = self._build_cookie_header(pending)
-            if cookie_hdr:
-                req_headers["Cookie"] = cookie_hdr
-            try:
-                req = urllib.request.Request(url, headers=req_headers, method="GET")
-                with self._opener.open(req, timeout=self.timeout) as resp:
-                    self._last_request_ts = time.monotonic()
-                    final_url = resp.geturl() or url
-                    body = resp.read().decode("utf-8", errors="replace")
-                    resp_headers = getattr(resp, "headers", None)
-                    resp_status = getattr(resp, "status", 200)
-                    login_reason = detect_login_page(body, final_url=final_url)
-                    if login_reason:
-                        diag_names = list(seen_names)
-                        _stage_set_cookies(resp_headers, {}, diag_names)
-                        self.last_set_cookie_names = diag_names
-                        self.last_response_info = {
-                            "url": url,
-                            "final_url": final_url,
-                            "status": resp_status,
-                            "set_cookie_names": list(diag_names),
-                        }
-                        raise SessionExpiredError(login_reason)
 
-                    _stage_set_cookies(resp_headers, pending, seen_names)
-                    self._commit_cookies(pending)
-                    self.last_set_cookie_names = list(seen_names)
-                    self.last_response_info = {
-                        "url": url,
-                        "final_url": final_url,
-                        "status": resp_status,
-                        "set_cookie_names": list(seen_names),
-                    }
-                    return body
-            except urllib.error.HTTPError as e:
-                self._last_request_ts = time.monotonic()
-                loc = e.headers.get("Location", "") if e.headers else ""
-                if e.code in (301, 302, 303, 307, 308):
-                    next_url = urllib.parse.urljoin(url, loc) if loc else ""
-                    if loc and (is_login_url(next_url) or "login" in loc.lower()):
-                        diag_names = list(seen_names)
-                        _stage_set_cookies(e.headers, {}, diag_names)
-                        self.last_set_cookie_names = diag_names
-                        self.last_response_info = {
-                            "url": url,
-                            "final_url": next_url or url,
-                            "status": e.code,
-                            "set_cookie_names": list(diag_names),
-                        }
-                        raise SessionExpiredError(f"Redirected to login ({loc}).") from e
-                    if loc:
-                        if not _is_safe_redirect_target(self.base_url, next_url):
-                            raise PortalHttpError(
-                                f"Refusing unsafe redirect from {url} to {next_url}"
-                            ) from e
-                        _stage_set_cookies(e.headers, pending, seen_names)
-                        url = next_url
-                        continue
-                raise PortalHttpError(f"HTTP {e.code} fetching {url}") from e
+        for _ in range(self._MAX_HOPS):
+            self._throttle()
+            try:
+                response = self.transport.fetch(
+                    url, self._request_headers(pending), self.timeout
+                )
             except (
+                TransportError,
                 urllib.error.URLError,
                 TimeoutError,
                 http.client.HTTPException,
                 OSError,
                 ValueError,
-            ) as e:
-                raise PortalHttpError(f"HTTP/network error fetching {url}: {e}") from e
+            ) as exc:
+                raise PortalHttpError(
+                    f"HTTP/network error fetching {url}: {exc}", set_cookie_names=seen_names
+                ) from exc
 
-        raise PortalHttpError(f"Too many redirects fetching {path}")
+            self._last_request_ts = time.monotonic()
+            final_url = response.final_url or url
+            location = response.header("Location")
 
-    def get_courses(self) -> List[Course]:
-        html = self.get_html("/Courses")
-        self.last_semester = parse_semester(html)
+            if response.status in self._REDIRECT_STATUSES:
+                next_url = urllib.parse.urljoin(url, location) if location else ""
+                if location and (is_login_url(next_url) or "login" in location.lower()):
+                    names = _dedupe_names(seen_names, response.set_cookie_names)
+                    raise SessionExpiredError(
+                        f"Redirected to login ({location}).", set_cookie_names=names
+                    )
+                if location:
+                    if not _is_safe_redirect_target(self._base_url, next_url):
+                        raise PortalHttpError(
+                            f"Refusing unsafe redirect from {url} to {next_url}",
+                            set_cookie_names=_dedupe_names(seen_names, response.set_cookie_names),
+                        )
+                    _stage_set_cookies(response.headers, pending, seen_names)
+                    url = next_url
+                    continue
+                raise PortalHttpError(
+                    f"HTTP {response.status} fetching {url}",
+                    set_cookie_names=_dedupe_names(seen_names, response.set_cookie_names),
+                )
+
+            if not 200 <= response.status < 300:
+                raise PortalHttpError(
+                    f"HTTP {response.status} fetching {url}",
+                    set_cookie_names=_dedupe_names(seen_names, response.set_cookie_names),
+                )
+
+            body = response.text()
+            login_reason = detect_login_page(body, final_url=final_url)
+            if login_reason:
+                # A login response must never mutate the jar or the session identifier; the
+                # cookie names are still reported for diagnostics.
+                names = _dedupe_names(seen_names, response.set_cookie_names)
+                raise SessionExpiredError(login_reason, set_cookie_names=names)
+
+            _stage_set_cookies(response.headers, pending, seen_names)
+            self._commit_cookies(pending)
+            names = tuple(seen_names)
+            return PortalResponse(
+                url=url,
+                final_url=final_url,
+                status=response.status,
+                body=body,
+                set_cookie_names=names,
+            )
+
+        raise PortalHttpError(
+            f"Too many redirects fetching {path}", set_cookie_names=seen_names
+        )
+
+    def get_html(self, path: str) -> str:
+        """Fetch an authenticated portal page body, raising SessionExpiredError at Login."""
+        return self.fetch_page(path).body
+
+    # -- typed portal operations ---------------------------------------------
+    def fetch_roster(self) -> RosterResult:
+        """Fetch and parse the enrolled-course roster from ``/Courses``.
+
+        Owns the dashboard page-marker check, semester extraction, and the "0 courses is a
+        parse error" rule, and reports the ``Set-Cookie`` header names observed on the page.
+        """
+        page = self.fetch_page("/Courses")
+        html = page.body
         if not has_courses_page_marker(html):
-            raise PortalParseError("Dashboard response missing expected courses table markup.")
+            raise PortalParseError(
+                "Dashboard response missing expected courses table markup.",
+                set_cookie_names=page.set_cookie_names,
+            )
         courses = parse_courses(html)
         if not courses:
-            raise PortalParseError("Dashboard parsed 0 courses.")
-        return courses
+            raise PortalParseError(
+                "Dashboard parsed 0 courses.", set_cookie_names=page.set_cookie_names
+            )
+        return RosterResult(
+            courses=courses,
+            semester=parse_semester(html),
+            set_cookie_names=page.set_cookie_names,
+        )
 
-    def select_course(self, course_id: str, expected_course: Optional[Course] = None) -> str:
-        """Switch active session course via /Courses/SetCourse/<id> (returns Announcements HTML)."""
-        html = self.get_html(f"/Courses/SetCourse/{course_id}")
-        if expected_course is not None:
-            verify_active_course(html, expected_course)
-        return html
+    def _fetch_collecting(self, path: str, observed: List[str]) -> PortalResponse:
+        """``fetch_page`` that accumulates observed cookie names and merges them on error."""
+        try:
+            page = self.fetch_page(path)
+        except (SessionExpiredError, PortalHttpError) as exc:
+            raise _with_observed_cookies(exc, observed)
+        observed[:] = _dedupe_names(observed, page.set_cookie_names)
+        return page
 
-    def get_marks_summary(self, expected_course: Optional[Course] = None) -> List[MarkItem]:
-        html = self.get_html("/MarksSummary/Index")
-        self.last_marks_html = html
-        if not has_marks_page_marker(html):
-            raise PortalParseError("MarksSummary response missing expected marks markup.")
-        if expected_course is not None:
-            verify_active_course(html, expected_course)
-        return parse_marks_summary(html)
+    def _fetch_verified(
+        self,
+        course: Course,
+        path: str,
+        marker_fn: Any,
+        missing_marker_message: str,
+        observed: List[str],
+        parse_fn: Any,
+    ) -> Tuple[str, Any]:
+        """Fetch one course page, verify it, and parse it; return ``(body, parsed)``.
 
-    def get_learning_resources(self, expected_course: Optional[Course] = None) -> List[ResourceItem]:
-        html = self.get_html("/LearningResources/Index")
-        self.last_resources_html = html
-        if not has_resources_page_marker(html):
-            raise PortalParseError("LearningResources response missing expected resources markup.")
-        if expected_course is not None:
-            verify_active_course(html, expected_course)
-        return parse_learning_resources(html)
+        One home for the four-step triple the marks and resources pages share:
+        ``_fetch_collecting`` -> page-marker check -> ``verify_active_course`` ->
+        ``parse_*``. Error messages and ``set_cookie_names`` widening are unchanged.
+        The page body is returned for callers that need it (marks diagnostics).
+        """
+        page = self._fetch_collecting(path, observed)
+        if not marker_fn(page.body):
+            raise PortalParseError(
+                missing_marker_message,
+                set_cookie_names=tuple(observed),
+            )
+        try:
+            verify_active_course(page.body, course)
+        except CourseMismatchError as exc:
+            raise _with_observed_cookies(exc, observed)
+        return page.body, parse_fn(page.body)
+
+    def fetch_course_snapshot(
+        self, course: Course, include_announcements: bool = False
+    ) -> CourseSnapshotResult:
+        """Fetch one course's marks, resources and optional announcements.
+
+        Performs the whole ASP.NET dance in order — ``SetCourse`` -> active-course
+        verification -> ``/MarksSummary/Index`` fetch + parse -> ``/LearningResources/Index``
+        fetch + parse -> optional announcement parsing — and returns parsed items only.
+
+        Raw HTML never leaves this method: when no marks are parsed, ``diagnostic_html``
+        carries the already-scrubbed marks page (see :func:`scrub_diagnostic_html`) and
+        ``diagnostic_preview`` its credential-free plain-text snippet. Errors carry every
+        ``Set-Cookie`` name observed so far in addition to their own.
+        """
+        observed: List[str] = []
+
+        announcements_html = self._fetch_collecting(
+            f"/Courses/SetCourse/{course.course_id}", observed
+        ).body
+        try:
+            verify_active_course(announcements_html, course)
+        except CourseMismatchError as exc:
+            raise _with_observed_cookies(exc, observed)
+
+        marks_html, marks = self._fetch_verified(
+            course,
+            "/MarksSummary/Index",
+            has_marks_page_marker,
+            "MarksSummary response missing expected marks markup.",
+            observed,
+            parse_marks_summary,
+        )
+        _resources_html, resources = self._fetch_verified(
+            course,
+            "/LearningResources/Index",
+            has_resources_page_marker,
+            "LearningResources response missing expected resources markup.",
+            observed,
+            parse_learning_resources,
+        )
+
+        announcements: Optional[List[AnnouncementItem]] = None
+        if include_announcements:
+            announcements = parse_announcements(announcements_html)
+
+        diagnostic_html = ""
+        diagnostic_preview = ""
+        if not marks:
+            diagnostic_html = scrub_diagnostic_html(marks_html)
+            diagnostic_preview = extract_diagnostic_text(marks_html)
+
+        return CourseSnapshotResult(
+            marks=marks,
+            resources=resources,
+            announcements=announcements,
+            set_cookie_names=tuple(observed),
+            diagnostic_html=diagnostic_html,
+            diagnostic_preview=diagnostic_preview,
+        )
+
+
+# -- module-level helpers ----------------------------------------------------
+
+
+def _with_observed_cookies(
+    exc: Exception, observed: Iterable[str]
+) -> Exception:
+    """Re-raise ``exc`` carrying every cookie name observed so far in the snapshot.
+
+    Returns the exception to raise (never raises itself) so call sites read
+    ``raise _with_observed_cookies(...)``. When nothing new was observed the original
+    exception instance is returned unchanged, keeping its traceback chain intact.
+    """
+    current: Tuple[str, ...] = getattr(exc, "set_cookie_names", ())
+    merged = _dedupe_names(observed, current)
+    if merged == current:
+        return exc
+    return type(exc)(str(exc), set_cookie_names=merged)  # type: ignore[call-arg]

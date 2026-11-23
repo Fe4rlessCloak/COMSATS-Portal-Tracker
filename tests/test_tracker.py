@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import contextlib
-import email.message
 import io
 import json
 import os
@@ -14,27 +13,30 @@ import tempfile
 import threading
 import time
 import unittest
-import urllib.error
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+HERE = Path(__file__).resolve().parent
+for entry in (str(ROOT), str(HERE)):
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
 
+import config  # noqa: E402
 import probe  # noqa: E402
 import tracker  # noqa: E402
 from notifiers import BaseNotifier, Notification, _latin1_safe, dispatch_all  # noqa: E402
 from sis_client import (  # noqa: E402
     Course,
     CourseMismatchError,
+    MarkItem,
     PortalHttpError,
-    PortalParseError,
+    ResourceItem,
     SessionExpiredError,
     SisClient,
     detect_login_page,
-    extract_diagnostic_text,
     has_authenticated_shell,
     parse_active_course,
     parse_announcements,
@@ -42,31 +44,64 @@ from sis_client import (  # noqa: E402
     parse_learning_resources,
     parse_marks_summary,
     parse_semester,
-    scrub_diagnostic_html,
     verify_active_course,
 )
+from support_portal_pages import SimulatedPortal  # noqa: E402
+from support_stub_transport import StubResponse, StubTransport, StubTransportError  # noqa: E402
+from runtime_store import RuntimeStore  # noqa: E402
 from tracker import (  # noqa: E402
+    CycleOptions,
     CycleTimeoutError,
-    EnvWatcher,
-    StateLockError,
-    check_healthcheck,
-    detect_semester_rollover,
-    diff_states,
     load_config,
-    load_env_with_sources,
-    load_state,
-    normalize_session_id,
-    parse_env_file,
-    parse_env_text,
     run_cycle,
     run_daemon,
     run_with_timeout,
-    save_state,
     scan_all_courses,
-    state_lock,
-    validate_snapshot,
-    write_heartbeat,
 )
+
+PORTAL_BASE = "https://sis.comsats.edu.pk"
+
+
+def portal_client(portal, session_id: str = "valid_cookie", **kwargs) -> SisClient:
+    """Real ``SisClient`` wired to an in-memory portal simulator."""
+    kwargs.setdefault("request_delay", 0.0)
+    return SisClient(session_id, base_url=PORTAL_BASE, transport=portal, **kwargs)
+
+
+def portal_factory(portal, clients: Optional[list] = None):
+    """Patch target for ``tracker.SisClient``: every constructed client is a real one.
+
+    ``run_daemon`` builds its own client from the freshly parsed ``.env``, so daemon tests
+    swap the class for this factory and keep the whole real client/transport stack.
+    """
+
+    def _factory(*args, **kwargs):
+        session_id = kwargs.get("session_id")
+        if session_id is None and args:
+            session_id = args[0]
+        client = SisClient(
+            session_id or "valid_cookie",
+            base_url=kwargs.get("base_url", PORTAL_BASE),
+            user_agent=kwargs.get("user_agent", ""),
+            request_delay=0.0,
+            cancel_event=kwargs.get("cancel_event"),
+            transport=portal,
+        )
+        if clients is not None:
+            clients.append(client)
+        return client
+
+    return _factory
+
+def save_state(state_path: Path, state: dict, max_backups: int = 5) -> None:
+    """Fixture helper: persist a baseline through the Runtime Store."""
+    RuntimeStore(state_path).save_state(state, max_backups=max_backups)
+
+
+def load_state(state_path: Path):
+    """Fixture helper: read a baseline through the Runtime Store."""
+    return RuntimeStore(state_path).load_state()
+
 
 COURSES_HTML = """
 <table class="table sis-dash-table">
@@ -201,83 +236,8 @@ class ParserAndDiffTests(unittest.TestCase):
         self.assertEqual(anns[0].title, "Quiz 2 Postponed")
         self.assertIn("Moved to Friday.", anns[0].body)
 
-    def test_diff_states_detects_new_and_updated_marks_and_resources(self) -> None:
-        old_state = {
-            "courses": {
-                "100001": {
-                    "code": "CSC101",
-                    "name": "Intro to Computing",
-                    "label": "CSC101 — Intro to Computing",
-                    "marks": {
-                        "Quizzes:9001": {
-                            "key": "Quizzes:9001",
-                            "section": "Quizzes",
-                            "title": "Quiz1",
-                            "obtained": "7.0",
-                            "total": "10.0",
-                            "date_text": "31 Oct 2026",
-                        }
-                    },
-                    "resources": {},
-                }
-            }
-        }
-        new_state = {
-            "courses": {
-                "100001": {
-                    "code": "CSC101",
-                    "name": "Intro to Computing",
-                    "label": "CSC101 — Intro to Computing",
-                    "marks": {
-                        "Quizzes:9001": {
-                            "key": "Quizzes:9001",
-                            "section": "Quizzes",
-                            "title": "Quiz1",
-                            "obtained": "8.0",
-                            "total": "10.0",
-                            "date_text": "31 Oct 2026",
-                        },
-                        "Assignments:9002": {
-                            "key": "Assignments:9002",
-                            "section": "Assignments",
-                            "title": "Assign1",
-                            "obtained": "9.0",
-                            "total": "10.0",
-                            "date_text": "01 Nov 2026",
-                        },
-                    },
-                    "resources": {
-                        "res-55": {
-                            "key": "res-55",
-                            "title": "Week 1 Slides",
-                            "material_type": "Lecture Notes",
-                            "date_text": "02 Nov 2026",
-                            "size": "1.2 MB",
-                            "href": "/LearningResources/Download/55",
-                        }
-                    },
-                }
-            }
-        }
-        notes = diff_states(old_state, new_state, base_url="https://sis.comsats.edu.pk")
-        events = [n.event for n in notes]
-        self.assertEqual(events, ["marks_updated", "resource_added"])
-        self.assertIn("7.0 / 10.0 -> 8.0 / 10.0", notes[0].message)
-        self.assertIn("+ [Assignments] Assign1: 9.0 / 10.0", notes[0].message)
-        self.assertIn("Week 1 Slides", notes[1].message)
-        self.assertEqual(
-            notes[1].url, "https://sis.comsats.edu.pk/LearningResources/Download/55"
-        )
-
     def test_latin1_safe_header_normalization(self) -> None:
         self.assertEqual(_latin1_safe("Marks update: CSC101 — Intro"), "Marks update: CSC101 - Intro")
-
-    def test_save_and_load_state_creates_parent_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "data" / "state.json"
-            payload = {"courses": {"1": {"marks": {}, "resources": {}}}}
-            save_state(state_path, payload)
-            self.assertEqual(load_state(state_path), payload)
 
 
 class _RecordingNotifier(BaseNotifier):
@@ -288,32 +248,6 @@ class _RecordingNotifier(BaseNotifier):
 
     def send(self, note: Notification) -> None:
         self.notes.append(note)
-
-
-class _FakeHttpResponse:
-    def __init__(
-        self,
-        body: str,
-        url: str = "https://sis.comsats.edu.pk/Courses",
-        headers=None,
-        status: int = 200,
-    ) -> None:
-        self._body = body.encode("utf-8")
-        self._url = url
-        self.headers = headers
-        self.status = status
-
-    def read(self) -> bytes:
-        return self._body
-
-    def geturl(self) -> str:
-        return self._url
-
-    def __enter__(self) -> "_FakeHttpResponse":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        return False
 
 
 def _make_mark(key: str, title: str, obtained: str = "8.0") -> dict:
@@ -376,182 +310,428 @@ def _auth_shell(inner: str, course_code: str = "", course_name: str = "") -> str
     )
 
 
-class ReliabilityAndBugfixTests(unittest.TestCase):
-    def test_bug1_degenerate_scan_rejected_and_rolling_backups_kept(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "data" / "state.json"
-            good_baseline = _make_state(marks_count=6, res_count=6, course_count=1)
-            save_state(state_path, good_baseline, max_backups=3)
+class CycleIntegrationTests(unittest.TestCase):
+    """End-to-end `run_cycle` through every real layer.
 
-            # Rotate backups across updates and verify .bak -> .bak.3 retention
-            for i in range(4):
-                updated = _make_state(marks_count=6 + i + 1, res_count=6, course_count=1)
-                save_state(state_path, updated, max_backups=3)
+    Wiring is deliberately complete: the real `SisClient` over `SimulatedPortal` (itself a
+    `StubTransport`, so every outbound request is recorded at the HTTP edge), a real
+    `RuntimeStore` over a temp directory, the real `snapshot_transition` module, and the
+    recording notifier. Nothing here patches Portal behaviour, the policy, or the store.
+    """
 
-            self.assertTrue(state_path.with_name("state.json.bak").exists())
-            self.assertTrue(state_path.with_name("state.json.bak.2").exists())
-            self.assertTrue(state_path.with_name("state.json.bak.3").exists())
-            self.assertFalse(state_path.with_name("state.json.bak.4").exists())
+    BASE = "https://sis.comsats.edu.pk"
 
-            # Corrupt primary state.json -> load_state recovers from .bak
-            latest_before_corrupt = load_state(state_path)
-            bak_state = json.loads(state_path.with_name("state.json.bak").read_text(encoding="utf-8"))
-            state_path.write_text("{corrupt json", encoding="utf-8")
-            recovered = load_state(state_path)
-            self.assertEqual(recovered, bak_state)
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state_path = Path(self._tmp.name) / "data" / "state.json"
+        self.data_dir = self.state_path.parent
+        self.store = RuntimeStore(self.state_path)
+        self.notifier = _RecordingNotifier()
+        self.course = Course(course_id="100001", code="CSC101", name="Intro to Computing")
 
-            # Restore latest good baseline and verify degenerate 0-marks scan does NOT overwrite
-            save_state(state_path, latest_before_corrupt, max_backups=3)
-            notifier = _RecordingNotifier()
-
-            class _ZeroMarksClient:
-                def select_course(self, cid, expected_course=None):
-                    return ""
-
-                def get_marks_summary(self, expected_course=None):
-                    return []
-
-                def get_learning_resources(self, expected_course=None):
-                    return []
-
-            courses = [Course(course_id="100001", code="CSC101", name="Course 1")]
-            result = run_cycle(
-                _ZeroMarksClient(),  # type: ignore[arg-type]
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertFalse(result.saved)
-            self.assertIsNotNone(result.anomaly)
-            self.assertEqual(load_state(state_path), latest_before_corrupt)
-            self.assertEqual([n.event for n in notifier.notes], ["scan_anomaly"])
-
-            # Sharp >50% drop and 0-course scan are also rejected by validate_snapshot
-            self.assertIsNotNone(
-                validate_snapshot(
-                    latest_before_corrupt,
-                    tracker.ScanResult(state=_make_state(marks_count=2, res_count=6, course_count=1)),
-                )
-            )
-            self.assertIsNotNone(
-                validate_snapshot(
-                    latest_before_corrupt,
-                    tracker.ScanResult(state={"courses": {}}),
-                )
-            )
-
-    def test_bug2_diff_detects_removals_and_legitimate_single_removal_persists(self) -> None:
-        old_state = {
-            "courses": {
-                "100001": {
-                    "code": "CSC101",
-                    "name": "Intro",
-                    "label": "CSC101 — Intro",
-                    "marks": {
-                        "Quizzes:1": _make_mark("Quizzes:1", "Quiz1", "7.0"),
-                        "Quizzes:2": _make_mark("Quizzes:2", "Quiz2", "8.0"),
-                    },
-                    "resources": {
-                        "res-1": _make_resource("res-1", "Week 1"),
-                    },
-                    "announcements": {
-                        "Ann1|10 Nov": {"key": "Ann1|10 Nov", "title": "Ann1", "meta": "10 Nov", "body": "Hi"},
-                    },
-                },
-                "100002": {
-                    "code": "MTH104",
-                    "name": "Calculus",
-                    "label": "MTH104 — Calculus",
-                    "marks": {"Quizzes:9": _make_mark("Quizzes:9", "Q9", "5.0")},
-                    "resources": {},
-                    "announcements": {},
-                },
-            }
-        }
-        new_state = {
-            "courses": {
-                "100001": {
-                    "code": "CSC101",
-                    "name": "Intro",
-                    "label": "CSC101 — Intro",
-                    "marks": {
-                        "Quizzes:1": _make_mark("Quizzes:1", "Quiz1", "7.0"),
-                    },
-                    "resources": {},
-                    "announcements": {},
-                }
-            }
-        }
-        notes = diff_states(
-            old_state,
-            new_state,
-            base_url="https://sis.comsats.edu.pk",
-            track_announcements=True,
+    # -- helpers -------------------------------------------------------------
+    def portal(self, marks=(), resources=(), semester="Fall 2026", **kwargs):
+        return SimulatedPortal(
+            courses=[self.course],
+            semester=semester,
+            marks={self.course.course_id: list(marks)},
+            resources={self.course.course_id: list(resources)},
+            **kwargs,
         )
-        events = [n.event for n in notes]
+
+    def cycle(self, portal, courses=None, **kwargs):
+        return run_cycle(
+            portal_client(portal),
+            courses if courses is not None else [self.course],
+            self.store,
+            CycleOptions(base_url=self.BASE, semester=kwargs.pop("semester", portal.semester), **kwargs),
+            [self.notifier],
+        )
+
+    def events(self) -> list:
+        return [n.event for n in self.notifier.notes]
+
+    def saved(self):
+        return self.store.load_state()
+
+    # -- baseline ------------------------------------------------------------
+    def test_first_cycle_saves_a_baseline(self) -> None:
+        res = self.cycle(self.portal(marks=[MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")]))
+        self.assertTrue(res.saved)
+        self.assertIsNone(res.anomaly)
+        self.assertEqual(self.events(), ["baseline_saved"])
+        self.assertEqual(self.store.load_state()["semester"], "Fall 2026")
+        self.assertEqual(self.store.load_state()["courses"]["100001"]["code"], "CSC101")
+        self.assertFalse(self.data_dir.joinpath(".anomaly_alerted").exists())
+
+    def test_dry_run_baseline_writes_nothing(self) -> None:
+        res = self.cycle(
+            self.portal(marks=[MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")]),
+            dry_run=True,
+        )
+        self.assertFalse(res.saved)
+        self.assertEqual(self.events(), ["baseline_saved"])
+        self.assertFalse(self.state_path.exists())
+
+    # -- unchanged / incremental --------------------------------------------
+    def test_unchanged_cycle_reports_but_does_not_notify(self) -> None:
+        marks = [MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")]
+        self.cycle(self.portal(marks=marks))
+        self.notifier.notes.clear()
+
+        res = self.cycle(self.portal(marks=marks))
+        self.assertTrue(res.saved)
+        self.assertIsNone(res.anomaly)
+        self.assertEqual(self.notifier.notes, [])
+        self.assertEqual(len(self.saved()["courses"]["100001"]["marks"]), 1)
+
+    def test_new_marks_are_announced_and_persisted(self) -> None:
+        self.cycle(self.portal(marks=[MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")]))
+        self.notifier.notes.clear()
+
+        res = self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem("Quizzes:1", "Quizzes", "Quiz1", "9.0", "10.0", ""),
+                    MarkItem("Quizzes:2", "Quizzes", "Quiz2", "5.0", "10.0", ""),
+                ],
+                resources=[
+                    ResourceItem("res-1", "Slides", "Week 1", "01 Nov", "1.0 MB",
+                                 "/LearningResources/Download/res-1")
+                ],
+            )
+        )
+        self.assertTrue(res.saved)
+        self.assertEqual(self.events(), ["marks_updated", "resource_added"])
+        self.assertEqual(self.notifier.notes[0].data["items"][0]["change"], "updated")
+        self.assertEqual(self.notifier.notes[0].data["items"][1]["change"], "added")
+        self.assertEqual(len(self.saved()["courses"]["100001"]["marks"]), 2)
+
+    def test_legitimate_small_removal_persists_and_alerts(self) -> None:
+        self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", ""),
+                    MarkItem("Quizzes:2", "Quizzes", "Quiz2", "7.0", "10.0", ""),
+                ],
+                resources=[ResourceItem("res-1", "Slides", "Week 1", "01 Nov", "1.0 MB", "/x")],
+            )
+        )
+        self.notifier.notes.clear()
+
+        res = self.cycle(
+            self.portal(
+                marks=[MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")],
+                resources=[ResourceItem("res-1", "Slides", "Week 1", "01 Nov", "1.0 MB", "/x")],
+            )
+        )
+        self.assertTrue(res.saved)
+        self.assertEqual(self.events(), ["marks_removed"])
+        self.assertEqual(len(self.saved()["courses"]["100001"]["marks"]), 1)
+
+    # -- rollover ------------------------------------------------------------
+    def test_semester_rollover_by_label_saves_a_fresh_baseline(self) -> None:
+        self.cycle(self.portal(marks=[MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")]))
+        self.notifier.notes.clear()
+
+        res = self.cycle(self.portal(marks=[], semester="Spring 2027"))
+        self.assertTrue(res.saved)
+        self.assertEqual(self.events(), ["semester_rollover"])
+        self.assertEqual(self.saved()["semester"], "Spring 2027")
         self.assertEqual(
-            events,
-            ["marks_removed", "resource_removed", "announcement_removed", "course_removed"],
+            json.loads(self.data_dir.joinpath("state.json.bak").read_text(encoding="utf-8"))["semester"],
+            "Fall 2026",
         )
-        self.assertIn("Quiz2", notes[0].message)
-        self.assertIn("Week 1", notes[1].message)
-        self.assertIn("Ann1", notes[2].message)
-        self.assertIn("MTH104 — Calculus", notes[3].message)
 
-        # Legitimate removal of 1 mark (2 -> 1) passes validation and alerts marks_removed
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "state.json"
-            baseline = _make_state(marks_count=2, res_count=1, course_count=1)
-            save_state(state_path, baseline)
-            notifier = _RecordingNotifier()
+    def test_semester_rollover_by_disjoint_course_ids(self) -> None:
+        legacy = _make_state(marks_count=2, res_count=0, course_count=1)
+        self.assertNotIn("semester", legacy)
+        self.store.save_state(legacy)
+        new_course = Course(course_id="999001", code="CSC499", name="New Term Course")
+        other = SimulatedPortal(courses=[new_course], semester="")
 
-            class _OneRemovedClient:
-                def select_course(self, cid, expected_course=None):
-                    return ""
+        res = run_cycle(
+            portal_client(other),
+            [new_course],
+            self.store,
+            CycleOptions(base_url=self.BASE, semester=""),
+            [self.notifier],
+        )
+        self.assertTrue(res.saved)
+        self.assertEqual(self.events(), ["semester_rollover"])
+        self.assertIn("999001", self.saved()["courses"])
 
-                def get_marks_summary(self, expected_course=None):
-                    from sis_client import MarkItem
+    def test_legacy_state_gains_a_semester_label_without_rolling_over(self) -> None:
+        legacy = _make_state(marks_count=2, res_count=0, course_count=1)
+        self.store.save_state(legacy)
 
-                    return [
-                        MarkItem(
-                            key="Quizzes:0_0",
-                            section="Quizzes",
-                            title="Quiz0",
-                            obtained="8.0",
-                            total="10.0",
-                            date_text="01 Nov 2026",
-                        )
-                    ]
-
-                def get_learning_resources(self, expected_course=None):
-                    from sis_client import ResourceItem
-
-                    return [
-                        ResourceItem(
-                            key="res-0_0",
-                            title="Slide 0",
-                            material_type="Slides",
-                            date_text="01 Nov 2026",
-                            size="1.0 MB",
-                            href="/LearningResources/Download/res-0_0",
-                        )
-                    ]
-
-            courses = [Course(course_id="100001", code="CSC101", name="Course 1")]
-            res = run_cycle(
-                _OneRemovedClient(),  # type: ignore[arg-type]
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
+        res = self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem(f"Quizzes:0_{i}", "Quizzes", f"Quiz{i}", "8.0", "10.0", "01 Nov")
+                    for i in range(2)
+                ]
             )
-            self.assertTrue(res.saved)
-            self.assertIsNone(res.anomaly)
-            self.assertEqual([n.event for n in notifier.notes], ["marks_removed"])
+        )
+        self.assertTrue(res.saved)
+        self.assertEqual(self.notifier.notes, [])
+        self.assertEqual(self.saved()["semester"], "Fall 2026")
 
+    def test_reset_state_rebaselines_over_a_degenerate_snapshot(self) -> None:
+        self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem(f"Quizzes:{i}", "Quizzes", f"Q{i}", "8.0", "10.0", "")
+                    for i in range(6)
+                ]
+            )
+        )
+        self.notifier.notes.clear()
+
+        res = self.cycle(self.portal(marks=[]), reset_state=True)
+        self.assertTrue(res.saved)
+        self.assertEqual(self.events(), ["baseline_saved"])
+        self.assertEqual(self.saved()["courses"]["100001"]["marks"], {})
+
+    # -- anomalies -----------------------------------------------------------
+    def test_anomaly_rejection_dedupes_then_recovers(self) -> None:
+        self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem(f"Quizzes:{i}", "Quizzes", f"Q{i}", "8.0", "10.0", "")
+                    for i in range(6)
+                ],
+                resources=[ResourceItem("res-1", "Slides", "Week 1", "01 Nov", "1.0 MB", "/x")],
+                set_cookie_on_switch="ARRAffinity",
+            )
+        )
+        baseline = self.saved()
+        self.notifier.notes.clear()
+
+        # 1st degenerate scan: rejected, alerted once, diagnostics written.
+        empty_marks = self.portal(marks=[], resources=[])
+        empty_marks.set_cookie_on_switch = "ARRAffinity"
+        res1 = self.cycle(empty_marks)
+        self.assertFalse(res1.saved)
+        self.assertIsNotNone(res1.anomaly)
+        self.assertEqual(self.events(), ["scan_anomaly"])
+        self.assertEqual(self.saved(), baseline)
+        self.assertIn("ARRAffinity", self.notifier.notes[0].data["set_cookie_names"])
+
+        marker = json.loads(self.data_dir.joinpath(".anomaly_alerted").read_text(encoding="utf-8"))
+        self.assertEqual(marker["count"], 1)
+        diag = json.loads(self.data_dir.joinpath("last_anomaly.json").read_text(encoding="utf-8"))
+        self.assertEqual(diag["occurrence"], 1)
+        self.assertEqual(diag["scanned_totals"], {"courses": 1, "marks": 0, "resources": 0})
+        self.assertEqual(diag["baseline_totals"], {"courses": 1, "marks": 6, "resources": 1})
+        self.assertIn("No marks available.", diag["sample_marks_preview"])
+        diag_first_seen = marker["first_seen"]
+        saved_html = self.data_dir.joinpath("last_anomaly_marks.html").read_text(encoding="utf-8")
+        self.assertIn("No marks available.", saved_html)
+
+        # 2nd identical anomaly: deduplicated (no notification) but counted.
+        res2 = self.cycle(self.portal(marks=[], resources=[]))
+        self.assertFalse(res2.saved)
+        self.assertEqual(res2.notifications, [])
+        self.assertEqual(self.events(), ["scan_anomaly"])
+        marker = json.loads(self.data_dir.joinpath(".anomaly_alerted").read_text(encoding="utf-8"))
+        self.assertEqual(marker["count"], 2)
+        self.assertEqual(marker["first_seen"], diag_first_seen)
+
+        # Recovery: state saved, one recovery alert ahead of the diff alert, marker cleared.
+        res3 = self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem(f"Quizzes:{i}", "Quizzes", f"Q{i}", "8.0", "10.0", "")
+                    for i in range(7)
+                ],
+                resources=[],
+            )
+        )
+        self.assertTrue(res3.saved)
+        self.assertIsNone(res3.anomaly)
+        # The recovery alert always precedes the diff alerts; the scan below also drops
+        # the baseline's single resource, which is a legitimate removal.
+        self.assertEqual(
+            self.events(),
+            ["scan_anomaly", "scan_recovered", "marks_updated", "resource_removed"],
+        )
+        self.assertFalse(self.data_dir.joinpath(".anomaly_alerted").exists())
+        self.assertEqual(len(self.saved()["courses"]["100001"]["marks"]), 7)
+
+    def test_dry_run_anomaly_persists_no_marker_or_diagnostics(self) -> None:
+        self.cycle(
+            self.portal(
+                marks=[
+                    MarkItem(f"Quizzes:{i}", "Quizzes", f"Q{i}", "8.0", "10.0", "")
+                    for i in range(6)
+                ]
+            )
+        )
+        self.notifier.notes.clear()
+
+        res = self.cycle(self.portal(marks=[]), dry_run=True)
+        self.assertFalse(res.saved)
+        self.assertIsNotNone(res.anomaly)
+        self.assertEqual(self.events(), ["scan_anomaly"])
+        self.assertFalse(self.data_dir.joinpath(".anomaly_alerted").exists())
+        self.assertFalse(self.data_dir.joinpath("last_anomaly.json").exists())
+
+    def test_partial_scan_is_rejected_and_the_baseline_survives(self) -> None:
+        second = Course(course_id="100002", code="MTH104", name="Calculus")
+        portal = SimulatedPortal(
+            courses=[self.course, second],
+            semester="Fall 2026",
+            marks={"100001": [MarkItem("Quizzes:1", "Quizzes", "Quiz1", "8.0", "10.0", "")],
+                   "100002": [MarkItem("Quizzes:9", "Quizzes", "Q9", "5.0", "10.0", "")]},
+        )
+        self.cycle(portal, courses=[self.course, second])
+        baseline = self.saved()
+        self.notifier.notes.clear()
+
+        portal.failures["/Courses/SetCourse/100002"] = PortalHttpError("HTTP 500")
+        res = self.cycle(portal, courses=[self.course, second])
+        self.assertFalse(res.saved)
+        self.assertIn("Partial scan", res.anomaly or "")
+        self.assertEqual(self.saved(), baseline)
+        self.assertEqual(self.events(), ["scan_anomaly"])
+
+    def test_mid_scan_session_expiry_leaves_state_untouched(self) -> None:
+        second = Course(course_id="100002", code="MTH104", name="Calculus")
+        self.store.save_state(_make_state(marks_count=2, res_count=1, course_count=2))
+        baseline_bytes = self.state_path.read_bytes()
+
+        portal = SimulatedPortal(
+            courses=[self.course, second],
+            semester="Fall 2026",
+            marks={"100001": [MarkItem("Quizzes:100", "Quizzes", "New", "9.0", "10.0", "")]},
+            failures={
+                "/Courses/SetCourse/100002": StubResponse(
+                    "", status=302, headers={"Location": "/Login/Index"}
+                )
+            },
+        )
+        with self.assertRaises(SessionExpiredError):
+            self.cycle(portal, courses=[self.course, second])
+
+        self.assertEqual(self.state_path.read_bytes(), baseline_bytes)
+        self.assertEqual(self.notifier.notes, [])
+        self.assertFalse(self.data_dir.joinpath(".anomaly_alerted").exists())
+
+    def test_mid_scan_session_expiry_relays_observed_cookie_names(self) -> None:
+        """A1: names collected mid-scan must ride the re-raised exception, not vanish."""
+        second = Course(course_id="100002", code="MTH104", name="Calculus")
+        self.store.save_state(_make_state(marks_count=2, res_count=1, course_count=2))
+        baseline_bytes = self.state_path.read_bytes()
+
+        portal = SimulatedPortal(
+            courses=[self.course, second],
+            semester="Fall 2026",
+            marks={"100001": [MarkItem("Quizzes:1", "Quizzes", "Quiz1", "9.0", "10.0", "")]},
+            set_cookie_on_switch="PortalAffinity",  # observed on course 1's SetCourse
+            failures={
+                "/Courses/SetCourse/100002": StubResponse(
+                    "",
+                    status=302,
+                    headers={
+                        "Location": "/Login/Index",
+                        "Set-Cookie": ["ARRAffinity=node7; Path=/"],
+                    },
+                )
+            },
+        )
+        with self.assertRaises(SessionExpiredError) as ctx:
+            self.cycle(portal, courses=[self.course, second])
+
+        self.assertEqual(
+            ctx.exception.set_cookie_names, ("PortalAffinity", "ARRAffinity")
+        )
+        # Names only — the cookie *value* must never be copied onto the exception text.
+        self.assertNotIn("node7", str(ctx.exception))
+        self.assertEqual(self.state_path.read_bytes(), baseline_bytes)
+
+    # -- store discipline ----------------------------------------------------
+    def test_baseline_is_loaded_before_the_portal_is_scanned(self) -> None:
+        self.store.save_state(_make_state(marks_count=2, res_count=1, course_count=1))
+        order: list = []
+        orig_load = RuntimeStore.load_state
+
+        def _spy_load(store_self):
+            order.append("load_state")
+            return orig_load(store_self)
+
+        def _spy_scan(*args, **kwargs):
+            order.append("scan_all_courses")
+            return tracker.ScanResult(
+                state=_make_state(marks_count=3, res_count=1, course_count=1)
+            )
+
+        with mock.patch.object(RuntimeStore, "load_state", _spy_load), mock.patch.object(
+            tracker, "scan_all_courses", side_effect=_spy_scan
+        ):
+            res = run_cycle(
+                None,  # type: ignore[arg-type]
+                [self.course],
+                self.store,
+                CycleOptions(base_url=self.BASE),
+                [],
+            )
+
+        self.assertTrue(res.saved)
+        self.assertEqual(order, ["load_state", "scan_all_courses"])
+
+    def test_cycle_options_surface_is_the_only_form(self) -> None:
+        """B1: the legacy keyword shim is gone; only CycleOptions is accepted."""
+        with self.assertRaises(TypeError):
+            run_cycle(
+                None,
+                [self.course],
+                self.store,
+                **{"state_path": self.state_path, "base_url": self.BASE},  # type: ignore[arg-type]
+            )
+        # CycleOptions no longer carries a state_path field at all.
+        self.assertFalse(hasattr(CycleOptions(base_url=self.BASE), "state_path"))
+
+    def test_a_bare_string_in_place_of_notifiers_is_rejected_loudly(self) -> None:
+        # A string is iterable, so without the guard it would fail deep inside
+        # dispatch_all with an AttributeError on the first character.
+        with self.assertRaises(TypeError) as ctx:
+            run_cycle(
+                portal_client(self.portal(marks=[])),
+                [self.course],
+                self.store,
+                CycleOptions(base_url=self.BASE),
+                "recording",  # type: ignore[arg-type]
+            )
+        self.assertIn("bare string", str(ctx.exception))
+
+    def test_a_string_in_place_of_options_is_rejected_loudly(self) -> None:
+        # The old 6-argument positional signature would land base_url here; failing loudly
+        # beats silently scanning with the wrong policy.
+        with self.assertRaises(AttributeError):
+            run_cycle(
+                portal_client(self.portal(marks=[])),
+                [self.course],
+                self.store,
+                self.BASE,  # type: ignore[arg-type]
+                [],
+            )
+
+    def test_positional_call_style_is_the_supported_form(self) -> None:
+        res = run_cycle(
+            portal_client(self.portal(marks=[])),
+            [self.course],
+            RuntimeStore(self.state_path),
+            CycleOptions(base_url=self.BASE, semester="Fall 2026"),
+            [self.notifier],
+        )
+        self.assertTrue(res.saved)
+        self.assertEqual(self.events(), ["baseline_saved"])
+        self.assertTrue(self.state_path.exists())
+
+
+class ReliabilityAndBugfixTests(unittest.TestCase):
     def test_bug3_session_expiry_resumes_on_env_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / ".env"
@@ -570,30 +750,22 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             resumed_event = threading.Event()
             courses = [Course(course_id="100001", code="CSC101", name="Intro")]
 
-            class _FakeClient:
-                def __init__(self, session_id, **kwargs) -> None:
-                    self.session_id = session_id
-                    self.base_url = kwargs.get("base_url", "https://sis.comsats.edu.pk")
-                    self.user_agent = kwargs.get("user_agent", "")
-                    self.request_delay = 0.0
-                    self.cancel_event = None
+            portal = SimulatedPortal(
+                courses=courses,
+                marks={
+                    "100001": [
+                        MarkItem("Quizzes:1", "Quizzes", "Q1", "9", "10", ""),
+                    ]
+                },
+                expire_sessions={"expired_cookie"},
+            )
 
-                def get_courses(self):
-                    if self.session_id == "expired_cookie":
-                        raise SessionExpiredError("Expired")
+            def _note_resume(path, headers, sim):
+                if path == "/Courses" and sim._session_cookie(headers) != "expired_cookie":
                     resumed_event.set()
-                    return courses
+                return sim._respond(path, headers)
 
-                def select_course(self, cid, expected_course=None):
-                    return ""
-
-                def get_marks_summary(self, expected_course=None):
-                    from sis_client import MarkItem
-
-                    return [MarkItem("Quizzes:1", "Quizzes", "Q1", "9", "10", "")]
-
-                def get_learning_resources(self, expected_course=None):
-                    return []
+            portal.on_path["/Courses"] = _note_resume
 
             def _updater() -> None:
                 deadline = time.monotonic() + 5.0
@@ -610,7 +782,10 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 self.assertTrue(resumed_event.wait(timeout=5.0))
-                time.sleep(0.2)
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline and not state_path.exists():
+                    time.sleep(0.05)
+                time.sleep(0.3)
                 signal.raise_signal(signal.SIGTERM)
 
             prev_int = signal.getsignal(signal.SIGINT)
@@ -618,10 +793,12 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_updater, daemon=True)
             t.start()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
-                    tracker, "SisClient", _FakeClient
+                with mock.patch.object(
+                    tracker, "SisClient", portal_factory(portal)
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[notifier]):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
@@ -648,24 +825,25 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
 
             notifier = _RecordingNotifier()
 
-            class _AlwaysExpiredClient:
-                def __init__(self, *args, **kwargs) -> None:
-                    self.cancel_event = None
-
-                def get_courses(self):
-                    raise SessionExpiredError("Expired")
+            # Every dashboard fetch for this session is a login redirect.
+            portal = SimulatedPortal(expire_sessions={"still_expired"})
 
             prev_int = signal.getsignal(signal.SIGINT)
             prev_term = signal.getsignal(signal.SIGTERM)
             buf = io.StringIO()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
-                    tracker, "SisClient", _AlwaysExpiredClient
+                with mock.patch.object(
+                    tracker, "SisClient", portal_factory(portal)
                 ), mock.patch.object(
                     tracker, "build_notifiers", return_value=[notifier]
                 ), contextlib.redirect_stdout(buf):
-                    rc1 = run_daemon(env_path, state_path, heartbeat_path=hb_path)
-                    rc2 = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    fast_env = {"SIS_SESSION_ID": ""}
+                    rc1 = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ=fast_env
+                    )
+                    rc2 = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ=fast_env
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
@@ -679,42 +857,59 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             hb = json.loads(hb_path.read_text(encoding="utf-8"))
             self.assertEqual(hb["status"], "exiting_session_expired")
 
-    def test_bug4_env_precedence_and_inode_replacement_watcher(self) -> None:
+    def test_session_expired_alert_names_the_rotated_cookies(self) -> None:
+        """A1: the daemon's session-expired diagnostic exposes cookie NAMES, never values."""
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / ".env"
-            env_path.write_text("SIS_SESSION_ID=disk_cookie_1\n", encoding="utf-8")
+            state_path = Path(tmp) / "data" / "state.json"
+            hb_path = Path(tmp) / "data" / "heartbeat.json"
+            env_path.write_text(
+                "SIS_SESSION_ID=dead_cookie\n"
+                "KEEPALIVE_INTERVAL=15\n"
+                "FETCH_INTERVAL=30\n"
+                "EXPIRED_POLL_INTERVAL=1\n"
+                "SESSION_EXPIRED_TIMEOUT=1\n",
+                encoding="utf-8",
+            )
+            notifier = _RecordingNotifier()
+            portal = SimulatedPortal(
+                courses=[Course(course_id="100001", code="CSC101", name="Intro")],
+                marks={"100001": [MarkItem("Quizzes:1", "Quizzes", "Q1", "9", "10", "")]},
+                expire_sessions={"dead_cookie"},
+                login_redirect_sets_cookie="ARRAffinity",
+            )
+            buf = io.StringIO()
+            with mock.patch.object(
+                tracker, "SisClient", portal_factory(portal)
+            ), mock.patch.object(
+                tracker, "build_notifiers", return_value=[notifier]
+            ), contextlib.redirect_stdout(buf):
+                rc1 = run_daemon(
+                    env_path,
+                    state_path,
+                    heartbeat_path=hb_path,
+                    environ={"SIS_SESSION_ID": ""},
+                )
+                # Second run: the alert marker exists, so the daemon takes the
+                # "already alerted" branch and prints the diagnostic line.
+                rc2 = run_daemon(
+                    env_path,
+                    state_path,
+                    heartbeat_path=hb_path,
+                    environ={"SIS_SESSION_ID": ""},
+                )
 
-            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": "stale_process_env"}, clear=False):
-                values, sources = load_env_with_sources(env_path)
-                self.assertEqual(values["SIS_SESSION_ID"], "disk_cookie_1")
-                self.assertIn("overrides process_env", sources["SIS_SESSION_ID"])
-
-                # Fallback to process_env when .env key is blank
-                env_path.write_text("SIS_SESSION_ID=\n", encoding="utf-8")
-                values2, sources2 = load_env_with_sources(env_path)
-                self.assertEqual(values2["SIS_SESSION_ID"], "stale_process_env")
-                self.assertEqual(sources2["SIS_SESSION_ID"], "process_env")
-
-            # Watcher detects inode replacement even when value is unchanged, and content changes
-            env_path.write_text("SIS_SESSION_ID=cookie_same\n", encoding="utf-8")
-            watcher = EnvWatcher(env_path)
-            self.assertEqual(watcher.check_changed(), (False, ""))
-
-            tmp_env = Path(tmp) / ".env.tmp"
-            tmp_env.write_text("SIS_SESSION_ID=cookie_same\n", encoding="utf-8")
-            os.replace(tmp_env, env_path)
-            changed1, desc1 = watcher.check_changed()
-            self.assertTrue(changed1)
-            self.assertIn("inode", desc1)
-            self.assertIn("content unchanged", desc1)
-
-            tmp_env2 = Path(tmp) / ".env.tmp2"
-            tmp_env2.write_text("SIS_SESSION_ID=cookie_new\n", encoding="utf-8")
-            os.replace(tmp_env2, env_path)
-            changed2, desc2 = watcher.check_changed()
-            self.assertTrue(changed2)
-            self.assertIn("content changed", desc2)
-            self.assertEqual(load_config(env_path).session_id, "cookie_new")
+            self.assertEqual(rc1, 1)
+            self.assertEqual(rc2, 1)
+            self.assertEqual([n.event for n in notifier.notes], ["session_expired"])
+            message = notifier.notes[0].message
+            self.assertIn("ARRAffinity", message)
+            # The notification is names-only: no cookie VALUE ever reaches it.
+            self.assertNotIn("node7", message)
+            self.assertIn("ARRAffinity", buf.getvalue())
+            hb = json.loads(hb_path.read_text(encoding="utf-8"))
+            self.assertIn("ARRAffinity", hb["detail"])
+            self.assertNotIn("node7", hb["detail"])
 
     def test_bug5_login_detection_and_real_snapshots(self) -> None:
         # 1. Explicit markers, alternative login markup, meta refresh, JS redirect, final URL, missing shell
@@ -733,42 +928,8 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
         self.assertIsNotNone(detect_login_page("<html><body><div>500 Error</div></body></html>"))
         self.assertIsNone(detect_login_page(_auth_shell('<table class="sis-dash-table"></table>')))
 
-        # 2. HTTP 302 redirect to /Login and 200 alternate login via SisClient.get_html
-        client = SisClient("abc", request_delay=0.0)
-        redirect_err = urllib.error.HTTPError(
-            "https://sis.comsats.edu.pk/Courses",
-            302,
-            "Found",
-            {"Location": "/Login/Index"},  # type: ignore[arg-type]
-            None,
-        )
-        try:
-            with mock.patch.object(client._opener, "open", side_effect=redirect_err):
-                with self.assertRaises(SessionExpiredError):
-                    client.get_html("/Courses")
-        finally:
-            redirect_err.close()
-
-        with mock.patch.object(
-            client._opener,
-            "open",
-            return_value=_FakeHttpResponse(
-                '<html><body class="sis-login-page"><form action="/Login"><button>Go</button></form></body></html>'
-            ),
-        ):
-            with self.assertRaises(SessionExpiredError):
-                client.get_html("/Courses")
-
-        # Missing page markup on authenticated shell raises PortalParseError
-        with mock.patch.object(
-            client._opener,
-            "open",
-            return_value=_FakeHttpResponse(_auth_shell("<div>Empty error shell</div>")),
-        ):
-            with self.assertRaises(PortalParseError):
-                client.get_marks_summary()
-            with self.assertRaises(PortalParseError):
-                client.get_learning_resources()
+        # 2. SisClient login detection through redirects/pages is covered in tests/test_portal.py
+        #    (stub HTTP transport adapter); only the pure HTML/URL detectors live here.
 
         # Real HTML snapshots (if present locally) must pass authenticated shell & not false-positive
         snap_dir = ROOT / "snapshots"
@@ -815,49 +976,53 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             env_path.write_text("SIS_SESSION_ID=valid\n", encoding="utf-8")
             wedge_gate = threading.Event()
 
-            class _WedgedClient:
-                def __init__(self, *args, **kwargs) -> None:
-                    self.cancel_event = None
-
-                def get_courses(self):
+            # A genuinely wedged network: the transport blocks inside fetch() forever, which
+            # is exactly the failure the cycle watchdog exists for.
+            class _WedgedTransport(StubTransport):
+                def fetch(self, url, headers, timeout=None):
                     wedge_gate.wait(10.0)
-                    return []
+                    raise StubTransportError("never answered")
 
-            fast_cfg = load_config(env_path)
+            portal = _WedgedTransport()
+
+            fast_cfg = config.load_config(env_path)
             fast_cfg.cycle_timeout = 1  # type: ignore[assignment]
             prev_int = signal.getsignal(signal.SIGINT)
             prev_term = signal.getsignal(signal.SIGTERM)
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
-                    tracker, "SisClient", _WedgedClient
-                ), mock.patch.object(tracker, "load_config", return_value=fast_cfg):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                with mock.patch.object(
+                    tracker, "SisClient", portal_factory(portal)
+                ), mock.patch.object(config, "load_config", return_value=fast_cfg):
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 wedge_gate.set()
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
 
             self.assertEqual(rc, 1)
-            ok, msg = check_healthcheck(hb_path)
+            ok, msg = RuntimeStore(state_path, hb_path).check_healthcheck()
             self.assertFalse(ok)
             self.assertIn("wedged_exiting", msg)
 
         # Healthcheck checks: missing, fresh ok, stale, waiting_for_session
         with tempfile.TemporaryDirectory() as tmp:
             hb_path = Path(tmp) / "heartbeat.json"
-            self.assertFalse(check_healthcheck(hb_path)[0])
+            store = RuntimeStore(Path(tmp) / "state.json", hb_path, keepalive_interval=60)
+            self.assertFalse(store.check_healthcheck()[0])
 
-            write_heartbeat(hb_path, "ok", keepalive_interval=60, fetch_interval=480)
-            self.assertTrue(check_healthcheck(hb_path)[0])
+            store.write_heartbeat("ok")
+            self.assertTrue(store.check_healthcheck()[0])
 
-            write_heartbeat(hb_path, "waiting_for_session", keepalive_interval=60, fetch_interval=480)
-            self.assertFalse(check_healthcheck(hb_path)[0])
+            store.write_heartbeat("waiting_for_session")
+            self.assertFalse(store.check_healthcheck()[0])
 
             stale = json.loads(hb_path.read_text(encoding="utf-8"))
             stale["status"] = "ok"
             stale["timestamp"] = time.time() - 500
             hb_path.write_text(json.dumps(stale), encoding="utf-8")
-            ok_stale, msg_stale = check_healthcheck(hb_path, max_age_override=30)
+            ok_stale, msg_stale = store.check_healthcheck(max_age_override=30)
             self.assertFalse(ok_stale)
             self.assertIn("stale", msg_stale)
 
@@ -865,84 +1030,29 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
         c1 = Course(course_id="100001", code="CSC101", name="Course 1")
         c2 = Course(course_id="100002", code="MTH104", name="Course 2")
         prev_state = _make_state(marks_count=2, res_count=1, course_count=2)
+        new_mark = MarkItem("Quizzes:100", "Quizzes", "NewQuiz", "9", "10", "")
 
-        class _PartialFailClient:
-            def select_course(self, cid, expected_course=None):
-                if cid == "100002":
-                    raise PortalHttpError("500 error")
-                return ""
+        def _portal(**kwargs) -> SimulatedPortal:
+            return SimulatedPortal(
+                courses=[c1, c2], marks={"100001": [new_mark]}, **kwargs
+            )
 
-            def get_marks_summary(self, expected_course=None):
-                from sis_client import MarkItem
-
-                return [MarkItem("Quizzes:100", "Quizzes", "NewQuiz", "9", "10", "")]
-
-            def get_learning_resources(self, expected_course=None):
-                return []
-
+        # Course 2's SetCourse returns 500: course 1 lands, course 2 carries forward.
+        partial_portal = _portal(
+            failures={"/Courses/SetCourse/100002": PortalHttpError(
+                "HTTP 500 fetching https://sis.comsats.edu.pk/Courses/SetCourse/100002"
+            )}
+        )
         scan = scan_all_courses(
-            _PartialFailClient(),  # type: ignore[arg-type]
-            [c1, c2],
-            previous_state=prev_state,
+            portal_client(partial_portal), [c1, c2], previous_state=prev_state
         )
         self.assertTrue(scan.partial)
         self.assertEqual(scan.failed_courses, [c2.label])
         self.assertIn("100001", scan.state["courses"])
+        self.assertIn("Quizzes:100", scan.state["courses"]["100001"]["marks"])
         self.assertEqual(scan.state["courses"]["100002"], prev_state["courses"]["100002"])
 
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "state.json"
-            save_state(state_path, prev_state)
-            notifier = _RecordingNotifier()
-            res = run_cycle(
-                _PartialFailClient(),  # type: ignore[arg-type]
-                [c1, c2],
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertFalse(res.saved)
-            self.assertEqual(load_state(state_path), prev_state)
-            self.assertEqual([n.event for n in notifier.notes], ["scan_anomaly"])
 
-        # Mid-scan SessionExpiredError preserves earlier fetched course in ScanResult & keeps baseline
-        class _MidExpireClient:
-            def select_course(self, cid, expected_course=None):
-                if cid == "100002":
-                    raise SessionExpiredError("Expired mid-scan")
-                return ""
-
-            def get_marks_summary(self, expected_course=None):
-                from sis_client import MarkItem
-
-                return [MarkItem("Quizzes:100", "Quizzes", "NewQuiz", "9", "10", "")]
-
-            def get_learning_resources(self, expected_course=None):
-                return []
-
-        scan_exp = scan_all_courses(
-            _MidExpireClient(),  # type: ignore[arg-type]
-            [c1, c2],
-            previous_state=prev_state,
-        )
-        self.assertTrue(scan_exp.session_expired)
-        self.assertIn("Quizzes:100", scan_exp.state["courses"]["100001"]["marks"])
-        self.assertEqual(scan_exp.state["courses"]["100002"], prev_state["courses"]["100002"])
-
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "state.json"
-            save_state(state_path, prev_state)
-            with self.assertRaises(SessionExpiredError):
-                run_cycle(
-                    _MidExpireClient(),  # type: ignore[arg-type]
-                    [c1, c2],
-                    state_path=state_path,
-                    base_url="https://sis.comsats.edu.pk",
-                    track_announcements=False,
-                    notifiers=[],
-                )
-            self.assertEqual(load_state(state_path), prev_state)
 
     def test_bug8_active_course_verification_prevents_attribution_drift(self) -> None:
         html_csc325 = _auth_shell(
@@ -961,20 +1071,7 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
         with self.assertRaises(CourseMismatchError):
             verify_active_course(html_csc325, expected_336)
 
-        # Stuck on CSC336 while scanning CSC325 via SisClient raises CourseMismatchError
-        client = SisClient("valid", request_delay=0.0)
-        stuck_html = _auth_shell(
-            '<div class="sis-lr"><span class="sis-lr-count">0 resources</span></div>',
-            course_code="CSC336",
-            course_name="Web Technologies",
-        )
-        with mock.patch.object(
-            client._opener, "open", return_value=_FakeHttpResponse(stuck_html)
-        ):
-            with self.assertRaises(CourseMismatchError):
-                client.select_course("182153", expected_course=expected_325)
-            with self.assertRaises(CourseMismatchError):
-                client.get_learning_resources(expected_course=expected_325)
+        # Stuck on CSC336 while scanning CSC325 is covered in tests/test_portal.py (stub transport).
 
     def test_bug9_once_handles_non_session_errors_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -982,389 +1079,23 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             state_path = Path(tmp) / "state.json"
             env_path.write_text("SIS_SESSION_ID=valid\n", encoding="utf-8")
 
-            class _ErrClient:
-                def __init__(self, *args, **kwargs) -> None:
-                    self.cancel_event = None
-
-                def get_courses(self):
-                    raise PortalHttpError("502 Bad Gateway")
+            # A dashboard that answers 502 at the transport edge.
+            portal = SimulatedPortal(failures={"/Courses": StubResponse("boom", status=502)})
 
             buf = io.StringIO()
-            with mock.patch.dict(
-                os.environ,
-                {"ENV_FILE": str(env_path), "STATE_FILE": str(state_path), "SIS_SESSION_ID": ""},
-                clear=False,
-            ), mock.patch.object(tracker, "SisClient", _ErrClient), mock.patch.object(
+            main_env = {
+                "ENV_FILE": str(env_path),
+                "STATE_FILE": str(state_path),
+                "SIS_SESSION_ID": "",
+            }
+            with mock.patch.object(tracker, "SisClient", portal_factory(portal)), mock.patch.object(
                 sys, "argv", ["tracker.py", "--once"]
             ), contextlib.redirect_stdout(buf):
-                rc = tracker.main()
+                rc = tracker.main(environ=main_env)
 
             self.assertEqual(rc, 1)
-            self.assertIn("[ERROR] Scan failed: 502 Bad Gateway", buf.getvalue())
-
-    def test_bug10_load_before_scan_and_state_locking(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "state.json"
-            baseline = _make_state(marks_count=2, res_count=1, course_count=1)
-            save_state(state_path, baseline)
-
-            call_order: list[str] = []
-            orig_load = tracker.load_state
-
-            def _spy_load(path: Path):
-                call_order.append("load_state")
-                return orig_load(path)
-
-            def _spy_scan(*args, **kwargs):
-                call_order.append("scan_all_courses")
-                return tracker.ScanResult(state=_make_state(marks_count=3, res_count=1, course_count=1))
-
-            with mock.patch.object(tracker, "load_state", side_effect=_spy_load), mock.patch.object(
-                tracker, "scan_all_courses", side_effect=_spy_scan
-            ):
-                res = run_cycle(
-                    client=None,  # type: ignore[arg-type]
-                    courses=[Course(course_id="100001", code="CSC101", name="Course 1")],
-                    state_path=state_path,
-                    base_url="https://sis.comsats.edu.pk",
-                    track_announcements=False,
-                    notifiers=[],
-                )
-
-            self.assertTrue(res.saved)
-            self.assertEqual(call_order, ["load_state", "scan_all_courses"])
-
-            # Concurrent lock contention raises StateLockError
-            import fcntl
-
-            lock_path = state_path.with_name("state.json.lock")
-            with lock_path.open("a+", encoding="utf-8") as fh:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                try:
-                    with self.assertRaises(StateLockError):
-                        with state_lock(state_path, timeout=0.2):
-                            pass
-                finally:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-
-    def test_anomaly_dedup_recovery_and_diagnostics(self) -> None:
-        from sis_client import MarkItem, ResourceItem
-
-        marks_empty_html = (
-            '<html><body class="sis-portal-body">'
-            '<header class="sis-portal-header">'
-            '<a id="Dash_Board" href="/Courses/Index">Dashboard</a>'
-            '<form id="synopsisForm" method="post" action="https://ww5.comsats.edu.pk/efs/StudentLogin.aspx">'
-            '<input name="uid" hidden type="text" value="CIIT/TEST-001/ISB">'
-            '<input name="pwd" hidden type="password" value="SUPER_SECRET_PWD">'
-            "</form></header>"
-            '<div class="main_body"><div class="content_area">'
-            '<div class="sis-marks-summary"><p class="sis-marks-empty">No marks available.</p>'
-            '<input type="password" value="INNER_SECRET">'
-            "</div></div></div>"
-            '<footer class="sis-portal-footer"><p>Footer</p></footer>'
-            "</body></html>"
-        )
-
-        # Verify scrubbing directly and against local real snapshots if present
-        scrubbed = scrub_diagnostic_html(marks_empty_html)
-        self.assertNotIn("SUPER_SECRET_PWD", scrubbed)
-        self.assertNotIn("synopsisForm", scrubbed)
-        self.assertNotIn("INNER_SECRET", scrubbed)
-        self.assertIn("<!-- password input redacted -->", scrubbed)
-        self.assertIn("No marks available.", extract_diagnostic_text(marks_empty_html))
-
-        snap_marks = ROOT / "snapshots" / "marks_summary.html"
-        if snap_marks.exists():
-            raw_snap = snap_marks.read_text(encoding="utf-8", errors="replace")
-            scrubbed_snap = scrub_diagnostic_html(raw_snap)
-            self.assertNotIn("synopsisForm", scrubbed_snap)
-            self.assertNotIn('type=\'password\'', scrubbed_snap.lower())
-            self.assertNotIn('type="password"', scrubbed_snap.lower())
-
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "data" / "state.json"
-            baseline = _make_state(marks_count=6, res_count=2, course_count=1)
-            save_state(state_path, baseline)
-            courses = [Course(course_id="100001", code="CSC101", name="Course 1")]
-
-            class _ModeClient:
-                def __init__(self) -> None:
-                    self.mode = "zero_marks"
-                    self.last_marks_html = ""
-                    self.last_set_cookie_names: list[str] = []
-
-                def select_course(self, cid, expected_course=None):
-                    self.last_set_cookie_names = ["ARRAffinity"]
-                    return ""
-
-                def get_marks_summary(self, expected_course=None):
-                    self.last_set_cookie_names = []
-                    if self.mode == "zero_marks":
-                        self.last_marks_html = marks_empty_html
-                        return []
-                    if self.mode == "partial_error":
-                        raise PortalHttpError("503 Unavailable")
-                    return [
-                        MarkItem(
-                            key=f"Quizzes:0_{i}",
-                            section="Quizzes",
-                            title=f"Quiz{i}",
-                            obtained="8.0",
-                            total="10.0",
-                            date_text="01 Nov 2026",
-                        )
-                        for i in range(7)
-                    ]
-
-                def get_learning_resources(self, expected_course=None):
-                    self.last_set_cookie_names = []
-                    return [
-                        ResourceItem(
-                            key=f"res-0_{i}",
-                            title=f"Slide {i}",
-                            material_type="Slides",
-                            date_text="01 Nov 2026",
-                            size="1.0 MB",
-                            href=f"/LearningResources/Download/res-0_{i}",
-                        )
-                        for i in range(2)
-                    ]
-
-            client = _ModeClient()
-
-            # Dry-run anomaly should not persist marker or diagnostics files
-            dry_notifier = _RecordingNotifier()
-            dry_res = run_cycle(
-                client,  # type: ignore[arg-type]
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[dry_notifier],
-                dry_run=True,
-            )
-            self.assertFalse(dry_res.saved)
-            self.assertIsNotNone(dry_res.anomaly)
-            self.assertFalse(state_path.with_name(".anomaly_alerted").exists())
-            self.assertFalse(state_path.with_name("last_anomaly.json").exists())
-
-            # 1st real zero-marks anomaly sends 1 alert and writes diagnostics
-            notifier = _RecordingNotifier()
-            res1 = run_cycle(
-                client,  # type: ignore[arg-type]
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertFalse(res1.saved)
-            self.assertEqual([n.event for n in res1.notifications], ["scan_anomaly"])
-            self.assertEqual([n.event for n in notifier.notes], ["scan_anomaly"])
-            self.assertIn("Scanned: 1 courses, 0 marks, 2 resources", notifier.notes[0].message)
-            self.assertEqual(notifier.notes[0].data["set_cookie_names"], ["ARRAffinity"])  # type: ignore[index]
-
-            diag = json.loads(state_path.with_name("last_anomaly.json").read_text(encoding="utf-8"))
-            self.assertEqual(diag["occurrence"], 1)
-            self.assertEqual(diag["scanned_totals"], {"courses": 1, "marks": 0, "resources": 2})
-            self.assertEqual(diag["baseline_totals"], {"courses": 1, "marks": 6, "resources": 2})
-            self.assertEqual(diag["set_cookie_names"], ["ARRAffinity"])
-            self.assertIn("No marks available.", diag["sample_marks_preview"])
-            self.assertNotIn("SUPER_SECRET_PWD", json.dumps(diag))
-
-            diag_html = state_path.with_name("last_anomaly_marks.html").read_text(encoding="utf-8")
-            self.assertNotIn("SUPER_SECRET_PWD", diag_html)
-            self.assertNotIn("synopsisForm", diag_html)
-            self.assertNotIn("INNER_SECRET", diag_html)
-            self.assertIn("No marks available.", diag_html)
-
-            # 2nd identical zero-marks anomaly is deduplicated (no notification)
-            res2 = run_cycle(
-                client,  # type: ignore[arg-type]
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertFalse(res2.saved)
-            self.assertEqual(res2.notifications, [])
-            self.assertEqual([n.event for n in notifier.notes], ["scan_anomaly"])
-            marker2 = json.loads(state_path.with_name(".anomaly_alerted").read_text(encoding="utf-8"))
-            self.assertEqual(marker2["count"], 2)
-
-            # Different anomaly reason sends a new alert and resets count to 1
-            client.mode = "partial_error"
-            res3 = run_cycle(
-                client,  # type: ignore[arg-type]
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertFalse(res3.saved)
-            self.assertEqual([n.event for n in notifier.notes], ["scan_anomaly", "scan_anomaly"])
-            marker3 = json.loads(state_path.with_name(".anomaly_alerted").read_text(encoding="utf-8"))
-            self.assertEqual(marker3["count"], 1)
-
-            # Recovery scan with 1 new mark clears marker, saves state, and sends both recovery + marks_updated
-            client.mode = "recovered"
-            res4 = run_cycle(
-                client,  # type: ignore[arg-type]
-                courses,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertTrue(res4.saved)
-            self.assertIsNone(res4.anomaly)
-            self.assertFalse(state_path.with_name(".anomaly_alerted").exists())
-            self.assertEqual([n.event for n in res4.notifications], ["scan_recovered", "marks_updated"])
-            self.assertEqual(
-                [n.event for n in notifier.notes],
-                ["scan_anomaly", "scan_anomaly", "scan_recovered", "marks_updated"],
-            )
-            saved_after = load_state(state_path)
-            self.assertIsNotNone(saved_after)
-            assert saved_after is not None
-            self.assertEqual(len(saved_after["courses"]["100001"]["marks"]), 7)
-
-    def test_sis_client_cookie_jar_and_set_cookie_rotation(self) -> None:
-        client = SisClient("init_sid", request_delay=0.0)
-        seen_cookies: list[str] = []
-
-        def _msg(*cookies: str) -> email.message.Message:
-            m = email.message.Message()
-            for c in cookies:
-                m.add_header("Set-Cookie", c)
-            return m
-
-        auth_body = _auth_shell('<table class="sis-dash-table"></table>')
-
-        # 1. Authenticated 200 setting ARRAffinity persists on next request
-        def _open_step1(req, timeout=20):
-            seen_cookies.append(req.headers.get("Cookie", ""))
-            if len(seen_cookies) == 1:
-                return _FakeHttpResponse(
-                    auth_body,
-                    headers=_msg("ARRAffinity=node1; Path=/; HttpOnly"),
-                )
-            return _FakeHttpResponse(auth_body)
-
-        with mock.patch.object(client._opener, "open", side_effect=_open_step1):
-            client.get_html("/Courses")
-            client.get_html("/Courses")
-
-        self.assertEqual(seen_cookies[0], "ASP.NET_SessionId=init_sid")
-        self.assertIn("ASP.NET_SessionId=init_sid", seen_cookies[1])
-        self.assertIn("ARRAffinity=node1", seen_cookies[1])
-        self.assertEqual(client.session_id, "init_sid")
-
-        # 2. Non-login 302 redirect sets cookie for hop 2 and commits after hop 2 passes login detection
-        seen_cookies.clear()
-        redir_headers = _msg("PortalAffinity=edge2; Path=/")
-        redir_headers["Location"] = "/Courses/Index"
-        redir_err = urllib.error.HTTPError(
-            "https://sis.comsats.edu.pk/Courses",
-            302,
-            "Found",
-            redir_headers,  # type: ignore[arg-type]
-            None,
-        )
-
-        call_idx = 0
-
-        def _open_step2(req, timeout=20):
-            nonlocal call_idx
-            call_idx += 1
-            seen_cookies.append(req.headers.get("Cookie", ""))
-            if call_idx == 1:
-                raise redir_err
-            return _FakeHttpResponse(auth_body)
-
-        try:
-            with mock.patch.object(client._opener, "open", side_effect=_open_step2):
-                client.get_html("/Courses")
-                client.get_html("/Courses")
-        finally:
-            redir_err.close()
-
-        self.assertIn("PortalAffinity=edge2", seen_cookies[1])
-        self.assertIn("PortalAffinity=edge2", seen_cookies[2])
-        self.assertEqual(client.last_set_cookie_names, [])
-
-        # 3. Authenticated 200 rotating ASP.NET_SessionId updates client.session_id and subsequent requests
-        seen_cookies.clear()
-
-        def _open_step3(req, timeout=20):
-            seen_cookies.append(req.headers.get("Cookie", ""))
-            if len(seen_cookies) == 1:
-                return _FakeHttpResponse(
-                    auth_body,
-                    headers=_msg(
-                        "ASP.NET_SessionId=rotated_sid; Path=/; HttpOnly",
-                        "PortalAffinity=; Expires=Thu, 01-Jan-1970 00:00:00 GMT",
-                    ),
-                )
-            return _FakeHttpResponse(auth_body)
-
-        with mock.patch.object(client._opener, "open", side_effect=_open_step3):
-            client.get_html("/Courses")
-            client.get_html("/Courses")
-
-        self.assertEqual(client.session_id, "rotated_sid")
-        self.assertIn("ASP.NET_SessionId=rotated_sid", seen_cookies[1])
-        self.assertIn("ARRAffinity=node1", seen_cookies[1])
-        self.assertNotIn("PortalAffinity", seen_cookies[1])
-
-        # 4. Login 302 or 200 login page with Set-Cookie must NOT mutate cookie jar or session_id
-        login_redir_hdr = _msg("ASP.NET_SessionId=evil_redir; Path=/")
-        login_redir_hdr["Location"] = "/Login/Index"
-        login_redir_err = urllib.error.HTTPError(
-            "https://sis.comsats.edu.pk/Courses",
-            302,
-            "Found",
-            login_redir_hdr,  # type: ignore[arg-type]
-            None,
-        )
-        try:
-            with mock.patch.object(client._opener, "open", side_effect=login_redir_err):
-                with self.assertRaises(SessionExpiredError):
-                    client.get_html("/Courses")
-        finally:
-            login_redir_err.close()
-
-        self.assertEqual(client.session_id, "rotated_sid")
-
-        with mock.patch.object(
-            client._opener,
-            "open",
-            return_value=_FakeHttpResponse(
-                '<html><body class="sis-login-page"><form action="/Login"></form></body></html>',
-                headers=_msg("ASP.NET_SessionId=evil_200; Path=/"),
-            ),
-        ):
-            with self.assertRaises(SessionExpiredError):
-                client.get_html("/Courses")
-
-        self.assertEqual(client.session_id, "rotated_sid")
-
-        # 5. Manual session_id assignment resets old auxiliary cookies
-        client.session_id = "brand_new"
-        seen_cookies.clear()
-        with mock.patch.object(
-            client._opener,
-            "open",
-            side_effect=lambda req, timeout=20: (
-                seen_cookies.append(req.headers.get("Cookie", "")),
-                _FakeHttpResponse(auth_body),
-            )[1],
-        ):
-            client.get_html("/Courses")
-        self.assertEqual(seen_cookies[0], "ASP.NET_SessionId=brand_new")
+            self.assertIn("[ERROR] Scan failed:", buf.getvalue())
+            self.assertIn("502", buf.getvalue())
 
     def test_daemon_heartbeat_keeps_anomaly_across_keepalive_and_same_cookie_env_wakeup(self) -> None:
         # Part A: Heartbeat keeps status="anomaly" across keep-alive ticks
@@ -1377,31 +1108,14 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
 
             courses = [Course(course_id="100001", code="CSC101", name="Course 1")]
             tick_event = threading.Event()
-            get_courses_calls = 0
+            dashboard_fetch_count = 0
 
-            class _AnomalousClient:
-                def __init__(self, *args, **kwargs) -> None:
-                    self.cancel_event = None
-                    self.last_marks_html = ""
-                    self.last_set_cookie_names: list[str] = []
-
-                def get_courses(self):
-                    nonlocal get_courses_calls
-                    get_courses_calls += 1
-                    if get_courses_calls >= 2:
-                        tick_event.set()
-                    return courses
-
-                def select_course(self, cid, expected_course=None):
-                    return ""
-
-                def get_marks_summary(self, expected_course=None):
-                    return []
-
-                def get_learning_resources(self, expected_course=None):
-                    from sis_client import ResourceItem
-
-                    return [
+            # Real client over a simulator that answers with the same dashboard every time.
+            portal = SimulatedPortal(
+                courses=courses,
+                marks={"100001": []},
+                resources={
+                    "100001": [
                         ResourceItem(
                             key="res-0_0",
                             title="Slide 0",
@@ -1411,8 +1125,20 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                             href="/LearningResources/Download/res-0_0",
                         )
                     ]
+                },
+            )
 
-            fast_cfg = tracker.TrackerConfig(
+            def _count_dashboard(path, headers, sim):
+                nonlocal dashboard_fetch_count
+                if path == "/Courses":
+                    dashboard_fetch_count += 1
+                    if dashboard_fetch_count >= 2:
+                        tick_event.set()
+                return sim._respond(path, headers)
+
+            portal.on_path["/Courses"] = _count_dashboard
+
+            fast_cfg = config.TrackerConfig(
                 raw={"SIS_SESSION_ID": "valid_cookie"},
                 session_id="valid_cookie",
                 base_url="https://sis.comsats.edu.pk",
@@ -1439,8 +1165,8 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_stopper, daemon=True)
             t.start()
             try:
-                with mock.patch.object(tracker, "SisClient", _AnomalousClient), mock.patch.object(
-                    tracker, "load_config", return_value=fast_cfg
+                with mock.patch.object(tracker, "SisClient", portal_factory(portal)), mock.patch.object(
+                    config, "load_config", return_value=fast_cfg
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[_RecordingNotifier()]):
                     rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
             finally:
@@ -1449,11 +1175,11 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                 t.join(timeout=2.0)
 
             self.assertEqual(rc, 0)
-            self.assertGreaterEqual(get_courses_calls, 2)
+            self.assertGreaterEqual(dashboard_fetch_count, 2)
             hb = json.loads(hb_path.read_text(encoding="utf-8"))
             self.assertEqual(hb["status"], "anomaly")
             self.assertIn("keep-alive OK", hb["detail"])
-            self.assertTrue(check_healthcheck(hb_path)[0])
+            self.assertTrue(RuntimeStore(state_path, hb_path).check_healthcheck(max_age_override=300)[0])
 
         # Part B: Touching/replacing .env with the SAME SIS_SESSION_ID wakes up expired wait loop immediately
         with tempfile.TemporaryDirectory() as tmp:
@@ -1476,48 +1202,29 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             attempts = 0
             retested_while_expired = threading.Event()
 
-            class _SameCookieClient:
-                def __init__(self, session_id, **kwargs) -> None:
-                    self._session_id = ""
-                    self.session_id = session_id
-                    self.base_url = kwargs.get("base_url", "https://sis.comsats.edu.pk")
-                    self.user_agent = kwargs.get("user_agent", "")
-                    self.request_delay = 0.0
-                    self.cancel_event = None
-                    self.last_marks_html = ""
-                    self.last_set_cookie_names: list[str] = []
+            # The portal keeps rejecting the *same* session cookie until the second .env
+            # save; each dashboard fetch is one "attempt".
+            portal = SimulatedPortal(
+                courses=courses,
+                marks={"100001": [MarkItem("Quizzes:1", "Quizzes", "Q1", "9", "10", "")]},
+            )
+            accepting = threading.Event()
 
-                @property
-                def session_id(self) -> str:
-                    return self._session_id
-
-                @session_id.setter
-                def session_id(self, value: str) -> None:
-                    self._session_id = value
-
-                def get_courses(self):
-                    nonlocal attempts
+            def _count_attempt(path, headers, sim):
+                nonlocal attempts
+                if path == "/Courses":
                     with attempt_lock:
                         attempts += 1
-                        cur = attempts
-                    if cur == 1:
-                        raise SessionExpiredError("Expired #1")
-                    if cur == 2:
+                        current = attempts
+                    if current == 2:
                         retested_while_expired.set()
-                        raise SessionExpiredError("Still expired #2")
-                    resumed_event.set()
-                    return courses
+                    if accepting.is_set():
+                        resumed_event.set()
+                        return sim._respond(path, headers)
+                    return sim._login_redirect()
+                return sim._respond(path, headers)
 
-                def select_course(self, cid, expected_course=None):
-                    return ""
-
-                def get_marks_summary(self, expected_course=None):
-                    from sis_client import MarkItem
-
-                    return [MarkItem("Quizzes:1", "Quizzes", "Q1", "9", "10", "")]
-
-                def get_learning_resources(self, expected_course=None):
-                    return []
+            portal.on_path["/Courses"] = _count_attempt
 
             def _wait_for_waiting() -> None:
                 deadline = time.monotonic() + 5.0
@@ -1542,11 +1249,14 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
 
                 _wait_for_waiting()
                 # Second replacement once server accepts the reused cookie
+                accepting.set()
                 tmp2 = Path(tmp) / ".env.tmp2"
                 tmp2.write_text(env_content, encoding="utf-8")
                 os.replace(tmp2, env_path)
-                self.assertTrue(resumed_event.wait(timeout=4.0))
-                time.sleep(0.2)
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline and not state_path.exists():
+                    time.sleep(0.05)
+                time.sleep(0.3)
                 signal.raise_signal(signal.SIGTERM)
 
             prev_int = signal.getsignal(signal.SIGINT)
@@ -1554,10 +1264,12 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_same_cookie_updater, daemon=True)
             t.start()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
-                    tracker, "SisClient", _SameCookieClient
+                with mock.patch.object(
+                    tracker, "SisClient", portal_factory(portal)
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[notifier]):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
@@ -1565,156 +1277,6 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual([n.event for n in notifier.notes], ["session_expired", "baseline_saved"])
-
-    def test_probe_respects_env_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            env_path = Path(tmp) / "custom.env"
-            env_path.write_text("SIS_SESSION_ID=probe_cookie_from_env_file\n", encoding="utf-8")
-
-            with mock.patch.dict(
-                os.environ,
-                {"ENV_FILE": str(env_path), "SIS_SESSION_ID": ""},
-                clear=False,
-            ), mock.patch.object(sys, "argv", ["probe.py"]), mock.patch.object(
-                probe, "run_probe", return_value=0
-            ) as mock_run:
-                rc = probe.main()
-
-            self.assertEqual(rc, 0)
-            mock_run.assert_called_once()
-            self.assertEqual(mock_run.call_args[0][0], "probe_cookie_from_env_file")
-
-    def test_env_parser_boms_and_encodings(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False):
-                # 1. UTF-8 BOM directly before SIS_SESSION_ID on line 1
-                p1 = Path(tmp) / "utf8_bom.env"
-                p1.write_bytes(b"\xef\xbb\xbfSIS_SESSION_ID=bom_sid_1\n")
-                self.assertEqual(load_config(p1).session_id, "bom_sid_1")
-
-                # 2. UTF-8 BOM directly before comment containing '=' on line 1
-                p2 = Path(tmp) / "utf8_bom_comment.env"
-                p2.write_bytes(b"\xef\xbb\xbf# comment with = sign\nSIS_SESSION_ID=bom_sid_2\n")
-                self.assertEqual(load_config(p2).session_id, "bom_sid_2")
-
-                # 3. UTF-16 LE & UTF-16 BE with BOM (and UTF-32 LE with BOM)
-                p3 = Path(tmp) / "utf16le.env"
-                p3.write_bytes(b"\xff\xfe" + "SIS_SESSION_ID=u16le_sid\n".encode("utf-16-le"))
-                self.assertEqual(load_config(p3).session_id, "u16le_sid")
-
-                p4 = Path(tmp) / "utf16be.env"
-                p4.write_bytes(b"\xfe\xff" + "SIS_SESSION_ID=u16be_sid\n".encode("utf-16-be"))
-                self.assertEqual(load_config(p4).session_id, "u16be_sid")
-
-                p5 = Path(tmp) / "utf32le.env"
-                p5.write_bytes(b"\xff\xfe\x00\x00" + "SIS_SESSION_ID=u32le_sid\n".encode("utf-32-le"))
-                self.assertEqual(load_config(p5).session_id, "u32le_sid")
-
-                # 4. Windows-1252 (cp1252) em-dash 0x97 in comment
-                p6 = Path(tmp) / "cp1252.env"
-                p6.write_bytes(b"# COMSATS \x97 Portal\nSIS_SESSION_ID=cp1252_sid\n")
-                self.assertEqual(load_config(p6).session_id, "cp1252_sid")
-
-    def test_env_parser_export_inline_comments_and_quotes(self) -> None:
-        # export prefix variations and non-export keys starting with export/EXPORT
-        parsed_export = parse_env_text(
-            "export SIS_SESSION_ID=abc\n"
-            "EXPORT_FLAG=1\n"
-            "export_mode=2\n"
-        )
-        self.assertEqual(parsed_export["SIS_SESSION_ID"], "abc")
-        self.assertEqual(parsed_export["EXPORT_FLAG"], "1")
-        self.assertEqual(parsed_export["export_mode"], "2")
-        self.assertEqual(parse_env_text('export   SIS_SESSION_ID="abc"\n')["SIS_SESSION_ID"], "abc")
-        self.assertEqual(parse_env_text("export\tSIS_SESSION_ID='abc' # note\n")["SIS_SESSION_ID"], "abc")
-
-        # Unquoted inline # comments vs unquoted '#' without preceding whitespace
-        with tempfile.TemporaryDirectory() as tmp:
-            env_path = Path(tmp) / ".env"
-            env_path.write_text(
-                "SIS_SESSION_ID=abc123 # morning\n"
-                "KEEPALIVE_INTERVAL=60 # 1 min\n"
-                "TRACK_ANNOUNCEMENTS=true # on\n"
-                "WEBHOOK_URL=https://example.com/hook#frag\n"
-                "NTFY_TOKEN=tok#123 # real comment\n",
-                encoding="utf-8",
-            )
-            with mock.patch.dict(
-                os.environ,
-                {"SIS_SESSION_ID": "", "KEEPALIVE_INTERVAL": "", "TRACK_ANNOUNCEMENTS": ""},
-                clear=False,
-            ):
-                cfg = load_config(env_path)
-            self.assertEqual(cfg.session_id, "abc123")
-            self.assertEqual(cfg.keepalive_interval, 60)
-            self.assertTrue(cfg.track_announcements)
-            self.assertEqual(cfg.raw["WEBHOOK_URL"], "https://example.com/hook#frag")
-            self.assertEqual(cfg.raw["NTFY_TOKEN"], "tok#123")
-
-        self.assertEqual(parse_env_text("SIS_SESSION_ID=# comment\n")["SIS_SESSION_ID"], "")
-        self.assertEqual(parse_env_text("SIS_SESSION_ID= # comment\n")["SIS_SESSION_ID"], "")
-
-        # Quoted values with trailing # comments, preserved #, empty quotes, nested quotes, escapes
-        quoted_cases = [
-            ('K="abc" # c', "abc"),
-            ('K="abc"#c', "abc"),
-            ("K='abc' # c", "abc"),
-            ("K='abc'#c", "abc"),
-            ('K="abc # 123" # c', "abc # 123"),
-            ("K='abc # 123' # c", "abc # 123"),
-            ('K="" # empty', ""),
-            ("K='' # empty", ""),
-            ("""K="a'b'" """, "a'b'"),
-            ("""K='a"b"' """, 'a"b"'),
-            (r'K="a\"b\\c"', 'a"b\\c'),
-        ]
-        for line, expected in quoted_cases:
-            self.assertEqual(parse_env_text(line)["K"], expected, msg=f"Failed for {line!r}")
-
-        # Duplicate keys: last assignment wins, including blanking an earlier .env key
-        with tempfile.TemporaryDirectory() as tmp:
-            env_path = Path(tmp) / ".env"
-            env_path.write_text(
-                "SIS_SESSION_ID=first\nSIS_SESSION_ID=second\nNTFY_URL=https://ntfy.sh/t\nNTFY_URL=\n",
-                encoding="utf-8",
-            )
-            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": "", "NTFY_URL": ""}, clear=False):
-                vals, _ = load_env_with_sources(env_path)
-            self.assertEqual(vals["SIS_SESSION_ID"], "second")
-            self.assertEqual(vals["NTFY_URL"], "")
-
-    def test_session_normalization_and_secret_free_diagnostics(self) -> None:
-        self.assertEqual(normalize_session_id("ASP.NET_SessionId=abc"), "abc")
-        self.assertEqual(normalize_session_id("asp.net_sessionid=abc; Path=/; HttpOnly"), "abc")
-        self.assertEqual(normalize_session_id("Cookie: foo=1; ASP.NET_SessionId=abc; bar=2"), "abc")
-        self.assertEqual(normalize_session_id("ASP.NET_SessionId="), "")
-        placeholder_parsed = parse_env_text('SIS_SESSION_ID="paste_your_ASP_NET_SessionId_here" # placeholder')
-        self.assertEqual(normalize_session_id(placeholder_parsed["SIS_SESSION_ID"]), "")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            # Directory passed as ENV_FILE must not raise IsADirectoryError
-            dir_path = Path(tmp) / "env_dir"
-            dir_path.mkdir()
-            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False):
-                self.assertEqual(parse_env_file(dir_path), {})
-                with self.assertRaises(SystemExit) as dir_ctx:
-                    load_config(dir_path, require_session=True)
-            self.assertIn("directory", str(dir_ctx.exception))
-
-            # Missing SIS_SESSION_ID with typo'd key surfaces key name without leaking any values
-            typo_env = Path(tmp) / ".env"
-            typo_env.write_text(
-                "SIS_SESSIONID=super_secret_val\nNTFY_TOKEN=secret_token\n",
-                encoding="utf-8",
-            )
-            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": "", "NTFY_TOKEN": ""}, clear=False):
-                with self.assertRaises(SystemExit) as typo_ctx:
-                    load_config(typo_env, require_session=True)
-            err_msg = str(typo_ctx.exception)
-            self.assertIn("SIS_SESSIONID", err_msg)
-            self.assertIn("NTFY_TOKEN", err_msg)
-            self.assertNotIn("super_secret_val", err_msg)
-            self.assertNotIn("secret_token", err_msg)
 
     def test_daemon_and_probe_with_bom_export_and_inline_comment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1729,42 +1291,32 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                 b"SESSION_EXPIRED_TIMEOUT=20\n"
             )
 
-            # Verify probe.load_env & probe.load_config handle BOM + export + quoted inline comment
-            with mock.patch.dict(os.environ, {"SIS_SESSION_ID": "", "SIS_USER_AGENT": ""}, clear=False):
-                self.assertEqual(probe.load_env(env_path)["SIS_SESSION_ID"], "expired_cookie")
-                probe_sid, _ = probe.load_config(env_path)
-                self.assertEqual(probe_sid, "expired_cookie")
+            # Verify probe.load_config handles BOM + export + quoted inline comment
+            probe_sid, _ = probe.load_config(
+                env_path, environ={"SIS_SESSION_ID": "", "SIS_USER_AGENT": ""}
+            )
+            self.assertEqual(probe_sid, "expired_cookie")
 
             notifier = _RecordingNotifier()
             resumed_event = threading.Event()
             courses = [Course(course_id="100001", code="CSC101", name="Intro")]
 
-            class _FakeClient:
-                def __init__(self, session_id, **kwargs) -> None:
-                    self.session_id = session_id
-                    self.base_url = kwargs.get("base_url", "https://sis.comsats.edu.pk")
-                    self.user_agent = kwargs.get("user_agent", "")
-                    self.request_delay = 0.0
-                    self.cancel_event = None
+            # Only "fresh_cookie" is accepted; "expired_cookie" gets the login page.
+            portal = SimulatedPortal(
+                courses=courses,
+                marks={"100001": [MarkItem("Quizzes:1", "Quizzes", "Q1", "9", "10", "")]},
+                expire_sessions={"expired_cookie"},
+            )
 
-                def get_courses(self):
-                    if self.session_id == "expired_cookie":
-                        raise SessionExpiredError("Expired")
-                    if self.session_id == "fresh_cookie":
-                        resumed_event.set()
-                        return courses
-                    raise AssertionError(f"Unexpected session_id: {self.session_id!r}")
+            def _note_fresh(path, headers, sim):
+                if (
+                    path == "/Courses"
+                    and sim._session_cookie(headers) == "fresh_cookie"
+                ):
+                    resumed_event.set()
+                return sim._respond(path, headers)
 
-                def select_course(self, cid, expected_course=None):
-                    return ""
-
-                def get_marks_summary(self, expected_course=None):
-                    from sis_client import MarkItem
-
-                    return [MarkItem("Quizzes:1", "Quizzes", "Q1", "9", "10", "")]
-
-                def get_learning_resources(self, expected_course=None):
-                    return []
+            portal.on_path["/Courses"] = _note_fresh
 
             def _updater() -> None:
                 deadline = time.monotonic() + 5.0
@@ -1780,7 +1332,10 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                     b"SESSION_EXPIRED_TIMEOUT=20\n"
                 )
                 self.assertTrue(resumed_event.wait(timeout=5.0))
-                time.sleep(0.2)
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline and not state_path.exists():
+                    time.sleep(0.05)
+                time.sleep(0.3)
                 signal.raise_signal(signal.SIGTERM)
 
             prev_int = signal.getsignal(signal.SIGINT)
@@ -1788,10 +1343,12 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_updater, daemon=True)
             t.start()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
-                    tracker, "SisClient", _FakeClient
+                with mock.patch.object(
+                    tracker, "SisClient", portal_factory(portal)
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[notifier]):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
@@ -1802,103 +1359,9 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             self.assertIn("session_expired", events)
             self.assertIn("baseline_saved", events)
 
-    def test_redirect_safety_blocks_cross_host_and_downgrade(self) -> None:
-        client = SisClient("secret_sid", request_delay=0.0)
-        auth_body = _auth_shell('<table class="sis-dash-table"></table>')
-
-        def _make_redir(url: str, location: str) -> urllib.error.HTTPError:
-            hdrs = email.message.Message()
-            hdrs["Location"] = location
-            return urllib.error.HTTPError(url, 302, "Found", hdrs, None)  # type: ignore[arg-type]
-
-        # 1. Cross-host redirect must fail without issuing a second request
-        cross_err = _make_redir("https://sis.comsats.edu.pk/Courses", "https://evil.example.com/steal")
-        try:
-            with mock.patch.object(client._opener, "open", side_effect=[cross_err]) as m_open:
-                with self.assertRaises(PortalHttpError):
-                    client.get_html("/Courses")
-                self.assertEqual(m_open.call_count, 1)
-        finally:
-            cross_err.close()
-
-        # 2. HTTPS -> HTTP downgrade redirect must fail without issuing a second request
-        down_err = _make_redir("https://sis.comsats.edu.pk/Courses", "http://sis.comsats.edu.pk/Courses/Index")
-        try:
-            with mock.patch.object(client._opener, "open", side_effect=[down_err]) as m_open:
-                with self.assertRaises(PortalHttpError):
-                    client.get_html("/Courses")
-                self.assertEqual(m_open.call_count, 1)
-        finally:
-            down_err.close()
-
-        # 3. Same-host HTTPS redirect is still allowed
-        same_err = _make_redir("https://sis.comsats.edu.pk/Courses", "/Courses/Index")
-        try:
-            with mock.patch.object(
-                client._opener,
-                "open",
-                side_effect=[same_err, _FakeHttpResponse(auth_body)],
-            ) as m_open:
-                self.assertEqual(client.get_html("/Courses"), auth_body)
-                self.assertEqual(m_open.call_count, 2)
-        finally:
-            same_err.close()
-
-        # 4. Cross-host login redirect still raises SessionExpiredError
-        login_err = _make_redir("https://sis.comsats.edu.pk/Courses", "https://sso.example.com/Login/Index")
-        try:
-            with mock.patch.object(client._opener, "open", side_effect=[login_err]):
-                with self.assertRaises(SessionExpiredError):
-                    client.get_html("/Courses")
-        finally:
-            login_err.close()
-
-        # 5. probe.fetch also stops without leaking cookies on cross-host or downgrade redirects
-        for target in ("https://evil.example.com/steal", "http://sis.comsats.edu.pk/Courses/Index"):
-            p_err = _make_redir("https://sis.comsats.edu.pk/Courses", target)
-            fake_opener = mock.Mock()
-            fake_opener.open.side_effect = [p_err]
-            try:
-                with mock.patch.object(probe.urllib.request, "build_opener", return_value=fake_opener):
-                    res = probe.fetch("/Courses", "secret_sid")
-                self.assertEqual(res.status, 302)
-                self.assertEqual(fake_opener.open.call_count, 1)
-            finally:
-                p_err.close()
-
-    def test_value_error_and_header_sanitization_safety(self) -> None:
-        # 1. Invalid base_url without scheme wraps ValueError in PortalHttpError
-        bad_client = SisClient("sid", base_url="sis.comsats.edu.pk", request_delay=0.0)
-        with self.assertRaises(PortalHttpError):
-            bad_client.get_html("/Courses")
-
-        # 2. Non-Latin-1 / CRLF in User-Agent is sanitized before Request construction
-        auth_body = _auth_shell('<table class="sis-dash-table"></table>')
-        seen_ua: list[str] = []
-        ua_client = SisClient(
-            "sid",
-            user_agent="Mozilla/5.0\r\nX-Bad: 1 — test",
-            request_delay=0.0,
-        )
-
-        def _capture_open(req, timeout=20):
-            seen_ua.append(req.headers.get("User-agent", ""))
-            return _FakeHttpResponse(auth_body)
-
-        with mock.patch.object(ua_client._opener, "open", side_effect=_capture_open):
-            ua_client.get_html("/Courses")
-        self.assertEqual(seen_ua, ["Mozilla/5.0X-Bad: 1  test"])
-
-        # 3. UnicodeEncodeError during open is wrapped as PortalHttpError
-        with mock.patch.object(
-            ua_client._opener,
-            "open",
-            side_effect=UnicodeEncodeError("latin-1", "bad", 0, 1, "ordinal not in range"),
-        ):
-            with self.assertRaises(PortalHttpError):
-                ua_client.get_html("/Courses")
-
-        # 4. run_daemon catches ValueError from get_courses cleanly without crashing
+    def test_daemon_survives_value_error_from_portal(self) -> None:
+        # Header sanitization, invalid base URL, and transport-exception translation are
+        # covered in tests/test_portal.py through the stub transport adapter.
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / ".env"
             state_path = Path(tmp) / "data" / "state.json"
@@ -1906,13 +1369,14 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             env_path.write_text("SIS_SESSION_ID=valid\nKEEPALIVE_INTERVAL=15\n", encoding="utf-8")
             errored_event = threading.Event()
 
-            class _ValueErrorClient:
-                def __init__(self, *args, **kwargs) -> None:
-                    self.cancel_event = None
-
-                def get_courses(self):
+            # Raising ValueError out of the transport edge proves the daemon survives the
+            # same class of bad-URL error urllib used to leak.
+            class _ValueErrorTransport(StubTransport):
+                def fetch(self, url, headers, timeout=None):
                     errored_event.set()
                     raise ValueError("unknown url type: bad")
+
+            portal = _ValueErrorTransport()
 
             def _stopper() -> None:
                 self.assertTrue(errored_event.wait(timeout=5.0))
@@ -1928,10 +1392,12 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_stopper, daemon=True)
             t.start()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
-                    tracker, "SisClient", _ValueErrorClient
+                with mock.patch.object(
+                    tracker, "SisClient", portal_factory(portal)
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[_RecordingNotifier()]):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
@@ -1954,30 +1420,25 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             courses = [Course(course_id="100001", code="CSC101", name="Course 1")]
             in_scan = threading.Event()
             observed_cancel: list[threading.Event] = []
+            created: list = []
 
-            class _SlowScanClient:
-                def __init__(self, *args, **kwargs) -> None:
-                    self.cancel_event: Optional[threading.Event] = kwargs.get("cancel_event")
-                    self.last_semester = "Fall 2026"
+            # The SetCourse hop blocks until the daemon's cancel_event fires — the real
+            # cooperative-cancellation path through the transport seam.
+            class _SlowTransport(SimulatedPortal):
+                def fetch(self, url, headers, timeout=None):
+                    if urllib.parse.urlparse(url).path.startswith("/Courses/SetCourse/"):
+                        client = created[-1]
+                        cancel = getattr(client, "cancel_event", None)
+                        if cancel is not None:
+                            observed_cancel.append(cancel)
+                        in_scan.set()
+                        if cancel is not None:
+                            cancel.wait(10.0)
+                            if cancel.is_set():
+                                raise StubTransportError("Request cancelled.")
+                    return super().fetch(url, headers, timeout)
 
-                def get_courses(self):
-                    return courses
-
-                def select_course(self, cid, expected_course=None):
-                    if self.cancel_event is not None:
-                        observed_cancel.append(self.cancel_event)
-                    in_scan.set()
-                    if self.cancel_event is not None:
-                        self.cancel_event.wait(10.0)
-                        if self.cancel_event.is_set():
-                            raise PortalHttpError("Request cancelled.")
-                    return ""
-
-                def get_marks_summary(self, expected_course=None):
-                    return []
-
-                def get_learning_resources(self, expected_course=None):
-                    return []
+            portal = _SlowTransport(courses=courses)
 
             sig_t0: list[float] = []
 
@@ -1991,10 +1452,12 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_stopper, daemon=True)
             t.start()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
-                    tracker, "SisClient", _SlowScanClient
+                with mock.patch.object(
+                    tracker, "SisClient", portal_factory(portal, created)
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[_RecordingNotifier()]):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
@@ -2005,33 +1468,6 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             self.assertLess(elapsed_after_sig, 2.0)
             self.assertTrue(observed_cancel and observed_cancel[0].is_set())
             self.assertFalse(state_path.exists())
-
-    def test_backup_chain_recovery_and_corrupt_state_preservation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "data" / "state.json"
-            s1 = _make_state(marks_count=1, res_count=1, course_count=1)
-            s2 = _make_state(marks_count=2, res_count=1, course_count=1)
-            s3 = _make_state(marks_count=3, res_count=1, course_count=1)
-            s4 = _make_state(marks_count=4, res_count=1, course_count=1)
-
-            save_state(state_path, s1, max_backups=3)
-            save_state(state_path, s2, max_backups=3)
-            save_state(state_path, s3, max_backups=3)
-            # Now state.json=s3, .bak=s2, .bak.2=s1
-
-            # Corrupt both state.json and .bak -> load_state falls back to .bak.2
-            state_path.write_text("{bad primary", encoding="utf-8")
-            state_path.with_name("state.json.bak").write_text("{bad bak", encoding="utf-8")
-            self.assertEqual(load_state(state_path), s1)
-
-            # Restore .bak to s2 while state.json stays corrupt -> save_state(s4) preserves .bak=s2
-            save_state(state_path.with_name("state.json.bak"), s2, max_backups=0)
-            save_state(state_path, s4, max_backups=3)
-            self.assertEqual(load_state(state_path), s4)
-            self.assertEqual(
-                json.loads(state_path.with_name("state.json.bak").read_text(encoding="utf-8")),
-                s2,
-            )
 
     def test_semester_tracking_rollover_retake_legacy_and_reset_state(self) -> None:
         from sis_client import MarkItem
@@ -2047,104 +1483,11 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                 bool(parse_semester(snap_courses.read_text(encoding="utf-8", errors="replace")))
             )
 
+        # In-cycle rollover / retake / legacy-upgrade scenarios are covered end-to-end by
+        # CycleIntegrationTests and purely by tests/test_snapshot_transition.py; what stays
+        # here is the CLI contract around --reset-state.
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "data" / "state.json"
-            fall_state = _make_state(marks_count=6, res_count=2, course_count=2)
-            fall_state["semester"] = "Fall 2026"
-            save_state(state_path, fall_state)
-
-            class _RolloverClient:
-                def __init__(self, semester: str, marks: list[MarkItem]) -> None:
-                    self.last_semester = semester
-                    self._marks = marks
-
-                def select_course(self, cid, expected_course=None):
-                    return ""
-
-                def get_marks_summary(self, expected_course=None):
-                    return list(self._marks)
-
-                def get_learning_resources(self, expected_course=None):
-                    return []
-
-            # 1. Same semester (Fall 2026 -> Fall 2026) with 6 -> 0 marks STILL blocked as anomaly
-            notifier = _RecordingNotifier()
-            c_same = [
-                Course(course_id="100001", code="CSC101", name="Course 1"),
-                Course(course_id="100002", code="CSC102", name="Course 2"),
-            ]
-            res_anom = run_cycle(
-                _RolloverClient("Fall 2026", []),  # type: ignore[arg-type]
-                c_same,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertFalse(res_anom.saved)
-            self.assertIsNotNone(res_anom.anomaly)
-
-            # 2. New semester (Fall 2026 -> Spring 2027) WITH retaken course 100001 and 0 marks rolls over
-            notifier.notes.clear()
-            c_spring = [
-                Course(course_id="100001", code="CSC101", name="Course 1 (Retake)"),
-                Course(course_id="200003", code="CSC203", name="Course 3"),
-            ]
-            res_roll = run_cycle(
-                _RolloverClient("Spring 2027", []),  # type: ignore[arg-type]
-                c_spring,
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[notifier],
-            )
-            self.assertTrue(res_roll.saved)
-            self.assertIsNone(res_roll.anomaly)
-            events = [n.event for n in notifier.notes]
-            self.assertIn("semester_rollover", events)
-            self.assertNotIn("course_removed", events)
-            saved_spring = load_state(state_path)
-            assert saved_spring is not None
-            self.assertEqual(saved_spring.get("semester"), "Spring 2027")
-            self.assertEqual(
-                json.loads(state_path.with_name("state.json.bak").read_text(encoding="utf-8")).get("semester"),
-                "Fall 2026",
-            )
-
-            # 3. Legacy state without "semester": same courses upgrade cleanly without rollover;
-            #    disjoint courses roll over cleanly even with 0 marks
-            legacy_state = _make_state(marks_count=6, res_count=1, course_count=1)
-            self.assertNotIn("semester", legacy_state)
-            save_state(state_path, legacy_state)
-            legacy_same_marks = [
-                MarkItem(f"Quizzes:0_{i}", "Quizzes", f"Quiz{i}", "8.0", "10.0", "01 Nov")
-                for i in range(6)
-            ]
-            res_legacy_same = run_cycle(
-                _RolloverClient("Fall 2026", legacy_same_marks),  # type: ignore[arg-type]
-                [Course(course_id="100001", code="CSC101", name="Course 1")],
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[_RecordingNotifier()],
-            )
-            self.assertTrue(res_legacy_same.saved)
-            self.assertEqual((load_state(state_path) or {}).get("semester"), "Fall 2026")
-            self.assertIsNone(detect_semester_rollover(legacy_state, load_state(state_path) or {}))
-
-            save_state(state_path, legacy_state)
-            disjoint_notifier = _RecordingNotifier()
-            res_legacy_disjoint = run_cycle(
-                _RolloverClient("", []),  # type: ignore[arg-type]
-                [Course(course_id="999001", code="CSC499", name="New Term Course")],
-                state_path=state_path,
-                base_url="https://sis.comsats.edu.pk",
-                track_announcements=False,
-                notifiers=[disjoint_notifier],
-            )
-            self.assertTrue(res_legacy_disjoint.saved)
-            self.assertEqual([n.event for n in disjoint_notifier.notes], ["semester_rollover"])
-
             # 4. --once --reset-state overrides same-semester >50% drop, plus SIS_SEMESTER override;
             #    --reset-state without --once returns 1
             env_path = Path(tmp) / ".env"
@@ -2153,35 +1496,24 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             big_state["semester"] = "Summer 2027"
             save_state(state_path, big_state)
 
-            class _ResetCliClient:
-                def __init__(self, *args, **kwargs) -> None:
-                    self.cancel_event = None
-                    self.last_semester = ""
-
-                def get_courses(self):
-                    return [Course(course_id="100001", code="CSC101", name="Course 1")]
-
-                def select_course(self, cid, expected_course=None):
-                    return ""
-
-                def get_marks_summary(self, expected_course=None):
-                    return []
-
-                def get_learning_resources(self, expected_course=None):
-                    return []
-
+            reset_portal = SimulatedPortal(
+                courses=[Course(course_id="100001", code="CSC101", name="Course 1")]
+            )
             reset_notifier = _RecordingNotifier()
-            with mock.patch.dict(
-                os.environ,
-                {"ENV_FILE": str(env_path), "STATE_FILE": str(state_path), "SIS_SESSION_ID": ""},
-                clear=False,
-            ), mock.patch.object(tracker, "SisClient", _ResetCliClient), mock.patch.object(
+            main_env = {
+                "ENV_FILE": str(env_path),
+                "STATE_FILE": str(state_path),
+                "SIS_SESSION_ID": "",
+            }
+            with mock.patch.object(
+                tracker, "SisClient", portal_factory(reset_portal)
+            ), mock.patch.object(
                 tracker, "build_notifiers", return_value=[reset_notifier]
             ):
                 with mock.patch.object(sys, "argv", ["tracker.py", "--reset-state"]):
-                    self.assertEqual(tracker.main(), 1)
+                    self.assertEqual(tracker.main(environ=main_env), 1)
                 with mock.patch.object(sys, "argv", ["tracker.py", "--once", "--reset-state"]):
-                    rc_reset = tracker.main()
+                    rc_reset = tracker.main(environ=main_env)
 
             self.assertEqual(rc_reset, 0)
             self.assertEqual([n.event for n in reset_notifier.notes], ["baseline_saved"])
@@ -2210,43 +1542,34 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             attempts = 0
             attempt_lock = threading.Lock()
             second_expire_seen = threading.Event()
+            accepted_once = threading.Event()
 
-            class _FlakyReusedClient:
-                def __init__(self, session_id, **kwargs) -> None:
-                    self._session_id = session_id
-                    self.cancel_event = None
-                    self.last_marks_html = ""
-                    self.last_set_cookie_names: list[str] = []
-                    self.last_semester = ""
+            # Dashboard fetch #1 expires, #2 succeeds (then the scan hits an anomaly),
+            # #3 onward expire again — the exact sequence that proves a successful
+            # roster fetch clears .session_alerted even when the scan then fails.
+            portal = SimulatedPortal(
+                courses=courses,
+                marks={"100001": []},
+                resources={"100001": []},
+                semester="",
+            )
 
-                @property
-                def session_id(self) -> str:
-                    return self._session_id
+            def _flaky_dashboard(path, headers, sim):
+                nonlocal attempts
+                if path != "/Courses":
+                    return sim._respond(path, headers)
+                with attempt_lock:
+                    attempts += 1
+                    current = attempts
+                if current == 1:
+                    return sim._login_redirect()
+                if current == 2:
+                    accepted_once.set()
+                    return sim._respond(path, headers)
+                second_expire_seen.set()
+                return sim._login_redirect()
 
-                @session_id.setter
-                def session_id(self, value: str) -> None:
-                    self._session_id = value
-
-                def get_courses(self):
-                    nonlocal attempts
-                    with attempt_lock:
-                        attempts += 1
-                        cur = attempts
-                    if cur == 1:
-                        raise SessionExpiredError("Expired #1")
-                    if cur == 2:
-                        return courses
-                    second_expire_seen.set()
-                    raise SessionExpiredError("Expired #2")
-
-                def select_course(self, cid, expected_course=None):
-                    return ""
-
-                def get_marks_summary(self, expected_course=None):
-                    return []
-
-                def get_learning_resources(self, expected_course=None):
-                    return []
+            portal.on_path["/Courses"] = _flaky_dashboard
 
             def _driver() -> None:
                 deadline = time.monotonic() + 5.0
@@ -2254,16 +1577,18 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
                     if hb_path.exists() and "waiting_for_session" in hb_path.read_text(encoding="utf-8"):
                         break
                     time.sleep(0.05)
-                # Touch .env with same cookie -> attempt #2 passes get_courses(), hits anomaly
+                # Touch .env with same cookie -> attempt #2 passes fetch_roster(), hits anomaly
                 env_path.write_text(env_content + "# refreshed\n", encoding="utf-8")
                 self.assertTrue(second_expire_seen.wait(timeout=5.0))
                 time.sleep(0.2)
                 signal.raise_signal(signal.SIGTERM)
 
-            orig_load_config = tracker.load_config
+            orig_load_config = config.load_config
 
-            def _fast_load_config(ep: Path, require_session: bool = True) -> tracker.TrackerConfig:
-                cfg_obj = orig_load_config(ep, require_session=require_session)
+            def _fast_load_config(
+                ep: Path, require_session: bool = True, **kwargs: object
+            ) -> config.TrackerConfig:
+                cfg_obj = orig_load_config(ep, require_session=require_session, **kwargs)
                 cfg_obj.keepalive_interval = 1
                 return cfg_obj
 
@@ -2272,18 +1597,21 @@ class ReliabilityAndBugfixTests(unittest.TestCase):
             t = threading.Thread(target=_driver, daemon=True)
             t.start()
             try:
-                with mock.patch.dict(os.environ, {"SIS_SESSION_ID": ""}, clear=False), mock.patch.object(
-                    tracker, "SisClient", _FlakyReusedClient
+                with mock.patch.object(
+                    tracker, "SisClient", portal_factory(portal)
                 ), mock.patch.object(
-                    tracker, "load_config", side_effect=_fast_load_config
+                    config, "load_config", side_effect=_fast_load_config
                 ), mock.patch.object(tracker, "build_notifiers", return_value=[notifier]):
-                    rc = run_daemon(env_path, state_path, heartbeat_path=hb_path)
+                    rc = run_daemon(
+                        env_path, state_path, heartbeat_path=hb_path, environ={"SIS_SESSION_ID": ""}
+                    )
             finally:
                 signal.signal(signal.SIGINT, prev_int)
                 signal.signal(signal.SIGTERM, prev_term)
                 t.join(timeout=2.0)
 
             self.assertEqual(rc, 0)
+            self.assertTrue(accepted_once.is_set())
             events = [n.event for n in notifier.notes]
             self.assertEqual(events.count("session_expired"), 2)
             self.assertIn("scan_anomaly", events)
