@@ -11,6 +11,7 @@ bytes on disk, and `config.EnvWatcher.check()`.
 from __future__ import annotations
 
 import contextlib
+import html
 import http.client
 import io
 import json
@@ -904,11 +905,24 @@ class CrossSitePostTests(_ServerTestCase):
         self.assertIn('type="hidden"', body)
 
     def test_token_is_html_escaped_when_rendered(self) -> None:
+        """A token is escaped on the way into the attribute, not just "safe today".
+
+        `secrets.token_urlsafe` can only emit `[A-Za-z0-9_-]`, so asserting the
+        rendered token holds no `"` passes whether or not `html.escape` is
+        called -- a tautology. This drives an adversarial token through the real
+        render path instead, so removing the escape breaks it: the raw token
+        contains a `"`, the attribute value would end early, and the unescape
+        round-trip below would no longer reproduce the token.
+        """
+        token = 'quote"and<angle>&amp'
+        self.app.csrf_token = token
+
         _, body = self.get()
 
         match = CSRF_INPUT_RE.search(body)
-        self.assertIsNotNone(match)
-        self.assertNotIn('"', match.group(1))
+        self.assertIsNotNone(match, "the hidden token input vanished")
+        self.assertNotIn(token, body, "the raw token reached the markup")
+        self.assertEqual(html.unescape(match.group(1)), token)
 
     def test_cross_site_rejection_is_logged_without_the_token(self) -> None:
         token = self.csrf_token() or ""
