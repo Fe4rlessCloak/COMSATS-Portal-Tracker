@@ -1,6 +1,20 @@
+# Default deployment: pull the prebuilt image, never build.
+#
+# A server needs only this file, a .env beside it, and a writable ./data/
+# directory -- no source checkout. Local development builds use
+# `docker-compose.local.yml`, which layers `build: .` on top of this file:
+#
+#   docker compose                                  # server: pull only
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.local.yml up -d --build   # dev: build
+#
+# The container name, restart policy, environment and both mounts are the
+# frozen external contract; changing them breaks existing setups on upgrade.
 services:
   tracker:
-    build: .
+    # Built and published by .github/workflows/publish-image.yml; `latest` is
+    # what this pulls, `sha-<7>` is the rollback pin.
+    image: ghcr.io/fe4rlesscloak/comsats-portal-tracker:latest
     container_name: comsats-portal-tracker
     restart: unless-stopped
     environment:

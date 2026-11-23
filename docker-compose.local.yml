@@ -1,0 +1,12 @@
+# Local development override. Never use this on a server: a server has no
+# checkout to build from, and building locally is what the prebuilt image
+# exists to avoid.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+#
+# Only `build:` is added. `image:` is deliberately left in the base file so the
+# image built here is tagged with the same reference the pull-only server runs;
+# re-declaring it here would let the two shapes drift apart silently.
+services:
+  tracker:
+    build: .
