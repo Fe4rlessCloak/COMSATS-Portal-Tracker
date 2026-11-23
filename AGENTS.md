@@ -3,8 +3,8 @@
 ## Commands
 
 ```bash
-python3 scripts/check.py                      # guardrails: 3.9 grammar, deferred annotations, stdlib-only, image parity
-python3 scripts/probe_guardrails.py           # 18 probes: proves check.py fails in every direction it claims
+python3 scripts/check.py                      # static guardrails (see scripts/check.py docstring)
+python3 scripts/probe_guardrails.py           # proves check.py fails in every direction it claims
 python3 -m unittest discover -s tests -v      # the test suite
 ```
 
@@ -38,7 +38,8 @@ policy or the duplication rules.
 ## Invariants that are not negotiable
 
 - **`config` imports nothing local.** It sits at the bottom of the module graph; a local import
-  there would create the only possible cycle.
+  there would create the only possible cycle. `check.py` fails `config.py` on any import of a
+  shipped module, and fails any cycle among the root modules.
 - **Raw portal HTML must not leave `sis_client.py`.** It returns pre-scrubbed
   `diagnostic_html` / `diagnostic_preview`. `probe.py` is the only exception.
 - **Every `data/` write goes through `RuntimeStore`'s atomic writer.** No module-level

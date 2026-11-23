@@ -20,8 +20,8 @@ Zero external packages — **Python 3.9+ standard library only** (`urllib`, `htm
 | `Dockerfile` | `python:3.13-slim` container running `python3 -u tracker.py` with `HEALTHCHECK` calling `python3 tracker.py --healthcheck`. Copies every top-level module (`config.py`, `sis_client.py`, `notifiers.py`, `runtime_store.py`, `snapshot_transition.py`, `tracker.py`, `probe.py`). |
 | `docker-compose.yml` | Runs `comsats-portal-tracker` with `restart: unless-stopped`, directory-mounted config (`./:/app/config:ro`), and persistent `./data:/app/data`. |
 | `tests/test_tracker.py` | Offline unit tests (`python3 -m unittest discover -s tests -v`) covering parsers, real HTML snapshots, daemon behaviour, and every failure fallback, plus `CycleIntegrationTests` — full `run_cycle` cycles wired as real `SisClient` -> `SimulatedPortal` -> real `RuntimeStore` (temp dir) -> real `snapshot_transition` -> recording notifier. |
-| `scripts/check.py` | Static guardrails, four checks: Python 3.9 grammar floor; deferred annotations (mandatory `from __future__ import annotations`, and no eagerly-evaluated `X | Y` outside one); stdlib-only imports against the *3.9* stdlib, with test helpers scoped to `tests/`; and `Dockerfile`/`LOCAL_MODULES` parity in both directions. Accepts `--root DIR`. Run it with `python3 scripts/check.py`. |
-| `scripts/probe_guardrails.py` | Proves `scripts/check.py` fails in the 18 directions it claims. Copies the checkout into a temp dir, breaks one thing per probe, and asserts a `[FAIL]` line with no traceback — it never writes to the working tree. Run it after editing `check.py`. |
+| `scripts/check.py` | Static guardrails: Python 3.9 grammar floor; deferred annotations (mandatory `from __future__ import annotations`, and no eagerly-evaluated `X \| Y` outside one); stdlib-only imports against the *3.9* stdlib, with test helpers scoped to `tests/`; the import graph (`config.py` local-import-free, flat modules acyclic); and `Dockerfile`/`LOCAL_MODULES` parity in both directions. Accepts `--root DIR`. Run it with `python3 scripts/check.py`. |
+| `scripts/probe_guardrails.py` | Proves `scripts/check.py` fails in every direction it claims. Copies the checkout into a temp dir, breaks one thing per probe, and asserts a `[FAIL]` line with no traceback — it never writes to the working tree. Run it after editing `check.py`. |
 | `AGENTS.md` | The short entry point for an agent working here: commands, module map, non-negotiable invariants, test-seam conventions. |
 | `tests/test_snapshot_transition.py` | Zero-seam tests for the pure Snapshot Transition module: every validation/rollover/dedupe/recovery/diff rule with plain Python in and out, plus "rollover once" and "totals once" proofs via counting dict subclasses. No filesystem, no network, no mocks. |
 | `tests/test_config.py` | Offline tests for the leaf Config module: encodings, parsing, session normalization, precedence/provenance, diagnostics, unified `NOTIFIER_TIMEOUT`, single-read watching, notifier-change detection, and prober loading — all via injected `environ` mappings and real temp `.env` files. |
@@ -310,13 +310,14 @@ All runtime files live under `./data/` (mounted to `/app/data` in Docker) and ar
   python3 -m unittest discover -s tests -v
   ```
   `scripts/check.py` enforces the Python 3.9 grammar floor, deferred annotations (including
-  no eagerly-evaluated `X | Y`), stdlib-only imports against the *3.9* stdlib, and
+  no eagerly-evaluated `X | Y`), stdlib-only imports against the *3.9* stdlib, the module
+  import graph (`config.py` leaf and acyclic root modules), and
   `Dockerfile`/`LOCAL_MODULES` parity. The container image runs a newer interpreter than the
   floor, so those checks are the only thing pinning it. `scripts/probe_guardrails.py` proves
   the guardrail still fails on the cases it claims to catch — run it after editing
   `check.py`. It copies the repo into a temp dir first, so this checkout is never written to.
   Its probes cover the three floor constructs `check.py` names (`match`, `except*`,
-  `type X = int`) as well as the import, annotation, union and Dockerfile rules.
+  `type X = int`) as well as the import, annotation, union, module-graph and Dockerfile rules.
 - **Change snapshot policy in `snapshot_transition.py`, not `tracker.py`**: validation,
   rollover, anomaly dedupe/recovery, and diffing all live in that pure module, which must
   never import `tracker`, `runtime_store`, or `os`/`io`/`json`. `run_cycle()` only loads,

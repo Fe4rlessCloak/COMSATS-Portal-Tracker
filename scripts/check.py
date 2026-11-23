@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Static guardrails for the COMSATS Portal Tracker.
 
-Four checks that the test suite cannot make for itself:
+The checks the test suite cannot make about itself, in the order they run:
 
 1. Python 3.9 grammar -- the container image runs a newer interpreter than the
    floor this project promises, so a 3.10+ construct (``match``, ``except*``,
@@ -17,7 +17,10 @@ Four checks that the test suite cannot make for itself:
    The allowlist is the Python 3.9 stdlib, so a module introduced later (say
    ``tomllib``) is an error even when the running interpreter has it.
    Test-sibling modules are importable only from files under ``tests/``.
-4. Image integrity -- every name in ``LOCAL_MODULES`` must exist as
+4. Import graph -- ``config.py`` imports nothing local (it is the bottom of the
+   graph, so a local import there creates the only possible cycle) and the flat
+   modules form a DAG. Both are facts about the graph, not matters of taste.
+5. Image integrity -- every name in ``LOCAL_MODULES`` must exist as
    ``<name>.py`` and appear in the ``Dockerfile``'s ``COPY``, and the
    ``Dockerfile`` must copy nothing the allowlist does not know about.
 
@@ -344,6 +347,80 @@ def _imported_roots(node: ast.AST) -> list[str]:
     return []
 
 
+def check_import_graph(root: Path, trees: dict[Path, ast.AST]) -> list[str]:
+    """`config.py` must import nothing local, and the graph must stay acyclic.
+
+    AGENTS.md makes "config imports nothing local" the first non-negotiable
+    invariant, and a cycle there is the one thing it can create. Both are
+    mechanical facts about the module graph, so they are checked rather than
+    left to review: ``config`` importing anything in ``LOCAL_MODULES`` is a
+    failure, as is any local import cycle reachable from the root modules.
+
+    This catches the hazard a linter cannot see and the test suite only notices
+    once a cycle happens to execute at import time.
+    """
+    problems: list[str] = []
+    graph = _local_import_graph(root, trees)
+
+    for target in sorted(graph.get("config", ())):  # leaf invariant
+        problems.append(
+            f"config.py: imports {target!r} (the leaf must import nothing local "
+            f"-- a local import here creates a cycle)"
+        )
+
+    for cycle in _cycles(graph):
+        problems.append(
+            f"import cycle: {' -> '.join(cycle)} (flat modules must stay a DAG)"
+        )
+    return problems
+
+
+def _local_import_graph(
+    root: Path, trees: dict[Path, ast.AST]
+) -> dict[str, set[str]]:
+    """Module name -> the local modules it imports (root modules only)."""
+    graph: dict[str, set[str]] = {}
+    for path, tree in trees.items():
+        if path.parent != root or path.stem not in LOCAL_MODULES:
+            continue
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            for name in _imported_roots(node):
+                if name in LOCAL_MODULES and name != path.stem:
+                    imported.add(name)
+        graph[path.stem] = imported
+    return graph
+
+
+def _cycles(graph: dict[str, set[str]]) -> list[list[str]]:
+    """Every elementary cycle in ``graph``, each reported once.
+
+    Depth-first from each node, tracking the path; a back edge to a node already
+    on the path is a cycle. Cycles are deduplicated by rotating each to its
+    lexicographically smallest member, so ``a -> b -> a`` and ``b -> a -> b``
+    collapse into one finding.
+    """
+    found: dict[tuple[str, ...], list[str]] = {}
+
+    def walk(node: str, path: list[str]) -> None:
+        for neighbour in sorted(graph.get(node, ())):
+            if neighbour in path:
+                loop = path[path.index(neighbour) :]
+                found.setdefault(_canonical(loop), loop + [neighbour])
+                continue
+            walk(neighbour, path + [neighbour])
+
+    for start in sorted(graph):
+        walk(start, [start])
+    return [found[key] for key in sorted(found)]
+
+
+def _canonical(cycle: list[str]) -> tuple[str, ...]:
+    """Rotate a cycle so it starts at its smallest member, for deduplication."""
+    pivot = cycle.index(min(cycle))
+    return tuple(cycle[pivot:] + cycle[:pivot])
+
+
 def check_shipped_modules(root: Path) -> list[str]:
     """Local modules, the checkout, and the Dockerfile must agree."""
     problems: list[str] = []
@@ -415,10 +492,12 @@ def run_checks(root: Path) -> tuple[list[str], str]:
     problems += check_future_annotations(root, trees)
     problems += check_runtime_unions(root, trees)
     problems += check_stdlib_only(root, trees)
+    problems += check_import_graph(root, trees)
     problems += check_shipped_modules(root)
     summary = (
         f"OK: {len(trees)} files parse as Python {PYTHON_FLOOR[0]}.{PYTHON_FLOOR[1]}, "
-        "annotations are deferred, imports are stdlib-only, local modules all ship."
+        "annotations are deferred, imports are stdlib-only, module graph is acyclic, "
+        "local modules all ship."
     )
     return problems, summary
 
