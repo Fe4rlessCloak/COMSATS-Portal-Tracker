@@ -344,23 +344,16 @@ class DockerfileTests(unittest.TestCase):
     """What the workflow publishes must be the shipped set, and only that.
 
     ``check.py`` enforces Dockerfile/``LOCAL_MODULES`` agreement, so this does
-    not re-implement it. The expected set is spelled out literally instead: a
-    module quietly dropped from both lists at once would keep ``check.py`` green
-    and still vanish from the image.
+    not re-implement it. The expected set is derived from the checkout instead:
+    every root-level ``.py`` file is a shipped module, and the comparison still
+    catches the case a literal would -- a module dropped from the Dockerfile and
+    ``LOCAL_MODULES`` together would keep ``check.py`` green while vanishing
+    from the image.
     """
-
-    SHIPPED = {
-        "config",
-        "notifiers",
-        "probe",
-        "runtime_store",
-        "sis_client",
-        "snapshot_transition",
-        "tracker",
-    }
 
     def setUp(self) -> None:
         self.dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.shipped = {path.stem for path in ROOT.glob("*.py")}
 
     def test_dockerfile_copies_every_shipped_module(self) -> None:
         copy_line = [
@@ -371,7 +364,9 @@ class DockerfileTests(unittest.TestCase):
         self.assertTrue(copy_line, "Dockerfile has no COPY of .py files")
         copied = {word.strip(".,").removesuffix(".py")
                   for word in copy_line[0].split() if word.endswith(".py")}
-        self.assertEqual(copied, self.SHIPPED)
+        # No literal to go stale: the checkout is the only source of truth, so
+        # adding a module cannot make this test disagree with reality.
+        self.assertEqual(copied, self.shipped)
 
     def test_dockerfile_has_no_build_time_secret(self) -> None:
         for forbidden in ("ARG ", ".env", "PASSWORD", "TOKEN"):
