@@ -38,6 +38,7 @@ Settings come from the process environment first and the ``.env`` file second
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hmac
 import html
 import ipaddress
@@ -47,7 +48,7 @@ import secrets
 import socket
 import sys
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -111,6 +112,13 @@ MAX_REQUEST_BODY = 8 * 1024
 #: Hard cap on form fields, handed to ``parse_qs`` as ``max_num_fields``. The
 #: page posts exactly two; anything past this is not this form.
 MAX_FORM_FIELDS = 32
+#: Largest declared body the server will drain and discard to keep a keep-alive
+#: connection in sync. Bigger than this and it answers 413 with
+#: ``Connection: close`` instead, so the drain cannot itself be an attack.
+MAX_DISCARDED_BODY = 64 * 1024
+#: Timeout for that drain, so a client that declares a body and then stalls
+#: cannot hold a worker thread open.
+BODY_DISCARD_TIMEOUT = 5.0
 CSRF_TOKEN_BYTES = 32
 
 # Statuses the daemon writes when it cannot scan without a fresh cookie.
@@ -391,11 +399,18 @@ class Request:
 
 @dataclass(frozen=True)
 class Response:
-    """One outbound HTTP response."""
+    """One outbound HTTP response.
+
+    ``close_connection`` asks the transport to answer ``Connection: close`` and
+    drop the socket. It exists for one case that routing cannot express: a
+    request body larger than :data:`MAX_REQUEST_BODY`, where unread bytes would
+    otherwise be parsed as the next request line on a keep-alive connection.
+    """
 
     status: int = 200
     body: str = ""
     content_type: str = "text/html; charset=utf-8"
+    close_connection: bool = False
 
 
 @dataclass(frozen=True)
@@ -784,6 +799,17 @@ def build_app(
     )
 
 
+def _payload_too_large(close_connection: bool = False) -> Response:
+    """The one 413 body, for a request body larger than this page accepts."""
+    page = SessionUiApp._page(
+        413,
+        "Request too large",
+        "<p>That submission is larger than this page accepts. Nothing was saved; "
+        ".env is unchanged.</p>",
+    )
+    return replace(page, close_connection=close_connection)
+
+
 def _make_handler_class(app: SessionUiApp, log_stream: Optional[Any] = None) -> type:
     """Bind one application instance to a ``BaseHTTPRequestHandler`` subclass.
 
@@ -805,7 +831,10 @@ def _make_handler_class(app: SessionUiApp, log_stream: Optional[Any] = None) -> 
                 length = 0
             body = b""
             if method == "POST" and length > 0:
-                body = self.rfile.read(min(length, MAX_REQUEST_BODY))
+                if length > MAX_REQUEST_BODY:
+                    self._refuse_oversized_body(length)
+                    return
+                body = self.rfile.read(length)
 
             response = app.handle(
                 Request(
@@ -815,6 +844,41 @@ def _make_handler_class(app: SessionUiApp, log_stream: Optional[Any] = None) -> 
                     body=body,
                 )
             )
+            self._send(response, method)
+
+        def _refuse_oversized_body(self, declared_length: int) -> None:
+            """Answer 413 for an oversized body without desyncing the connection.
+
+            HTTP/1.1 is keep-alive here, so bytes of a body we did not read would
+            be parsed as the *next* request line (originally: a 9 KB POST followed
+            by a GET on the same socket produced a 501). Discarding a bounded
+            overrun keeps the connection usable; past that the drain itself would
+            be an attack, so the socket is closed instead.
+            """
+            drainable = declared_length <= MAX_DISCARDED_BODY
+            if drainable:
+                self._discard_body(declared_length)
+            self._send(_payload_too_large(close_connection=not drainable), "POST")
+
+        def _discard_body(self, declared_length: int) -> None:
+            """Read and throw away ``declared_length`` bytes, bounded by a timeout."""
+            original = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(BODY_DISCARD_TIMEOUT)
+                remaining = declared_length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+            except OSError:
+                self.close_connection = True
+            finally:
+                with contextlib.suppress(OSError):
+                    self.connection.settimeout(original)
+
+        def _send(self, response: Response, method: str) -> None:
+            """Write one response: the only place the header set is assembled."""
             payload = response.body.encode("utf-8")
             self.send_response(response.status)
             self.send_header("Content-Type", response.content_type)
@@ -822,6 +886,9 @@ def _make_handler_class(app: SessionUiApp, log_stream: Optional[Any] = None) -> 
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
+            if response.close_connection:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             if method != "HEAD":
                 self.wfile.write(payload)

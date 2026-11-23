@@ -327,6 +327,61 @@ class MalformedPostTests(_ServerTestCase):
             follow_up.close()
 
 
+class OversizedBodyTests(_ServerTestCase):
+    """A body over `MAX_REQUEST_BODY` must not desync an HTTP/1.1 connection.
+
+    HTTP/1.1 is keep-alive by default and this server always sets
+    `protocol_version = "HTTP/1.1"`. Reading only the first 8 KB of a 9 KB body
+    leaves 1 KB in the socket, and the next request on that connection is parsed
+    from the leftover bytes (originally reproduced as a 501).
+    """
+
+    def connect(self) -> "http.client.HTTPConnection":
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        self.addCleanup(conn.close)
+        return conn
+
+    def test_an_oversized_body_is_refused_and_the_next_request_parses(self) -> None:
+        conn = self.connect()
+        body = b"field=" + b"a" * (session_ui.MAX_REQUEST_BODY + 1024)
+        headers = dict(self.same_origin_headers())
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+        conn.request("POST", "/", body=body, headers=headers)
+        refused = conn.getresponse()
+        refused_body = refused.read()
+
+        self.assertEqual(refused.status, 413)
+        self.assertTrue(refused_body)
+
+        conn.request("GET", "/", headers=self.same_origin_headers())
+        follow_up = conn.getresponse()
+        try:
+            self.assertEqual(follow_up.status, 200)
+            self.assertIn(b"Tracker status", follow_up.read())
+        finally:
+            follow_up.close()
+
+    def test_an_absurd_declared_length_closes_instead_of_draining(self) -> None:
+        """Draining is bounded: past the cap the server hangs up, never reads on."""
+        conn = self.connect()
+        headers = dict(self.same_origin_headers())
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        headers["Content-Length"] = str(session_ui.MAX_REQUEST_BODY * 1000)
+
+        conn.putrequest("POST", "/")
+        for key, value in headers.items():
+            conn.putheader(key, value)
+        conn.endheaders()
+        conn.send(b"x" * 1024)
+
+        response = conn.getresponse()
+        self.assertEqual(response.status, 413)
+        self.assertIn("close", (response.getheader("Connection") or "").lower())
+
+
 class StatusPageTests(_ServerTestCase):
     """`GET /` renders read-only tracker status and no secrets."""
 
