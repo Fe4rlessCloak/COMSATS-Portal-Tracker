@@ -308,11 +308,12 @@ All runtime files live under `./data/` (mounted to `/app/data` in Docker) and ar
   python3 scripts/probe_guardrails.py
   python3 -m unittest discover -s tests -v
   ```
-  `scripts/check.py` enforces the Python 3.9 grammar floor, the mandatory
-  `from __future__ import annotations`, stdlib-only imports, and `Dockerfile`/`LOCAL_MODULES`
-  parity. The container image runs a newer interpreter than the floor, so those checks are the
-  only thing pinning it. `scripts/probe_guardrails.py` proves the guardrail still fails on the
-  cases it claims to catch — run it after editing `check.py`.
+  `scripts/check.py` enforces the Python 3.9 grammar floor, deferred annotations (including
+  no eagerly-evaluated `X | Y`), stdlib-only imports against the *3.9* stdlib, and
+  `Dockerfile`/`LOCAL_MODULES` parity. The container image runs a newer interpreter than the
+  floor, so those checks are the only thing pinning it. `scripts/probe_guardrails.py` proves
+  the guardrail still fails on the cases it claims to catch — run it after editing
+  `check.py`. It copies the repo into a temp dir first, so this checkout is never written to.
 - **Change snapshot policy in `snapshot_transition.py`, not `tracker.py`**: validation,
   rollover, anomaly dedupe/recovery, and diffing all live in that pure module, which must
   never import `tracker`, `runtime_store`, or `os`/`io`/`json`. `run_cycle()` only loads,

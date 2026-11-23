@@ -1,137 +1,231 @@
 #!/usr/bin/env python3
 """Prove scripts/check.py fails in every direction it claims to catch.
 
-Each probe writes a temporary file into the repo, runs the guardrail as a
-subprocess, then removes the file. Nothing is committed and the repo is left
-byte-identical: the probes only add and delete untracked scratch files.
+Each probe copies the checkout into a temporary directory, breaks exactly one
+thing there, runs ``check.py --root <copy>``, and asserts the run failed with a
+``[FAIL]`` line and no traceback. One probe asserts the opposite direction: real
+stdlib imports must pass. Nothing in this checkout is written at any point, so
+the script is safe to run anywhere, at any time, including mid-edit.
 
 Run: python3 scripts/probe_guardrails.py
 """
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 ROOT = Path(__file__).resolve().parent.parent
-PROBES: list[tuple[str, str, str]] = []
+CHECK = ROOT / "scripts" / "check.py"
+
+# The guardrail reads sources, the Dockerfile, and tests/ -- nothing else.
+COPIED_PATTERNS = ("*.py", "Dockerfile", "tests/*.py", "scripts/*.py")
+
+MUST_FAIL = "fail"
+MUST_PASS = "pass"
 
 
-def probe(label: str, filename: str, source: str) -> None:
-    PROBES.append((label, filename, source))
+@dataclass(frozen=True)
+class Probe:
+    """One way the guardrail is supposed to behave."""
+
+    label: str
+    break_it: Callable[[Path], None]
+    expectation: str = MUST_FAIL
 
 
-probe(
-    "syntax error does not crash the run",
-    "guardrail_probe_syntax.py",
-    "def broken(:\n    pass\n",
+def _write(root: Path, relative: str, source: str) -> None:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+
+
+def _write_bytes(root: Path, relative: str, payload: bytes) -> None:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+
+
+def _set_dockerfile(root: Path, transform: Callable[[str], str]) -> None:
+    dockerfile = root / "Dockerfile"
+    original = dockerfile.read_text(encoding="utf-8")
+    updated = transform(original)
+    if updated == original:
+        raise AssertionError("probe precondition failed: Dockerfile unchanged")
+    dockerfile.write_text(updated, encoding="utf-8")
+
+
+PROBES = (
+    Probe(
+        "syntax error is reported, not raised",
+        lambda root: _write(root, "zz_syntax.py", "def broken(:\n    pass\n"),
+    ),
+    Probe(
+        "non-UTF-8 bytes are reported, not raised",
+        lambda root: _write_bytes(
+            root, "zz_latin1.py", b"from __future__ import annotations\nx = 1\n\xff\xfe\n"
+        ),
+    ),
+    Probe(
+        "third-party import",
+        lambda root: _write(
+            root,
+            "zz_thirdparty.py",
+            "from __future__ import annotations\nimport requests\n",
+        ),
+    ),
+    Probe(
+        "unknown module is not silently allowed",
+        lambda root: _write(
+            root,
+            "zz_unknown.py",
+            "from __future__ import annotations\nimport not_a_real_module\n",
+        ),
+    ),
+    Probe(
+        "real stdlib imports are allowed",
+        lambda root: _write(
+            root,
+            "zz_stdlib.py",
+            "from __future__ import annotations\n"
+            "import math\nimport secrets\nimport configparser\n"
+            "import statistics\nimport zoneinfo\nimport graphlib\n",
+        ),
+        expectation=MUST_PASS,
+    ),
+    Probe(
+        "test helper imported from a shipped module",
+        lambda root: _write(
+            root,
+            "zz_testscope.py",
+            "from __future__ import annotations\nimport support_stub_transport\n",
+        ),
+    ),
+    Probe(
+        "missing __future__ annotations",
+        lambda root: _write(root, "zz_future.py", "x: int = 1\n"),
+    ),
+    Probe(
+        "runtime X | Y union (future import does not defer assignments)",
+        lambda root: _write(
+            root,
+            "zz_union.py",
+            "from __future__ import annotations\nAlias = int | str\n",
+        ),
+    ),
+    Probe(
+        "legal runtime bit-or is not a union",
+        lambda root: _write(
+            root,
+            "zz_bitflags.py",
+            "from __future__ import annotations\nimport re\n"
+            "FLAGS = re.IGNORECASE | re.DOTALL\n",
+        ),
+        expectation=MUST_PASS,
+    ),
+    Probe(
+        "Dockerfile drops a module",
+        lambda root: _set_dockerfile(root, lambda text: text.replace(" probe.py", "")),
+    ),
+    Probe(
+        "Dockerfile copies an unlisted module",
+        lambda root: _set_dockerfile(root, lambda text: text + "\nCOPY zz_ghost.py ./\n"),
+    ),
 )
 
-probe(
-    "third-party import",
-    "guardrail_probe_thirdparty.py",
-    "from __future__ import annotations\nimport requests\n",
-)
 
-probe(
-    "test helper imported from a shipped module",
-    "guardrail_probe_testscope.py",
-    "from __future__ import annotations\nimport support_stub_transport\n",
-)
-
-probe(
-    "missing __future__ annotations",
-    "guardrail_probe_future.py",
-    "x: int = 1\n",
-)
-
-probe(
-    "unknown stdlib name is not silently allowed",
-    "guardrail_probe_totally_unknown.py",
-    "from __future__ import annotations\nimport not_a_real_module\n",
-)
+def _copy_repo(destination: Path) -> None:
+    for pattern in COPIED_PATTERNS:
+        for source in ROOT.glob(pattern):
+            if "__pycache__" in source.parts or not source.is_file():
+                continue
+            target = destination / source.relative_to(ROOT)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
 
 
-def run() -> subprocess.CompletedProcess[str]:
+def _run(root: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "scripts/check.py"],
-        cwd=ROOT,
+        [sys.executable, str(CHECK), "--root", str(root)],
         capture_output=True,
         text=True,
     )
 
 
+def _first_fail_line(output: str) -> str:
+    for line in output.splitlines():
+        if line.startswith("[FAIL]"):
+            return line
+    stripped = output.strip().splitlines()
+    return stripped[0] if stripped else "(no output)"
+
+
+def _judge(probe: Probe, result: subprocess.CompletedProcess[str]) -> str | None:
+    """Return a failure message, or None when the probe behaved."""
+    output = result.stdout + result.stderr
+    if probe.expectation == MUST_PASS:
+        if result.returncode != 0:
+            return f"rejected a case it should accept ({_first_fail_line(output)})"
+        return None
+    if result.returncode == 0:
+        return "guardrail passed a case it should reject (exit 0)"
+    if "Traceback (most recent call last)" in output:
+        return "raised a traceback instead of reporting a [FAIL] line"
+    if "[FAIL]" not in output:
+        return "failed without a [FAIL] line"
+    return None
+
+
+def _report(probe: Probe, result: subprocess.CompletedProcess[str], problem: str | None) -> None:
+    output = result.stdout + result.stderr
+    if problem:
+        print(f"[FAIL] {probe.label}: {problem}")
+    elif probe.expectation == MUST_PASS:
+        print(f"[PASS] {probe.label}: exit 0")
+    else:
+        print(f"[PASS] {probe.label}: {_first_fail_line(output)}")
+
+
 def main() -> int:
     failures: list[str] = []
 
-    clean = run()
-    if clean.returncode != 0:
-        print(f"[FAIL] baseline is not clean:\n{clean.stdout}{clean.stderr}")
+    with tempfile.TemporaryDirectory(prefix="guardrail-baseline-") as tmp:
+        clean_root = Path(tmp) / "repo"
+        _copy_repo(clean_root)
+        baseline = _run(clean_root)
+    if baseline.returncode != 0:
+        print(f"[FAIL] baseline is not clean:\n{baseline.stdout}{baseline.stderr}")
         return 1
-    print(f"[PASS] baseline: {clean.stdout.strip()}")
+    print(f"[PASS] baseline: {baseline.stdout.strip()}")
 
-    for label, filename, source in PROBES:
-        path = ROOT / filename
-        path.write_text(source, encoding="utf-8")
-        try:
-            result = run()
-        finally:
-            path.unlink()
-        output = result.stdout + result.stderr
-        crash = "Traceback (most recent call last)" in output
-        if result.returncode == 0:
-            failures.append(f"{label}: guardrail passed a file it should reject")
-            print(f"[FAIL] {label}: exit 0 (not caught)")
-        elif crash:
-            failures.append(f"{label}: raised a traceback instead of reporting")
-            print(f"[FAIL] {label}: traceback instead of [FAIL] line")
-        else:
-            print(f"[PASS] {label}: {output.strip().splitlines()[0]}")
+    for probe in PROBES:
+        with tempfile.TemporaryDirectory(prefix="guardrail-probe-") as tmp:
+            root = Path(tmp) / "repo"
+            _copy_repo(root)
+            try:
+                probe.break_it(root)
+            except AssertionError as exc:
+                failures.append(f"{probe.label}: {exc}")
+                print(f"[SKIP] {probe.label}: {exc}")
+                continue
+            result = _run(root)
+        problem = _judge(probe, result)
+        if problem:
+            failures.append(f"{probe.label}: {problem}")
+        _report(probe, result, problem)
 
-    # A module listed as local but absent from the Dockerfile COPY must fail.
-    dockerfile = ROOT / "Dockerfile"
-    original = dockerfile.read_text(encoding="utf-8")
-    stripped = original.replace(" probe.py", "")
-    if stripped == original:
-        failures.append("dockerfile probe: could not remove probe.py from COPY")
-    else:
-        dockerfile.write_text(stripped, encoding="utf-8")
-        try:
-            result = run()
-        finally:
-            dockerfile.write_text(original, encoding="utf-8")
-        if result.returncode == 0:
-            failures.append("dockerfile drop: module missing from image not caught")
-            print("[FAIL] dockerfile drop: exit 0 (not caught)")
-        else:
-            print(f"[PASS] dockerfile drop: {(result.stdout + result.stderr).strip().splitlines()[0]}")
-
-    # A COPY'd module that is not in LOCAL_MODULES must fail.
-    with_extra = original.replace("COPY config.py", "COPY config.py extra_module.py")
-    dockerfile.write_text(with_extra, encoding="utf-8")
-    try:
-        result = run()
-    finally:
-        dockerfile.write_text(original, encoding="utf-8")
-    if result.returncode == 0:
-        failures.append("dockerfile ghost: COPY of an unlisted module not caught")
-        print("[FAIL] dockerfile ghost: exit 0 (not caught)")
-    else:
-        print(f"[PASS] dockerfile ghost: {(result.stdout + result.stderr).strip().splitlines()[0]}")
-
-    final = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True
-    ).stdout
-    if final.strip():
-        print(f"\n[NOTE] working tree changed by the probes:\n{final}")
-
+    total = len(PROBES) + 1
     if failures:
-        print(f"\n{len(failures)} probe(s) failed:")
+        print(f"\n{len(failures)} of {total} probes failed:")
         for failure in failures:
             print(f"  - {failure}")
         return 1
-    print(f"\nAll {len(PROBES) + 3} probes behaved as advertised.")
+    print(f"\nAll {total} probes behaved as advertised.")
     return 0
 
 

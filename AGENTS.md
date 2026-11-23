@@ -10,17 +10,17 @@ python3 -m unittest discover -s tests -v      # the test suite
 
 `scripts/check.py` reads each file once and reports every problem it finds; a file that does
 not parse is reported as a `[FAIL]` line, never a traceback. `scripts/probe_guardrails.py`
-writes scratch files, runs the guardrail, and deletes them, so it is safe to run anywhere.
+copies the checkout to a temp dir, breaks one thing at a time there, and asserts the guardrail
+catches it — it never writes into this tree, so it is safe to run at any time.
 
 The suite is **unittest**, not pytest. There is no `pytest`/`conftest.py`/`pyproject.toml`
 and no third-party packages — do not install any, and do not add a pytest dependency.
 
 ## Module map
 
-Flat modules at repo root, no packages. `config.py` is the leaf: it imports nothing local,
-so a cycle cannot start there. `sis_client.py` is a second, independent leaf by accident of
-its dependencies (stdlib only), not by design — do not lean on that; put shared policy in
-`config.py` or `snapshot_transition.py` instead.
+Flat modules at repo root, no packages. `config.py` is the leaf config module: it imports
+nothing local, so a cycle cannot start there. `sis_client.py` also happens to import nothing
+local, but that is incidental — do not treat it as a second permitted leaf.
 
 | Module | Role |
 | :--- | :--- |
@@ -37,7 +37,8 @@ policy or the duplication rules.
 
 ## Invariants that are not negotiable
 
-- **`config` imports nothing local.** It is the leaf; a local import there creates a cycle.
+- **`config` imports nothing local.** It sits at the bottom of the module graph; a local import
+  there would create the only possible cycle.
 - **Raw portal HTML must not leave `sis_client.py`.** It returns pre-scrubbed
   `diagnostic_html` / `diagnostic_preview`. `probe.py` is the only exception.
 - **Every `data/` write goes through `RuntimeStore`'s atomic writer.** No module-level
@@ -47,9 +48,13 @@ policy or the duplication rules.
   naming, heartbeat JSON keys/statuses, notification event names/titles/priorities/tags/urls/
   webhook payload fields, `NOTIFIER_TIMEOUT` (20s default, 1s minimum).
 - **Python 3.9+ stdlib only.** `from __future__ import annotations` is mandatory in every
-  `.py` file — the code must run on the 3.9 floor while local dev runs newer. Without it,
-  `x: int | str` evaluates `int | str` at definition time and raises `TypeError` on 3.9;
-  `check.py` enforces the import because the grammar floor silently accepts the syntax.
+  `.py` file — the code must run on the 3.9 floor while local dev runs newer. The future
+  import defers *annotations* only: an annotation `x: int | str` is safe with it, but a
+  module-level `Alias = int | str` still evaluates eagerly and raises `TypeError` on 3.9.
+  `check.py` enforces both halves, since the grammar floor accepts the syntax silently.
+- **The stdlib allowlist is the 3.9 stdlib, not the running interpreter's.** A module added
+  after 3.9 (`tomllib` in 3.11, `interpreters` in 3.14) must not be imported even though
+  local dev has it — the image is 3.13 and the floor is 3.9.
 - **`Dockerfile` and `LOCAL_MODULES` move together.** Add a root module and you edit both,
   or the image ships without it (`check.py` cross-checks the `COPY` line).
 
