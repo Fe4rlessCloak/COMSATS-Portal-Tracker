@@ -65,6 +65,14 @@ compose() {
     "$DOCKER" compose --project-directory "$STACK_DIR" -f "$COMPOSE_FILE" "$@"
 }
 
+# `docker images -q` is not consistent about the digest algorithm prefix: with
+# `--no-trunc` some daemons print the bare hex, while `image inspect {{.Id}}`
+# always prints `sha256:...`. Compare on the hex only, so the running image is
+# still recognised as "in use" either way.
+strip_digest() {
+    printf '%s' "${1#sha256:}"
+}
+
 # The ID the `:latest` tag points at locally, or empty when it has never been
 # pulled. Empty is normal on a first run, not an error.
 image_id() {
@@ -95,7 +103,8 @@ fi
 
 RUNNING_ID="$(container_image_id)"
 
-if [ -n "$NEW_ID" ] && [ "$NEW_ID" = "$RUNNING_ID" ]; then
+# Compare bare hex: the two commands disagree about the `sha256:` prefix.
+if [ -n "$NEW_ID" ] && [ "$(strip_digest "$NEW_ID")" = "$(strip_digest "$RUNNING_ID")" ]; then
     log "unchanged: ${CONTAINER} already runs ${NEW_ID}"
 elif [ "$DRY_RUN" -eq 1 ]; then
     log "would recreate ${CONTAINER} (running ${RUNNING_ID:-nothing}, image ${NEW_ID})"
@@ -110,10 +119,20 @@ fi
 # "the latest tag".
 mapfile -t LABELLED < <("$DOCKER" images --filter "$PRUNE_FILTER" --no-trunc -q 2>/dev/null || true)
 
+# One image carries several tags, so it is listed once per tag. Removing it
+# twice would make the second call fail for no reason, so keep the first
+# occurrence of each ID.
+declare -A SEEN=()
+
 removed=0
 for candidate in "${LABELLED[@]:-}"; do
     [ -n "$candidate" ] || continue
-    if [ "$candidate" = "$NEW_ID" ]; then
+    key="$(strip_digest "$candidate")"
+    if [ -n "${SEEN[$key]:-}" ]; then
+        continue
+    fi
+    SEEN[$key]=1
+    if [ "$(strip_digest "$candidate")" = "$(strip_digest "$NEW_ID")" ]; then
         continue
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
