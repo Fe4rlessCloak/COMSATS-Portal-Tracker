@@ -20,9 +20,11 @@ without mutating process-wide environment state.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -82,6 +84,11 @@ _UNREAD = object()
 _EXPORT_PREFIX_RE = re.compile(r"^export[ \t]+")
 _INLINE_COMMENT_RE = re.compile(r"(?:^|\s+)#.*$")
 _SESSION_COOKIE_RE = re.compile(r"(?:^|;\s*)asp\.net_sessionid\s*=\s*([^;]*)", re.IGNORECASE)
+# A `SIS_SESSION_ID` assignment line, split into its indent, the `=` and its RHS so a
+# rewrite keeps deletion-safe groups around the value it replaces.
+_SESSION_LINE_RE = re.compile(
+    r"^(?P<lead>[ \t]*(?:export[ \t]+)?)SIS_SESSION_ID(?P<assign>[ \t]*=[ \t]*)(?P<value>.*)$"
+)
 _SAFE_KEY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,40}$")
 
 
@@ -395,6 +402,147 @@ class EnvWatcher:
             raw=raw,
         )
         return EnvReload(changed=changed, description=desc, config=cfg)
+
+
+@dataclass(frozen=True)
+class SessionWrite:
+    """Outcome of one ``SIS_SESSION_ID`` rewrite (what changed, not how)."""
+
+    path: Path
+    created: bool
+    replaced: bool
+
+
+def _split_line_ending(line: str) -> Tuple[str, str]:
+    """Split a raw line into its content and its original ``\\r\\n``/``\\n``/``\\r`` ending."""
+    for ending in ("\r\n", "\n", "\r"):
+        if line.endswith(ending):
+            return line[: -len(ending)], ending
+    return line, ""
+
+
+def _closing_quote_index(text: str, quote: str) -> int:
+    """Index of the closing quote in a quoted .env value, honouring ``\\"`` escapes."""
+    i = 1
+    while i < len(text):
+        ch = text[i]
+        if quote == '"' and ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            return i
+        i += 1
+    return -1
+
+
+def _replace_value_segment(segment: str, new_value: str) -> str:
+    """Rewrite the RHS of a session line, keeping its quotes and trailing comment.
+
+    ``segment`` is everything after the ``=``. A quoted value keeps its quote
+    character and whatever follows the closing quote (whitespace and an inline
+    ``#`` comment); an unquoted value keeps its inline comment verbatim.
+    """
+    stripped = segment.strip()
+    if stripped[:1] in ('"', "'"):
+        quote = stripped[0]
+        end_idx = _closing_quote_index(stripped, quote)
+        if end_idx != -1:
+            tail = stripped[end_idx + 1 :]
+            return f"{quote}{new_value}{quote}{tail}"
+
+    comment = _INLINE_COMMENT_RE.search(segment)
+    if comment is not None and segment[comment.start() : comment.start() + 1].isspace():
+        return f"{new_value}{segment[comment.start() :]}"
+    if comment is not None and segment.startswith("#"):
+        return f"{new_value} {segment}"
+    return new_value
+
+
+def _validate_session_value(session_id: str) -> str:
+    """Normalize a pasted cookie and reject anything unsafe for a single .env line."""
+    value = normalize_session_id(session_id)
+    if not value:
+        raise ValueError("SIS_SESSION_ID is blank or the example placeholder; nothing to save.")
+    if any(ch.isspace() or ch in "\"'`\\" or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError(
+            "SIS_SESSION_ID contains characters that cannot be written to a single "
+            ".env line."
+        )
+    return value
+
+
+def write_session_id(env_path: Path, session_id: str) -> SessionWrite:
+    """Atomically set ``SIS_SESSION_ID`` in ``env_path``, touching no other byte.
+
+    Preserves every comment, blank line, key order and other setting, keeps the
+    line's ``export`` prefix, its quote style and its inline comment, keeps CRLF
+    line endings, and appends the key when it is absent. The write is a sibling
+    temp file plus ``os.replace``, so a running daemon's :class:`EnvWatcher` sees
+    the new inode immediately. A new file is created ``0600``; an existing file
+    keeps its mode. Raises ``ValueError`` (before any write) for a blank,
+    placeholder, or single-line-unsafe value.
+    """
+    value = _validate_session_value(session_id)
+
+    raw = read_env_bytes(env_path)
+    created = raw is None
+    existing_mode: Optional[int] = None
+    if raw is None:
+        if env_path.exists():
+            raise ValueError(f"cannot write SIS_SESSION_ID: {env_path} is a directory")
+        text = ""
+    else:
+        try:
+            existing_mode = env_path.stat().st_mode & 0o777
+        except OSError:
+            existing_mode = None
+        text = _decode_env_bytes(raw)
+
+    lines = text.splitlines(keepends=True)
+    replaced = False
+    for index, line in enumerate(lines):
+        content, ending = _split_line_ending(line)
+        prefix = ""
+        body = content
+        if index == 0 and body.startswith("\ufeff"):
+            prefix, body = "\ufeff", body[1:]
+        match = _SESSION_LINE_RE.match(body)
+        if match is None:
+            continue
+        lines[index] = (
+            f"{prefix}{match.group('lead')}SIS_SESSION_ID{match.group('assign')}"
+            f"{_replace_value_segment(match.group('value'), value)}{ending}"
+        )
+        replaced = True
+
+    if not replaced:
+        newline = "\r\n" if "\r\n" in text else "\n"
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] = lines[-1] + newline
+        lines.append(f"SIS_SESSION_ID={value}{newline}")
+
+    payload = "".join(lines).encode("utf-8")
+    _atomic_replace_bytes(env_path, payload, 0o600 if created else existing_mode)
+    return SessionWrite(path=env_path, created=created, replaced=replaced)
+
+
+def _atomic_replace_bytes(path: Path, data: bytes, mode: Optional[int]) -> None:
+    """Stage ``data`` in a sibling temp file with ``mode`` and ``os.replace`` it into place."""
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    try:
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode or 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(str(tmp_path), mode)
+        os.replace(str(tmp_path), str(path))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            if tmp_path.exists():
+                tmp_path.unlink()
+        raise
 
 
 def parse_int(

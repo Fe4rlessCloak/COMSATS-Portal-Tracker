@@ -450,6 +450,143 @@ class WatcherTests(unittest.TestCase):
             )
 
 
+class SessionWriteTests(unittest.TestCase):
+    """The one `.env` writer: it touches only the `SIS_SESSION_ID` assignment.
+
+    Everything here is asserted against the bytes on disk plus the existing
+    ``EnvWatcher``, so the tests survive any rewrite of the helper's internals.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmpdir = Path(self._tmp.name)
+        self.env_path = self.tmpdir / ".env"
+
+    def _write(self, text: str) -> None:
+        self.env_path.write_bytes(text.encode("utf-8"))
+
+    def test_replaces_only_the_session_line_and_preserves_everything_else(self) -> None:
+        original = (
+            "# Tracker configuration\n"
+            "# keep this comment\n"
+            "\n"
+            "SIS_SESSION_ID=old_cookie_value\n"
+            "\n"
+            "SIS_BASE_URL=https://sis.comsats.edu.pk  # portal\n"
+            "NTFY_URL=https://ntfy.sh/topic\n"
+            "SIS_SEMESTER=\"Fall 2026\"\n"
+        )
+        self._write(original)
+
+        config.write_session_id(self.env_path, "brand_new_cookie")
+
+        expected = original.replace(
+            "SIS_SESSION_ID=old_cookie_value", "SIS_SESSION_ID=brand_new_cookie"
+        )
+        self.assertEqual(self.env_path.read_text(encoding="utf-8"), expected)
+        # Nothing else moved: same line count, same order, same comments.
+        self.assertEqual(
+            [line.split("=")[0] for line in expected.splitlines()],
+            [line.split("=")[0] for line in original.splitlines()],
+        )
+
+    def test_preserves_export_prefix_quoting_and_inline_comment(self) -> None:
+        self._write('export SIS_SESSION_ID = "old cookie"  # mine\nNTFY_URL=x\n')
+
+        config.write_session_id(self.env_path, "newcookie")
+
+        self.assertEqual(
+            self.env_path.read_text(encoding="utf-8"),
+            'export SIS_SESSION_ID = "newcookie"  # mine\nNTFY_URL=x\n',
+        )
+
+    def test_preserves_crlf_line_endings(self) -> None:
+        self._write("SIS_SESSION_ID=old\r\nNTFY_URL=x\r\n")
+
+        config.write_session_id(self.env_path, "new")
+
+        self.assertEqual(
+            self.env_path.read_bytes(), b"SIS_SESSION_ID=new\r\nNTFY_URL=x\r\n"
+        )
+
+    def test_appends_the_key_when_missing_and_keeps_the_file_valid(self) -> None:
+        self._write("# no session here\nNTFY_URL=x")  # no trailing newline
+
+        result = config.write_session_id(self.env_path, "fresh")
+
+        self.assertEqual(
+            self.env_path.read_text(encoding="utf-8"),
+            "# no session here\nNTFY_URL=x\nSIS_SESSION_ID=fresh\n",
+        )
+        self.assertFalse(result.replaced)
+        self.assertFalse(result.created)
+
+    def test_creates_a_missing_file_with_owner_only_permissions(self) -> None:
+        result = config.write_session_id(self.env_path, "fresh")
+
+        self.assertTrue(result.created)
+        self.assertEqual(self.env_path.read_text(encoding="utf-8"), "SIS_SESSION_ID=fresh\n")
+        self.assertEqual(self.env_path.stat().st_mode & 0o777, 0o600)
+
+    def test_keeps_the_existing_mode_when_rewriting(self) -> None:
+        self._write("SIS_SESSION_ID=old\n")
+        self.env_path.chmod(0o640)
+
+        config.write_session_id(self.env_path, "new")
+
+        self.assertEqual(self.env_path.stat().st_mode & 0o777, 0o640)
+
+    def test_blank_and_placeholder_values_are_rejected_without_touching_the_file(self) -> None:
+        self._write("SIS_SESSION_ID=old\n")
+        before = self.env_path.read_bytes()
+        inode_before = self.env_path.stat().st_ino
+
+        for bad in ("", "   ", "Cookie:", config.SESSION_PLACEHOLDER):
+            with self.assertRaises(ValueError):
+                config.write_session_id(self.env_path, bad)
+
+        self.assertEqual(self.env_path.read_bytes(), before)
+        self.assertEqual(self.env_path.stat().st_ino, inode_before)
+
+    def test_values_containing_newlines_are_rejected_without_touching_the_file(self) -> None:
+        self._write("SIS_SESSION_ID=old\n")
+        before = self.env_path.read_bytes()
+
+        with self.assertRaises(ValueError):
+            config.write_session_id(self.env_path, "abc\nNTFY_TOKEN=leaked")
+
+        self.assertEqual(self.env_path.read_bytes(), before)
+
+    def test_write_is_an_atomic_replace_that_env_watcher_detects(self) -> None:
+        self._write("SIS_SESSION_ID=old\nNTFY_URL=x\n")
+        watcher = EnvWatcher(self.env_path, environ={})
+        inode_before = self.env_path.stat().st_ino
+        self.assertFalse(watcher.check(environ={}).changed)
+
+        config.write_session_id(self.env_path, "rotated_value")
+
+        # A same-directory temp file + os.replace leaves no litter and a new inode,
+        # which is what makes the running daemon notice the change.
+        self.assertEqual(
+            sorted(p.name for p in self.tmpdir.iterdir()), [".env"], msg="temp file left behind"
+        )
+        self.assertNotEqual(self.env_path.stat().st_ino, inode_before)
+
+        reload = watcher.check(environ={})
+        self.assertTrue(reload.changed)
+        self.assertIn("inode", reload.description)
+        self.assertEqual(reload.config.session_id, "rotated_value")
+
+    def test_result_reports_replacement(self) -> None:
+        self._write("SIS_SESSION_ID=old\n")
+
+        result = config.write_session_id(self.env_path, "new")
+
+        self.assertTrue(result.replaced)
+        self.assertFalse(result.created)
+
+
 class PortalDefaultsDriftTests(unittest.TestCase):
     """The mirrored portal defaults must not drift from the Portal module's copies.
 
