@@ -411,6 +411,70 @@ class DockerfileTests(unittest.TestCase):
             self.assertNotIn(forbidden, self.dockerfile)
 
 
+class ImageBuildJobTests(unittest.TestCase):
+    """#14's last criterion: a real `linux/amd64` build passes sanity checks.
+
+    Nothing else in CI built the image -- only the publish push did, after a
+    merge to `main` -- so a Dockerfile that no longer builds, an import that only
+    works from a checkout, or a `HEALTHCHECK` pointing at a broken command was
+    discovered by an empty registry or a restarting container, never by a red
+    build. The job must live in `checks.yml`, which runs on pull requests too,
+    and must stay off the publish path so a build failure can never block or
+    fake a release.
+    """
+
+    def setUp(self) -> None:
+        self.document = _load(CHECKS)
+        self.jobs = self.document["jobs"]
+
+    def test_checks_workflow_has_an_image_job(self) -> None:
+        self.assertIn("image", self.jobs, sorted(self.jobs))
+
+    def test_the_check_job_is_still_there(self) -> None:
+        """Adding a job must not replace the test matrix."""
+        self.assertIn("check", self.jobs)
+        versions = self.jobs["check"]["strategy"]["matrix"]["python-version"]
+        self.assertEqual([_text(v) for v in versions], ["3.9", "3.13"])
+
+    def test_the_image_job_needs_nothing_from_the_publish_workflow(self) -> None:
+        """It must be reachable on a pull request, not gated behind main."""
+        job = self.jobs["image"]
+        self.assertNotIn("needs", job)
+        self.assertNotIn("if", job, "an `if:` would gate the build off pull requests")
+
+    def test_the_image_job_has_no_registry_access(self) -> None:
+        job = self.jobs["image"]
+        text = "\n".join(_text(step.get("run")) for step in job["steps"])
+        for forbidden in ("login-action", "packages: write", "secrets."):
+            self.assertNotIn(forbidden, str(self.document.get("permissions", "")))
+            for step in job["steps"]:
+                self.assertNotIn(forbidden, _text(step.get("uses")))
+        self.assertNotIn("push", text)
+        self.assertNotIn("ghcr.io", text)
+
+    def test_the_image_job_builds_linux_amd64(self) -> None:
+        body = str(self.jobs["image"])
+        self.assertIn("linux/amd64", body)
+
+    def test_the_image_job_runs_the_healthcheck_command(self) -> None:
+        body = str(self.jobs["image"])
+        self.assertIn("--healthcheck", body)
+
+    def test_the_image_job_checks_for_secrets(self) -> None:
+        body = str(self.jobs["image"])
+        self.assertIn(".env", body)
+
+    def test_the_image_job_is_pinned_like_the_rest(self) -> None:
+        self.assertEqual(_text(self.jobs["image"]["runs-on"]), "ubuntu-24.04")
+
+    def test_no_job_publishes_anything(self) -> None:
+        for name, job in self.jobs.items():
+            with self.subTest(job=name):
+                for step in job["steps"]:
+                    self.assertNotIn("build-push-action", _text(step.get("uses")))
+                self.assertNotIn("permissions", job)
+
+
 class IntegrationTests(unittest.TestCase):
     def test_checks_workflow_is_named_what_the_trigger_expects(self) -> None:
         """workflow_run matches on the workflow's `name`, not its file name."""

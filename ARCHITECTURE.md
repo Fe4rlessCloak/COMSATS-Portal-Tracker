@@ -323,6 +323,10 @@ All runtime files live under `./data/` (mounted to `/app/data` in Docker) and ar
   `check.py`. It copies the repo into a temp dir first, so this checkout is never written to.
   Its probes cover the three floor constructs `check.py` names (`match`, `except*`,
   `type X = int`) as well as the import, annotation, union, module-graph and Dockerfile rules.
+  CI (`.github/workflows/checks.yml`) runs those two plus the suite on Python 3.9 and 3.13,
+  and an `image` job builds the real `linux/amd64` image, imports every module inside it,
+  and exercises the `HEALTHCHECK` both ways. That job runs on pull requests too and holds no
+  registry credentials — publishing lives only in `publish-image.yml`.
 - **Change snapshot policy in `snapshot_transition.py`, not `tracker.py`**: validation,
   rollover, anomaly dedupe/recovery, and diffing all live in that pure module, which must
   never import `tracker`, `runtime_store`, or `os`/`io`/`json`. `run_cycle()` only loads,
