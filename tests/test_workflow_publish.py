@@ -146,6 +146,44 @@ class YamlReaderTests(unittest.TestCase):
             loads("a: [1, 2\n")
 
 
+class ConcurrencyTests(unittest.TestCase):
+    """Publishes must serialise across commits, or `latest` can go backwards.
+
+    `latest` is a single shared tag. Keying the concurrency group on
+    `head_sha` -- as this workflow originally did -- gives every commit its own
+    group, so two green merges build in parallel and whichever finishes second
+    wins the tag. A slower run for an older commit would then repoint `latest`
+    at older code, and the 15-minute systemd timer would recreate the server
+    onto it, breaking #12 story 5 and #16's "only when a newer image was pulled".
+    """
+
+    def setUp(self) -> None:
+        self.document = _load(PUBLISH)
+        self.job = _build_job(self.document)
+
+    def test_concurrency_group_is_repository_scoped(self) -> None:
+        group = _text(self.job["concurrency"]["group"])
+
+        self.assertNotIn("head_sha", group)
+        self.assertNotIn("github.sha", group)
+        self.assertNotIn("github.run_id", group)
+        self.assertTrue(group.startswith("publish-image"), group)
+
+    def test_concurrency_group_is_a_literal_not_a_per_run_expression(self) -> None:
+        """A literal is the only form that cannot drift per commit."""
+        group = _text(self.job["concurrency"]["group"])
+
+        self.assertEqual(group, "publish-image")
+
+    def test_cancel_in_progress_is_false(self) -> None:
+        """Serialising is only meaningful if the queued run is not cancelled.
+
+        With `cancel-in-progress: true` the newer run would kill the older one,
+        which reorders publishes instead of ordering them.
+        """
+        self.assertIs(self.job["concurrency"]["cancel-in-progress"], False)
+
+
 class TriggerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.document = _load(PUBLISH)

@@ -32,10 +32,20 @@ jobs:
     # Pinned like checks.yml: an explicit image beats a floating label that has
     # already moved once under this repo.
     runs-on: ubuntu-24.04
-    # One publish per tested commit: a re-run of checks for the same SHA must
-    # not race a second build for the same two tags.
+    # One publish at a time, repository-wide -- deliberately NOT keyed on
+    # `head_sha`. `latest` is a single shared tag, so a per-commit group lets two
+    # green merges publish in parallel and the slower run win the tag; a run for
+    # an older commit could then repoint `latest` at older code and the 15-minute
+    # systemd timer would recreate the server onto it (#12 story 5, #16's "only
+    # when a newer image was pulled"). Serialising by repository makes publishes
+    # strictly ordered: the newest commit's run is the last to write `latest`.
+    #
+    # `cancel-in-progress: false` is therefore load-bearing, not a default left
+    # alone. Cancelling the in-flight run when a newer one queues would undo the
+    # ordering -- the older commit would never publish its `sha-<7>` tag, and a
+    # rollback pin for a commit that *did* pass checks would not exist.
     concurrency:
-      group: publish-image-${{ github.event.workflow_run.head_sha }}
+      group: publish-image
       cancel-in-progress: false
     steps:
       # workflow_run executes the *default branch's* copy of this file, and its
