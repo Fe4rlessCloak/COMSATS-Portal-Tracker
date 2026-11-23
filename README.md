@@ -68,13 +68,16 @@ For a simple breakdown of the polling flow, fallbacks, runtime files, and COMSAT
 
 ## Running 24/7 with Docker Compose (Recommended for Mini-PC)
 
-The image is published to GitHub Container Registry, so a server **needs no source checkout** — just three things in one directory:
+The image is published to GitHub Container Registry, so a server **needs no source checkout** — just one directory with four things:
 
 ```
 comsats/
-├── docker-compose.yml     # the only Compose file a server needs
-├── .env                   # your session cookie + notifier settings
-└── data/                  # created on first run; holds state.json + heartbeat.json
+├── docker-compose.yml            # copy from the repo
+├── .env                          # your session cookie + notifier settings
+├── data/                         # created on first run; state.json + heartbeat.json
+└── deploy/systemd/               # only if you want the auto-updater (below)
+    ├── comsats-tracker-update.sh
+    └── comsats-tracker-update.service / .timer
 ```
 
 Copy `docker-compose.yml` from this repository once, then:
@@ -125,17 +128,20 @@ Ready-to-copy units live in [`deploy/systemd/`](deploy/systemd/): `comsats-track
 
 Step 3 never touches anything else on the host. `docker image prune` cannot filter by label, and pruning by name or tag prefix would match whatever else happens to share them, so the label is the entire scope — that is what keeps unrelated containers and images on a shared server safe. The currently-running image is never deleted, and nothing is ever removed with `--force`, so an image still in use is skipped with a warning and retried on the next run.
 
-Install:
+Install (the script lives with your stack so its default `STACK_DIR` resolves; the units go to `/etc/systemd/system`):
 
 ```bash
+# from a checkout, onto the server's stack directory:
+mkdir -p /path/to/your/comsats/deploy/systemd      # replace /path/to/your/comsats
+cp deploy/systemd/comsats-tracker-update.sh /path/to/your/comsats/deploy/systemd/
 sudo cp deploy/systemd/comsats-tracker-update.service \
         deploy/systemd/comsats-tracker-update.timer /etc/systemd/system/
-sudo systemctl edit --full comsats-tracker-update.service   # set WorkingDirectory + ExecStart to /path/to/your/comsats
+sudo systemctl edit --full comsats-tracker-update.service   # set WorkingDirectory + ExecStart
 sudo systemctl daemon-reload
 sudo systemctl enable --now comsats-tracker-update.timer
 ```
 
-The two lines to change are `WorkingDirectory=` and `ExecStart=`; both must point at the directory holding your `docker-compose.yml`. The units are templates: they ship with `/path/to/COMSATS-Portal-Tracker` so no real host path is committed.
+The two lines to change are `WorkingDirectory=` and `ExecStart=`; both must point at the directory holding your `docker-compose.yml`. The units are templates shipping `/path/to/COMSATS-Portal-Tracker`, so no real host path is committed. If you would rather keep the script anywhere else, set `STACK_DIR=` explicitly in the unit and the script will use it instead of `../..` from its own location.
 
 Check on it:
 
