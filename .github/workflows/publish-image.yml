@@ -1,0 +1,128 @@
+name: publish-image
+
+# A second workflow file instead of a `needs:` job inside checks.yml, because
+# `permissions` are the part that makes this safe: a workflow started by a pull
+# request must never hold `packages: write`. Leaving checks.yml read-only means
+# a pull request cannot reach the registry even if a later change adds a job to
+# it. This workflow starts when checks *completes*, and its `if:` re-asserts the
+# three facts that make a publish legal -- green, push, main.
+on:
+  workflow_run:
+    workflows: ["checks"]
+    types: [completed]
+    branches: ["main"]
+
+permissions:
+  contents: read   # read the commit that was tested
+  packages: write  # push to ghcr.io; no PAT, no repository secret involved
+
+env:
+  IMAGE: ghcr.io/fe4rlesscloak/comsats-portal-tracker
+  REPO_URL: https://github.com/Fe4rlessCloak/COMSATS-Portal-Tracker
+
+jobs:
+  build:
+    # workflow_run fires on failure too, and `branches:` filters a head branch
+    # name that a fork gets to choose. So the conclusion, the event and the
+    # branch are all re-checked here rather than trusted to the filter alone.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    # Pinned like checks.yml: an explicit image beats a floating label that has
+    # already moved once under this repo.
+    runs-on: ubuntu-24.04
+    # One publish per tested commit: a re-run of checks for the same SHA must
+    # not race a second build for the same two tags.
+    concurrency:
+      group: publish-image-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
+    steps:
+      # workflow_run executes the *default branch's* copy of this file, and its
+      # `github.sha` is main's tip -- not the commit checks validated. Checking
+      # out `head_sha` explicitly is what makes the tags below describe the code
+      # that actually passed. Nothing from a fork is ever checked out: the `if:`
+      # above has already restricted this run to a push on main.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # Seven characters, the length git and GitHub print by default
+      # (`sha-1a2b3c4`), and the tag #16 pins when rolling back. Sliced from the
+      # 40-character SHA rather than read from `git rev-parse --short`, which
+      # silently grows past seven characters on an ambiguous prefix and would
+      # break that pin without failing anything.
+      - name: Derive the short SHA and prove the checkout is that commit
+        id: commit
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          short="${HEAD_SHA:0:7}"
+          if [ "${#short}" -ne 7 ]; then
+            echo "short SHA '$short' is not 7 characters" >&2
+            exit 1
+          fi
+          head="$(git rev-parse HEAD)"
+          if [ "$head" != "$HEAD_SHA" ]; then
+            echo "checked out $head, but checks validated $HEAD_SHA" >&2
+            exit 1
+          fi
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      # `secrets.GITHUB_TOKEN` is minted for this run and expires with it, so
+      # there is no stored credential anywhere; `packages: write` above is the
+      # entire grant.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # `latest` is what compose pulls; `sha-<7>` is the immutable rollback
+          # pin (#16 relies on it, #18's docs quote it). No floating `main` tag:
+          # a tag that moves cannot be rolled back to. These are tag *names* --
+          # metadata-action prefixes `images:` and adds the colon itself.
+          tags: |
+            latest
+            sha-${{ steps.commit.outputs.short }}
+          # `source` is load-bearing, not decoration: #16 filters its host-side
+          # prune on this label, so an image without it is an image that cleanup
+          # will not recognise as this project's.
+          labels: |
+            org.opencontainers.image.source=${{ env.REPO_URL }}
+            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+            org.opencontainers.image.title=COMSATS Portal Tracker
+            org.opencontainers.image.description=Portal session keeper, roster snapshotter and notifier for COMSATS students.
+
+      # amd64 only: the hosts this runs on are x86, and a second platform
+      # doubles publish time to produce an image nothing pulls.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record what was published
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          {
+            echo "### Published \`$IMAGE\`"
+            echo
+            echo "- tag \`latest\`"
+            echo "- tag \`sha-${{ steps.commit.outputs.short }}\`"
+            echo "- commit \`$HEAD_SHA\`"
+            echo "- digest \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
