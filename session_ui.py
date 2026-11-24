@@ -202,10 +202,11 @@ def _setting_values(
     passes them as environment entries) still wins over the mounted file, and a
     bare ``python3 session_ui.py`` run still reads ``.env`` as documented.
 
-    ``env_path`` is the CLI's ``--env-file`` value when it has one. It must be
-    honoured here, not only at the write site: the settings are resolved before
-    ``argparse`` runs, so a flag-only run would otherwise read the default
-    ``.env`` and silently lose its allowlist.
+    ``env_path`` is the explicit ``.env`` file (e.g. from ``--env-file`` or
+    ``app.env_path``) when one is known. Passing it here ensures every setting —
+    allowlist, host, port, timeout, and non-loopback opt-in — is read from the
+    same file the page will write, rather than silently falling back to the
+    repo-default ``.env``.
     """
     env = _env(environ)
     resolved = env_path if env_path is not None else resolve_env_file(
@@ -458,7 +459,7 @@ class SessionUiApp:
         self.allowed_user = (
             (allowed_user or "").strip()
             if allowed_user is not None
-            else load_settings(environ).allowed_user
+            else load_settings(environ, env_file=self.env_path).allowed_user
         )
         #: Per-process form token. Not one-shot, so an open tab keeps working
         #: across saves; it is unguessable and never logged or rendered anywhere
@@ -953,7 +954,7 @@ def create_server(
     log_stream: Optional[Any] = None,
 ) -> ThreadingHTTPServer:
     """Create (but do not start) the HTTP server, enforcing the loopback rule."""
-    settings = load_settings(environ)
+    settings = load_settings(environ, env_file=app.env_path)
     bind_host = resolve_bind_host(
         settings.host if host is None else host,
         environ,

@@ -11,6 +11,7 @@ bytes on disk, and `config.EnvWatcher.check()`.
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime, timezone
 import html
 import http.client
 import io
@@ -387,7 +388,8 @@ class StatusPageTests(_ServerTestCase):
     """`GET /` renders read-only tracker status and no secrets."""
 
     def test_renders_status_detail_and_last_healthy_time(self) -> None:
-        self.write_heartbeat()
+        pinned = datetime(2026, 11, 23, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+        self.write_heartbeat(last_ok_timestamp=pinned)
 
         status, body = self.get()
 
@@ -396,7 +398,7 @@ class StatusPageTests(_ServerTestCase):
         self.assertIn("status", lowered)
         self.assertIn("ok", lowered)
         self.assertIn("3 courses tracked", body)
-        self.assertIn("2026-11-23", body)  # last healthy time, from last_ok_timestamp
+        self.assertIn("2026-11-23 10:00:00 UTC", body)  # last healthy time, from last_ok_timestamp
 
     def test_missing_heartbeat_is_reported_cleanly(self) -> None:
         self.assertFalse(self.heartbeat_path.exists())
@@ -1345,6 +1347,30 @@ class SettingsFromEnvFileTests(unittest.TestCase):
 
         self.assertEqual(settings.allowed_user, "from_the_flag@example.com")
         self.assertEqual(settings.env_path, self.env_path)
+
+    def test_create_server_reads_bind_settings_from_app_env_path(self) -> None:
+        self._write_env("SESSION_UI_HOST=192.0.2.1\n")
+        app = session_ui.build_app(
+            self.env_path, self.tmpdir / "heartbeat.json", environ={}
+        )
+        with self.assertRaises(session_ui.BindRefusedError):
+            session_ui.create_server(app, port=0, environ={})
+
+        self._write_env("SESSION_UI_HOST=127.0.0.1\nSESSION_UI_PORT=0\n")
+        app = session_ui.build_app(
+            self.env_path, self.tmpdir / "heartbeat.json", environ={}
+        )
+        server = session_ui.create_server(app, environ={})
+        self.addCleanup(server.server_close)
+        self.assertEqual(server.server_address[0], "127.0.0.1")
+        self.assertGreater(server.server_address[1], 0)
+
+    def test_direct_app_reads_allowed_user_from_env_path(self) -> None:
+        self._write_env("SESSION_UI_ALLOWED_USER=direct@example.com\n")
+        app = session_ui.SessionUiApp(
+            self.env_path, self.tmpdir / "heartbeat.json", environ={}
+        )
+        self.assertEqual(app.allowed_user, "direct@example.com")
 
 
 class EnvFileAllowlistGateTests(_ServerTestCase):

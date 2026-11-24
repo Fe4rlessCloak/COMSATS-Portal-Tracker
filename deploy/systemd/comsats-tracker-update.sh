@@ -100,9 +100,14 @@ compose() {
 # `--profile` is a global Compose flag, so it has to sit with `-f` and before
 # the subcommand -- hence the array threaded through `compose()` rather than a
 # suffix on each call. Empty unless the opt-in container exists (see the header).
+# Reading `{{.Image}}` in this same inspect call lets us check whether the UI
+# container is stale without a second `docker inspect` invocation.
 PROFILE_ARGS=()
-if "$DOCKER" inspect --format '{{.Name}}' "$SESSION_UI_CONTAINER" >/dev/null 2>&1; then
+UI_RUNNING_ID=""
+if UI_RUNNING_ID="$("$DOCKER" inspect --format '{{.Image}}' "$SESSION_UI_CONTAINER" 2>/dev/null)"; then
     PROFILE_ARGS=(--profile "$SESSION_UI_PROFILE")
+else
+    UI_RUNNING_ID=""
 fi
 
 # `docker images -q` is not consistent about the digest algorithm prefix: with
@@ -146,15 +151,41 @@ if [ -z "$NEW_ID" ]; then
     fi
 fi
 
+NEW_HEX="$(strip_digest "$NEW_ID")"
 RUNNING_ID="$(container_image_id)"
+RUNNING_HEX="$(strip_digest "$RUNNING_ID")"
 
 # Compare bare hex: the two commands disagree about the `sha256:` prefix.
-if [ -n "$NEW_ID" ] && [ "$(strip_digest "$NEW_ID")" = "$(strip_digest "$RUNNING_ID")" ]; then
-    log "unchanged: ${CONTAINER} already runs ${NEW_ID}"
+# Check both the tracker and (when enabled) `comsats-session-ui` so the UI
+# container cannot stay stranded on an older image if the tracker already moved.
+NEEDS_RECREATE=0
+RECREATE_REASON=""
+if [ -z "$NEW_ID" ] || [ "$NEW_HEX" != "$RUNNING_HEX" ]; then
+    NEEDS_RECREATE=1
+    RECREATE_REASON="${CONTAINER} running ${RUNNING_ID:-nothing}"
+fi
+if [ "${#PROFILE_ARGS[@]}" -gt 0 ]; then
+    UI_HEX="$(strip_digest "$UI_RUNNING_ID")"
+    if [ -z "$NEW_ID" ] || [ "$NEW_HEX" != "$UI_HEX" ]; then
+        NEEDS_RECREATE=1
+        if [ -n "$RECREATE_REASON" ]; then
+            RECREATE_REASON="${RECREATE_REASON}; ${SESSION_UI_CONTAINER} running ${UI_RUNNING_ID:-nothing}"
+        else
+            RECREATE_REASON="${SESSION_UI_CONTAINER} running ${UI_RUNNING_ID:-nothing}"
+        fi
+    fi
+fi
+
+if [ "$NEEDS_RECREATE" -eq 0 ]; then
+    if [ "${#PROFILE_ARGS[@]}" -gt 0 ]; then
+        log "unchanged: ${CONTAINER} and ${SESSION_UI_CONTAINER} already run ${NEW_ID}"
+    else
+        log "unchanged: ${CONTAINER} already runs ${NEW_ID}"
+    fi
 elif [ "$DRY_RUN" -eq 1 ]; then
-    log "would recreate ${CONTAINER} (running ${RUNNING_ID:-nothing}, image ${NEW_ID})"
+    log "would recreate (${RECREATE_REASON}; image ${NEW_ID})"
 else
-    log "image changed (running ${RUNNING_ID:-nothing}, image ${NEW_ID}); recreating ${CONTAINER}"
+    log "image changed (${RECREATE_REASON}; image ${NEW_ID}); recreating"
     compose up -d
 fi
 

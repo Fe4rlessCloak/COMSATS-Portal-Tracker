@@ -211,7 +211,7 @@ Compose reads that same `.env` to fill in the service's environment and port map
 
 With `SESSION_UI_ALLOWED_USER` set, every request without a matching `Tailscale-User-Login` header gets `403 Forbidden` — including one that reaches the loopback port by some other route, which is why it must be paired with the loopback-only publish below rather than trusted on its own.
 
-To stop it again, `docker compose --profile session-ui down` (or `docker compose stop session-ui`). Once the `comsats-session-ui` container exists, the auto-updater includes the profile automatically, so it keeps receiving new images; removing the container returns the host to tracker-only updates.
+To stop and remove only the page (returning the host to tracker-only updates), run `docker compose rm -sf session-ui`. Avoid `docker compose --profile session-ui down` — that stops and removes `tracker` too — and note that plain `docker compose stop session-ui` leaves the container in place, so the auto-updater will recreate and start it again on the next image update. While the `comsats-session-ui` container exists, the auto-updater includes the profile automatically and keeps both containers on the latest image.
 
 #### Publishing it privately with Tailscale Serve
 

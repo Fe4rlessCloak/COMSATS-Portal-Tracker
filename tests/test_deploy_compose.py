@@ -672,9 +672,10 @@ class UpdateScriptProfileTests(UpdateScriptCase):
     host's call log byte-identical.
     """
 
-    def _ui_container(self, running: bool = True) -> None:
+    def _ui_container(self, image_id: str = CURRENT, running: bool = True) -> None:
+        del running  # `docker inspect --format '{{.Image}}'` returns the image ID regardless
         (self.state / f"container_id.{SESSION_UI_CONTAINER}").write_text(
-            "true" if running else "false", encoding="utf-8"
+            image_id, encoding="utf-8"
         )
 
     def test_tracker_only_host_passes_no_profile(self) -> None:
@@ -722,11 +723,33 @@ class UpdateScriptProfileTests(UpdateScriptCase):
         """Stopping it by hand must not strand it on the previous image."""
         self._state(CURRENT, PREVIOUS)
         self._labels(CURRENT, PREVIOUS)
-        self._ui_container(running=False)
+        self._ui_container(image_id=PREVIOUS, running=False)
         self._run()
         self.assertIn(
             f"--profile {SESSION_UI_PROFILE}", self._compose_calls("up")[0]
         )
+
+    def test_stale_ui_container_triggers_recreate_even_when_tracker_is_current(self) -> None:
+        """If tracker is current but `comsats-session-ui` is stale, `up -d` must run."""
+        self._state(CURRENT, CURRENT)
+        self._labels(CURRENT, PREVIOUS)
+        self._ui_container(image_id=PREVIOUS)
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        ups = self._compose_calls("up")
+        self.assertEqual(len(ups), 1, self._calls())
+        self.assertIn(f"--profile {SESSION_UI_PROFILE}", ups[0])
+
+    def test_dry_run_reports_recreate_when_only_ui_container_is_stale(self) -> None:
+        self._state(CURRENT, CURRENT)
+        self._labels(CURRENT, PREVIOUS)
+        self._ui_container(image_id=PREVIOUS)
+        result = self._run("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self._compose_calls("up"), [])
+        self.assertIn("would recreate", result.stdout)
+        self.assertIn(SESSION_UI_CONTAINER, result.stdout)
+        self.assertNotIn("unchanged", result.stdout.lower())
 
     def test_dry_run_names_the_profile_it_would_use(self) -> None:
         self._state(CURRENT, PREVIOUS)
@@ -921,6 +944,10 @@ class ReadmeSessionUiTests(unittest.TestCase):
     def test_names_no_real_host_or_unrelated_port(self) -> None:
         for forbidden in ("100.", "192.168.", "10.0.0.", "8080", "9000", "32400"):
             self.assertNotIn(forbidden, self.text, forbidden)
+
+    def test_documents_removing_only_the_session_ui_to_stop(self) -> None:
+        self.assertIn("docker compose rm -sf session-ui", self.text)
+        self.assertIn("--profile session-ui down", self.text)
 
 
 class EnvExampleSessionUiTests(unittest.TestCase):
