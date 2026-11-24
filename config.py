@@ -20,9 +20,11 @@ without mutating process-wide environment state.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -39,6 +41,56 @@ DEFAULT_USER_AGENT = (
 # The single canonical notification timeout rule (default 20s, minimum 1s).
 NOTIFIER_TIMEOUT_DEFAULT = 20.0
 NOTIFIER_TIMEOUT_MINIMUM = 1.0
+
+# ------------------------------------------------------------------ heartbeat
+# The `heartbeat.json` staleness rule, defined once because two modules read the
+# same frozen contract (AGENTS.md lists its keys and statuses as unchangeable):
+# `runtime_store.check_healthcheck` for the container HEALTHCHECK and the
+# `--healthcheck` CLI, and `session_ui.read_heartbeat` for the status page. Two
+# copies would let the page and the container disagree about whether the tracker
+# is healthy, which is the one thing the file exists to answer.
+
+#: `KEEPALIVE_INTERVAL`'s floor and fallback, mirrored wherever it is parsed.
+DEFAULT_KEEPALIVE_INTERVAL = 120
+
+#: Staleness floor when `HEALTHCHECK_MAX_AGE` is unset: never stale sooner than
+#: this, however short the keep-alive interval is.
+MINIMUM_HEALTHCHECK_MAX_AGE = 60
+
+#: Statuses the daemon writes when it cannot scan without a fresh cookie: what
+#: makes the session page worth visiting and the container unhealthy.
+NEEDS_COOKIE_STATUSES = frozenset(
+    {"waiting_for_session", "exiting_session_expired", "wedged_exiting"}
+)
+
+
+def _as_int(value: Any, default: int) -> int:
+    """Integer-or-default, tolerating the strings ``json`` can carry."""
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def heartbeat_stale_after(payload: Mapping[str, Any]) -> int:
+    """Seconds after which a heartbeat payload counts as stale.
+
+    `HEALTHCHECK_MAX_AGE` wins when it is positive; otherwise the window is
+    `max(KEEPALIVE_INTERVAL, 60)` -- one keep-alive tick, but never under a
+    minute. This is the whole rule; both readers call it rather than restating
+    it.
+    """
+    configured = _as_int(payload.get("healthcheck_max_age"), 0)
+    if configured > 0:
+        return configured
+    keepalive = _as_int(payload.get("keepalive_interval"), DEFAULT_KEEPALIVE_INTERVAL)
+    return max(keepalive, MINIMUM_HEALTHCHECK_MAX_AGE)
+
+
+def heartbeat_needs_cookie(status: Any) -> bool:
+    """True when `status` is one of the daemon's cookie-waiting statuses."""
+    return str(status or "") in NEEDS_COOKIE_STATUSES
+
 
 SESSION_PLACEHOLDER = "paste_your_ASP_NET_SessionId_here"
 
@@ -82,6 +134,11 @@ _UNREAD = object()
 _EXPORT_PREFIX_RE = re.compile(r"^export[ \t]+")
 _INLINE_COMMENT_RE = re.compile(r"(?:^|\s+)#.*$")
 _SESSION_COOKIE_RE = re.compile(r"(?:^|;\s*)asp\.net_sessionid\s*=\s*([^;]*)", re.IGNORECASE)
+# A `SIS_SESSION_ID` assignment line, split into its indent, the `=` and its RHS so a
+# rewrite keeps deletion-safe groups around the value it replaces.
+_SESSION_LINE_RE = re.compile(
+    r"^(?P<lead>[ \t]*(?:export[ \t]+)?)SIS_SESSION_ID(?P<assign>[ \t]*=[ \t]*)(?P<value>.*)$"
+)
 _SAFE_KEY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,40}$")
 
 
@@ -151,6 +208,31 @@ def _decode_env_bytes(raw: bytes) -> str:
         return raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         return raw.decode("cp1252", errors="replace")
+
+
+def _env_bytes_codec(raw: bytes) -> Tuple[str, bytes]:
+    """The codec :func:`_decode_env_bytes` will use, plus the exact BOM bytes.
+
+    The writer needs both, because "touching no other byte" is only true if the
+    re-encode uses the encoding the read used -- ``raw.decode(...)`` consumes a
+    BOM, so it has to be re-attached verbatim rather than re-derived from the
+    host's byte order. ``utf-16``/``utf-32`` would encode little-endian on this
+    machine and silently rewrite a big-endian file.
+    """
+    for bom, codec in (
+        (b"\xff\xfe\x00\x00", "utf-32-le"),
+        (b"\x00\x00\xfe\xff", "utf-32-be"),
+        (b"\xff\xfe", "utf-16-le"),
+        (b"\xfe\xff", "utf-16-be"),
+        (b"\xef\xbb\xbf", "utf-8"),
+    ):
+        if raw.startswith(bom):
+            return codec, bom
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "cp1252", b""
+    return "utf-8", b""
 
 
 def _parse_quoted_env_value(val: str, quote: str) -> Optional[str]:
@@ -395,6 +477,177 @@ class EnvWatcher:
             raw=raw,
         )
         return EnvReload(changed=changed, description=desc, config=cfg)
+
+
+@dataclass(frozen=True)
+class SessionWrite:
+    """Outcome of one ``SIS_SESSION_ID`` rewrite (what changed, not how)."""
+
+    path: Path
+    created: bool
+    replaced: bool
+
+
+def _split_line_ending(line: str) -> Tuple[str, str]:
+    """Split a raw line into its content and its original ``\\r\\n``/``\\n``/``\\r`` ending."""
+    for ending in ("\r\n", "\n", "\r"):
+        if line.endswith(ending):
+            return line[: -len(ending)], ending
+    return line, ""
+
+
+def _closing_quote_index(text: str, quote: str) -> int:
+    """Index of the closing quote in a quoted .env value, honouring ``\\"`` escapes."""
+    i = 1
+    while i < len(text):
+        ch = text[i]
+        if quote == '"' and ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            return i
+        i += 1
+    return -1
+
+
+def _replace_value_segment(segment: str, new_value: str) -> str:
+    """Rewrite the RHS of a session line, keeping its quotes and trailing comment.
+
+    ``segment`` is everything after the ``=``. A quoted value keeps its quote
+    character and whatever follows the closing quote (whitespace and an inline
+    ``#`` comment); an unquoted value keeps its inline comment verbatim.
+    """
+    stripped = segment.strip()
+    if stripped[:1] in ('"', "'"):
+        quote = stripped[0]
+        end_idx = _closing_quote_index(stripped, quote)
+        if end_idx != -1:
+            tail = stripped[end_idx + 1 :]
+            return f"{quote}{new_value}{quote}{tail}"
+
+    comment = _INLINE_COMMENT_RE.search(segment)
+    if comment is not None and segment[comment.start() : comment.start() + 1].isspace():
+        return f"{new_value}{segment[comment.start() :]}"
+    if comment is not None and segment.startswith("#"):
+        return f"{new_value} {segment}"
+    return new_value
+
+
+def _validate_session_value(session_id: str) -> str:
+    """Normalize a pasted cookie and reject anything unsafe for a single .env line."""
+    value = normalize_session_id(session_id)
+    if not value:
+        raise ValueError("SIS_SESSION_ID is blank or the example placeholder; nothing to save.")
+    if any(ch.isspace() or ch in "\"'`\\" or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError(
+            "SIS_SESSION_ID contains characters that cannot be written to a single "
+            ".env line."
+        )
+    return value
+
+
+def write_session_id(env_path: Path, session_id: str) -> SessionWrite:
+    """Atomically set ``SIS_SESSION_ID`` in ``env_path``, touching no other byte.
+
+    Preserves every comment, blank line, key order and other setting, keeps the
+    line's ``export`` prefix, its quote style and its inline comment, keeps CRLF
+    line endings, and appends the key when it is absent. The file's own encoding
+    is preserved too -- UTF-8 (with or without a BOM), UTF-16 and UTF-32 in
+    either byte order, or the cp1252 fallback -- because the reader accepts all
+    of them and a UTF-8 rewrite would corrupt the ones it is not. The write is a
+    sibling temp file plus ``os.replace``, so a running daemon's
+    :class:`EnvWatcher` sees the new inode immediately. A new file is created
+    ``0600`` as UTF-8; an existing file keeps its mode. Raises ``ValueError``
+    (before any write) for a blank, placeholder, or single-line-unsafe value.
+    """
+    value = _validate_session_value(session_id)
+
+    raw = read_env_bytes(env_path)
+    created = raw is None
+    existing_mode: Optional[int] = None
+    if raw is None:
+        if env_path.exists():
+            raise ValueError(f"cannot write SIS_SESSION_ID: {env_path} is a directory")
+        text = ""
+        codec, bom = "utf-8", b""
+    else:
+        try:
+            existing_mode = env_path.stat().st_mode & 0o777
+        except OSError:
+            existing_mode = None
+        text = _decode_env_bytes(raw)
+        codec, bom = _env_bytes_codec(raw)
+
+    lines = text.splitlines(keepends=True)
+    replaced = False
+    for index, line in enumerate(lines):
+        content, ending = _split_line_ending(line)
+        prefix = ""
+        body = content
+        if index == 0 and body.startswith("\ufeff"):
+            prefix, body = "\ufeff", body[1:]
+        match = _SESSION_LINE_RE.match(body)
+        if match is None:
+            continue
+        lines[index] = (
+            f"{prefix}{match.group('lead')}SIS_SESSION_ID{match.group('assign')}"
+            f"{_replace_value_segment(match.group('value'), value)}{ending}"
+        )
+        replaced = True
+
+    if not replaced:
+        newline = "\r\n" if "\r\n" in text else "\n"
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] = lines[-1] + newline
+        lines.append(f"SIS_SESSION_ID={value}{newline}")
+
+    payload_text = "".join(lines)
+    # `_decode_env_bytes` consumes a BOM; the original bytes are re-attached
+    # verbatim below, so drop whatever `_decode_env_bytes`/`utf-8-sig` left here
+    # rather than letting it be encoded a second time.
+    if payload_text.startswith("\ufeff"):
+        payload_text = payload_text[1:]
+    try:
+        payload = bom + payload_text.encode(codec)
+    except UnicodeEncodeError:
+        raise ValueError(
+            f"SIS_SESSION_ID cannot be encoded as {codec}, which is what "
+            f"{env_path.name} is written in; nothing was saved."
+        )
+    _atomic_replace_bytes(env_path, payload, 0o600 if created else existing_mode)
+    return SessionWrite(path=env_path, created=created, replaced=replaced)
+
+
+def temp_sibling_path(path: Path) -> Path:
+    """The PID/thread-scoped sibling temp path used by both atomic writers.
+
+    ``config`` and ``runtime_store`` each stage a write in a sibling file and
+    ``os.replace`` it into place, and both must use the *same* naming: the
+    `*.tmp.<pid>.<tid>` suffix is what makes a leftover from a crash
+    distinguishable from a real runtime file, and what keeps two concurrent
+    writers from sharing one temp. This lives in ``config`` because it is the
+    leaf -- ``runtime_store`` imports it rather than keeping a second copy.
+    """
+    return path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+
+
+def _atomic_replace_bytes(path: Path, data: bytes, mode: Optional[int]) -> None:
+    """Stage ``data`` in a sibling temp file with ``mode`` and ``os.replace`` it into place."""
+    tmp_path = temp_sibling_path(path)
+    try:
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode or 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(str(tmp_path), mode)
+        os.replace(str(tmp_path), str(path))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            if tmp_path.exists():
+                tmp_path.unlink()
+        raise
 
 
 def parse_int(

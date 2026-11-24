@@ -1,0 +1,19 @@
+# Copy to /etc/systemd/system/comsats-tracker-update.timer and enable it:
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now comsats-tracker-update.timer
+#
+# OnUnitActiveSec=15min measures from the end of the previous run, so a long
+# pull delays the next check instead of stacking two of them.
+[Unit]
+Description=Check for a new COMSATS Portal Tracker image every 15 minutes
+Documentation=https://github.com/Fe4rlessCloak/COMSATS-Portal-Tracker
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Unit=comsats-tracker-update.service
+
+[Install]
+WantedBy=timers.target

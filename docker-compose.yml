@@ -1,6 +1,25 @@
+# Default deployment: pull the prebuilt image, never build.
+#
+# A server needs only this file, a .env beside it, and a writable ./data/
+# directory -- no source checkout. Local development builds use
+# `docker-compose.local.yml`, which layers `build: .` on top of this file:
+#
+#   docker compose                                  # server: pull only
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.local.yml up -d --build   # dev: build
+#
+# The container name, restart policy, environment and both mounts are the
+# frozen external contract; changing them breaks existing setups on upgrade.
+#
+# The optional session-renewal page is a second service under the `session-ui`
+# profile, so a plain `docker compose up -d` still starts only the tracker:
+#
+#   docker compose --profile session-ui up -d       # tracker + web page
 services:
   tracker:
-    build: .
+    # Built and published by .github/workflows/publish-image.yml; `latest` is
+    # what this pulls, `sha-<7>` is the rollback pin.
+    image: ghcr.io/fe4rlesscloak/comsats-portal-tracker:latest
     container_name: comsats-portal-tracker
     restart: unless-stopped
     environment:
@@ -10,3 +29,77 @@ services:
     volumes:
       - ./:/app/config:ro
       - ./data:/app/data
+
+  # Opt-in session-renewal web page. Same image as `tracker` (so the published
+  # `:latest` updates both), no Docker access of any kind, and reachable only
+  # through the host's own loopback.
+  session-ui:
+    profiles:
+      - session-ui
+    image: ghcr.io/fe4rlesscloak/comsats-portal-tracker:latest
+    container_name: comsats-session-ui
+    restart: unless-stopped
+    command:
+      - python3
+      - -u
+      - session_ui.py
+    environment:
+      # Config is READ-WRITE here, unlike `tracker`: this process is the one
+      # thing allowed to rewrite the `SIS_SESSION_ID` line of `.env`, and it
+      # does so with an atomic sibling-temp + os.replace (so the tracker's
+      # EnvWatcher sees the new inode). `data/` is READ-ONLY: it only reads
+      # `heartbeat.json` for the status panel and never writes a runtime file.
+      - ENV_FILE=/app/config/.env
+      - HEARTBEAT_FILE=/app/data/heartbeat.json
+      # Bind the wildcard *inside* the container, deliberately.
+      #
+      # The loopback guarantee moved from the process to the port mapping.
+      # Docker forwards a published port to the container's eth0 address, not
+      # to the container's own 127.0.0.1, so a process bound to the container
+      # loopback would make `127.0.0.1:8765:8765` unreachable -- the page would
+      # appear broken. Binding 0.0.0.0 here is therefore *required* for the
+      # published port to work, and `SESSION_UI_ALLOW_NON_LOOPBACK=1` is the
+      # explicit opt-in `session_ui.py` insists on before it will do it.
+      #
+      # What keeps this off the LAN and off other Tailscale ports is the host
+      # side of `ports:` below: `127.0.0.1:8765:8765` makes the daemon listen
+      # on the host's loopback only. Never reduce it to `8765:8765`, which
+      # would publish on every interface and hand the page to the whole
+      # network. Inside the container there is nothing else listening.
+      #
+      # The boundary stops at the host, not at the namespace: no separate
+      # network is declared, so on the default Compose bridge another container
+      # on that network *can* reach `comsats-session-ui:8765` (the host loopback
+      # mapping does not prevent that). `SESSION_UI_ALLOWED_USER` is what stops
+      # such a peer -- which is why it is strongly recommended whenever anything
+      # else runs on the same Docker host.
+      - SESSION_UI_HOST=0.0.0.0
+      # Width of the published port pair below. Interpolated from the .env
+      # beside this file (Compose's own project .env) so that setting
+      # `SESSION_UI_PORT` there actually moves the container's listener.
+      # `session_ui.py` reads its settings from the process environment first
+      # and `/app/config/.env` second, so this block wins over the mounted file
+      # rather than being the only source. A host port and a container port
+      # that disagreed would be a dead page.
+      - SESSION_UI_PORT=${SESSION_UI_PORT:-8765}
+      - SESSION_UI_PORTAL_TIMEOUT=${SESSION_UI_PORTAL_TIMEOUT:-15}
+      - SESSION_UI_ALLOW_NON_LOOPBACK=1
+      # The allowlist. Interpolated here so the value Compose was given is
+      # unambiguous, and so `docker inspect` shows what is actually enforced;
+      # with the process environment taking precedence, an interpolated empty
+      # string would otherwise shadow a value in the mounted file. Interpolation
+      # passes this single value and nothing else -- in particular not
+      # SIS_SESSION_ID or any notifier token, which stay in the mounted file and
+      # never enter the container's environment (where `docker inspect` would
+      # expose them).
+      # Empty or absent disables the check, which is the documented default.
+      - SESSION_UI_ALLOWED_USER=${SESSION_UI_ALLOWED_USER:-}
+    ports:
+      # Host side bound explicitly to loopback. The leading `127.0.0.1:` is the
+      # entire access-control story for this service; publish it to a tailnet
+      # with `tailscale serve`, never by widening this mapping. Both sides
+      # interpolate the same variable so they cannot drift apart.
+      - "127.0.0.1:${SESSION_UI_PORT:-8765}:${SESSION_UI_PORT:-8765}"
+    volumes:
+      - ./:/app/config
+      - ./data:/app/data:ro

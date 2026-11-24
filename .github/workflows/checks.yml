@@ -57,3 +57,120 @@ jobs:
 
       - name: Test suite
         run: python3 -m unittest discover -s tests -v
+
+  # #14's last acceptance criterion: "a real `linux/amd64` build passes
+  # container sanity checks". Without this job nothing builds the image before a
+  # merge -- the publish workflow only runs *after* one, so a Dockerfile that no
+  # longer builds, a module that only imports from a checkout, or a HEALTHCHECK
+  # pointing at a broken command would be discovered by an empty registry or a
+  # restarting container instead of by a red build.
+  #
+  # It is a separate job on purpose: it needs no Python matrix, it is reachable
+  # on pull requests (no `if:`, no `needs:`), and it holds no registry
+  # credentials -- nothing here can publish or block a release.
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # `linux/amd64` on an amd64 runner is native, so no QEMU or buildx driver
+      # is involved. The platform flag is still passed explicitly: it is the one
+      # the publish workflow uses, and asking for it here is what makes this a
+      # check of *that* image rather than of whatever the default happens to be.
+      - name: Build the image
+        run: docker build --platform linux/amd64 --tag comsats-check:local .
+
+      # The image must carry the code and nothing else. A `.env` in the image is
+      # the specific disaster: it would bake the session cookie and notifier
+      # tokens into a layer that `docker history` exposes.
+      - name: Prove the image ships code and no secrets
+        run: |
+          docker run --rm --entrypoint sh comsats-check:local -c '
+          set -eu
+          if [ -e /app/.env ]; then
+            echo "/app/.env is baked into the image" >&2; exit 1
+          fi
+          if [ -e /app/data/state.json ] || [ -e /app/data/heartbeat.json ]; then
+            echo "runtime data is baked into the image" >&2; exit 1
+          fi
+          if env | grep -Eiq "SESSION|TOKEN|PASSWORD|SECRET|NTFY|WEBHOOK"; then
+            echo "credential-shaped environment variable in the image:" >&2
+            env | grep -Ei "SESSION|TOKEN|PASSWORD|SECRET|NTFY|WEBHOOK" >&2
+            exit 1
+          fi
+          echo "no .env, no runtime data, no credential-shaped env"
+          '
+
+      # Every shipped module must import inside the image, on the image's own
+      # interpreter, and the image must ship exactly the modules the checkout
+      # has. Both sides are derived -- the checkout's `*.py` count and the
+      # image's `/app/*.py` glob -- so adding a module cannot leave a stale
+      # literal here, and a module missing from the `COPY` fails the count.
+      - name: Prove the image ships every module, and each one imports
+        run: |
+          set -eu
+          expected="$(ls ./*.py | wc -l | tr -d ' ')"
+          echo "checkout has ${expected} root modules"
+          docker run --rm --env EXPECTED="${expected}" \
+            --entrypoint python3 comsats-check:local -c '
+          import glob, importlib, os, sys
+          paths = sorted(glob.glob("/app/*.py"))
+          names = [os.path.basename(p)[:-3] for p in paths]
+          for name in names:
+              importlib.import_module(name)
+          print("%d modules import on %s: %s"
+                % (len(names), sys.version.split()[0], " ".join(names)))
+          expected = int(os.environ["EXPECTED"])
+          if len(names) != expected:
+              sys.exit("image ships %d root modules, checkout has %d"
+                       % (len(names), expected))
+          '
+
+      # Exercise the HEALTHCHECK the Dockerfile declares. With no heartbeat file
+      # it must exit 1 and say so -- the documented "unhealthy" answer. Exit 0
+      # would mean the check is vacuous; a traceback (or 127) means the command
+      # the container health-checks itself with does not run at all.
+      - name: Exercise the HEALTHCHECK command
+        run: |
+          set -eu
+          status=0
+          output="$(docker run --rm --entrypoint python3 comsats-check:local \
+            tracker.py --healthcheck 2>&1)" || status=$?
+          printf '%s\n' "$output"
+          test "$status" -eq 1 || {
+            echo "expected exit 1 (no heartbeat yet), got $status" >&2; exit 1; }
+          case "$output" in
+            *"Heartbeat file missing"*) ;;
+            *) echo "unexpected healthcheck output" >&2; exit 1 ;;
+          esac
+          case "$output" in
+            *Traceback*) echo "healthcheck raised" >&2; exit 1 ;;
+          esac
+
+      # The same command must answer 0 for a heartbeat the daemon would have
+      # written, or the health check is unsatisfiable and every container is
+      # permanently unhealthy.
+      - name: Prove the HEALTHCHECK can pass
+        run: |
+          set -eu
+          docker run --rm --entrypoint python3 comsats-check:local -c '
+          import json, os, sys, time
+          os.makedirs("/app/data", exist_ok=True)
+          with open("/app/data/heartbeat.json", "w", encoding="utf-8") as handle:
+              json.dump({"timestamp": time.time(), "iso": "2026-01-01T00:00:00+00:00",
+                         "pid": 1, "status": "ok", "detail": "",
+                         "last_ok_timestamp": time.time(),
+                         "keepalive_interval": 120, "fetch_interval": 480,
+                         "healthcheck_max_age": 0}, handle)
+          import subprocess
+          sys.exit(subprocess.run([sys.executable, "tracker.py", "--healthcheck"]).returncode)
+          '
+
+      # The session page is a second entry point in the same image and never
+      # gets started by the tracker's own health check, so prove it imports and
+      # exposes its CLI rather than assuming the tracker's import covered it.
+      - name: Prove the session UI is runnable
+        run: |
+          docker run --rm --entrypoint python3 comsats-check:local \
+            session_ui.py --help

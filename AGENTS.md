@@ -9,9 +9,12 @@ python3 -m unittest discover -s tests -v      # the test suite
 ```
 
 `scripts/check.py` reads each file once and reports every problem it finds; a file that does
-not parse is reported as a `[FAIL]` line, never a traceback. `scripts/probe_guardrails.py`
-copies the checkout to a temp dir, breaks one thing at a time there, and asserts the guardrail
-catches it — it never writes into this tree, so it is safe to run at any time.
+not parse is reported as a `[FAIL]` line, never a traceback. It also fails the run when a
+shipped module has no row in this file's module map or in `ARCHITECTURE.md`, so adding a
+module and forgetting its table entry is a build error rather than a stale doc.
+`scripts/probe_guardrails.py` copies the checkout to a temp dir, breaks one thing at a time
+there, and asserts the guardrail catches it — it never writes into this tree, so it is safe to
+run at any time.
 
 The suite is **unittest**, not pytest. There is no `pytest`/`conftest.py`/`pyproject.toml`
 and no third-party packages — do not install any, and do not add a pytest dependency.
@@ -31,6 +34,7 @@ local, but that is incidental — do not treat it as a second permitted leaf.
 | `tracker.py` | Daemon loop, `run_cycle`, CLI. Orchestration only. |
 | `notifiers.py` | Push backends + `dispatch_all`. |
 | `probe.py` | Standalone diagnostic CLI; the one sanctioned raw-HTML consumer. |
+| `session_ui.py` | Opt-in renewal page (`http.server`, loopback-only). `GET /` renders `heartbeat.json` read-only; `POST /` normalizes a pasted cookie, verifies it with `SisClient.fetch_roster()`, then rewrites only `SIS_SESSION_ID` via `config.write_session_id()`. One `guard_request` gate runs before routing for both methods: it enforces the optional `SESSION_UI_ALLOWED_USER` exact case-insensitive `Tailscale-User-Login` match, and refuses any `POST` without a same-origin `Origin`/`Sec-Fetch-Site` context plus this process's `csrf_token`. No Docker access. |
 
 `ARCHITECTURE.md` is the reference for behaviour and failure modes. Read it before changing
 policy or the duplication rules.
@@ -58,8 +62,8 @@ policy or the duplication rules.
   local dev has it — the image is 3.13 and the floor is 3.9.
 - **`Dockerfile` `COPY`, `LOCAL_MODULES`, and the two doc tables move together.** Adding a root
   module means editing `Dockerfile`, `LOCAL_MODULES` in `scripts/check.py`, the module map
-  here, and the module table in `ARCHITECTURE.md`. `check.py` enforces the first two; the
-  tables are on you.
+  here, and the module table in `ARCHITECTURE.md`. `check.py` enforces all four: the first two
+  by name, the tables by requiring a row per shipped module and no row for anything else.
 
 ## Tests
 

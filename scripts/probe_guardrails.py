@@ -24,8 +24,17 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parent.parent
 CHECK = ROOT / "scripts" / "check.py"
 
-# The guardrail reads sources, the Dockerfile, and tests/ -- nothing else.
-COPIED_PATTERNS = ("*.py", "Dockerfile", "tests/*.py", "scripts/*.py")
+# The guardrail reads sources, the Dockerfile, tests/, and the two module-map
+# docs -- nothing else. The docs are copied because `check_doc_module_tables`
+# reads them; a probe that breaks a row needs the file present in the copy.
+COPIED_PATTERNS = (
+    "*.py",
+    "Dockerfile",
+    "tests/*.py",
+    "scripts/*.py",
+    "AGENTS.md",
+    "ARCHITECTURE.md",
+)
 
 
 class Expectation(Enum):
@@ -75,6 +84,22 @@ def _set_dockerfile(root: Path, transform: Callable[[str], str]) -> None:
     if updated == original:
         raise AssertionError("probe precondition failed: Dockerfile unchanged")
     dockerfile.write_text(updated, encoding="utf-8")
+
+
+def _drop_doc_row(root: Path, relative: str, module: str) -> None:
+    """Delete the module-map row for ``module`` from a doc, leaving the rest."""
+    path = root / relative
+    original = path.read_text(encoding="utf-8")
+    kept = [
+        line
+        for line in original.splitlines(keepends=True)
+        if not line.startswith(f"| `{module}.py`")
+    ]
+    if len(kept) == len(original.splitlines(keepends=True)):
+        raise AssertionError(
+            f"probe precondition failed: {relative} has no `{module}.py` row"
+        )
+    path.write_text("".join(kept), encoding="utf-8")
 
 
 def _replace_copy_line(text: str, replacement: str) -> str:
@@ -228,6 +253,22 @@ PROBES = (
             lambda text: _replace_copy_line(text, "COPY *.py ./"),
         ),
         expectation=Expectation.MUST_PASS,
+    ),
+    Probe(
+        "a shipped module has no row in the AGENTS.md module table",
+        lambda root: _drop_doc_row(root, "AGENTS.md", "session_ui"),
+    ),
+    Probe(
+        "a shipped module has no row in the ARCHITECTURE.md module table",
+        lambda root: _drop_doc_row(root, "ARCHITECTURE.md", "runtime_store"),
+    ),
+    Probe(
+        "a module table lists a row nothing ships",
+        lambda root: _append(
+            root,
+            "AGENTS.md",
+            "| `zz_phantom.py` | A module that does not exist. |\n",
+        ),
     ),
 )
 

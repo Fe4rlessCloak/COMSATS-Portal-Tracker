@@ -68,23 +68,187 @@ For a simple breakdown of the polling flow, fallbacks, runtime files, and COMSAT
 
 ## Running 24/7 with Docker Compose (Recommended for Mini-PC)
 
-Create `.env` from `.env.example`, then build and start the container:
+The image is published to GitHub Container Registry, so a server **needs no source checkout** — just one directory with four things:
+
+```
+comsats/
+├── docker-compose.yml            # copy from the repo
+├── .env                          # your session cookie + notifier settings
+├── data/                         # created on first run; state.json + heartbeat.json
+└── deploy/systemd/               # only if you want the auto-updater (below)
+    ├── comsats-tracker-update.sh
+    └── comsats-tracker-update.service / .timer
+```
+
+Copy `docker-compose.yml` from this repository once, then:
 
 ```bash
 cp .env.example .env
 # Edit .env with SIS_SESSION_ID and NTFY_URL (or another notifier)
-docker compose up -d --build
+mkdir -p data
+docker compose up -d
 ```
 
+`docker-compose.yml` pulls the prebuilt `ghcr.io/fe4rlesscloak/comsats-portal-tracker:latest` image. The container keeps the name `comsats-portal-tracker`, `restart: unless-stopped`, the three `*_FILE` environment variables, the read-only `./:/app/config` mount and the read-write `./data:/app/data` mount — an existing setup that ran `docker compose up -d --build` upgrades with a plain `docker compose up -d`.
+
 Useful commands:
+
 ```bash
 docker compose logs -f                 # watch live keep-alive & scan logs
 docker compose run --rm tracker python3 -u tracker.py --test-notify
 docker compose ps                      # inspect container healthcheck status
-docker compose up -d --build           # rebuild after pulling updates
+docker compose pull && docker compose up -d   # update by hand (the timer below does this)
 ```
 
 State is persisted in `./data/state.json` (with rolling `state.json.bak*` backups and `heartbeat.json`, all gitignored). The Compose file mounts the project directory read-only at `/app/config` (`ENV_FILE=/app/config/.env`) so updating `SIS_SESSION_ID` in `.env` — even with editors that replace the file inode — is detected and hot-reloaded automatically by the running container. The `Dockerfile` also defines a `HEALTHCHECK` backed by `python3 tracker.py --healthcheck`.
+
+### First publish: make the GHCR package public
+
+The repository is public, but GitHub initialises a new GHCR package as **private** depending on your account defaults. Do this once after the first `publish-image` run on `main`:
+
+1. Open `https://github.com/Fe4rlessCloak?tab=packages` (or the repository's right-hand **Packages** sidebar).
+2. Open `comsats-portal-tracker` → **Package settings** → **Danger Zone**.
+3. **Change visibility** → **Public**, and confirm.
+
+Only then can a server pull without a GitHub token — there is no login step in the setup above, by design, because no credential is stored on the host. Confirm from the server:
+
+```bash
+docker pull ghcr.io/fe4rlesscloak/comsats-portal-tracker:latest
+```
+
+A `denied` here means the package is still private, not that the image is missing.
+
+### Automatic updates: systemd service + 15-minute timer
+
+Ready-to-copy units live in [`deploy/systemd/`](deploy/systemd/): `comsats-tracker-update.service` (a oneshot) and `comsats-tracker-update.timer`. The service runs [`deploy/systemd/comsats-tracker-update.sh`](deploy/systemd/comsats-tracker-update.sh), which:
+
+1. `docker compose pull`s the image;
+2. compares the **image ID** the `:latest` tag now resolves to against the ID the running container was created from — the tag always reads `latest`, so only the ID can tell you whether anything changed — and runs `docker compose up -d` **only when they differ**;
+3. deletes superseded tracker images, matching **only** images labelled `org.opencontainers.image.source=https://github.com/Fe4rlessCloak/COMSATS-Portal-Tracker`.
+
+Step 3 never touches anything else on the host. `docker image prune` cannot filter by label, and pruning by name or tag prefix would match whatever else happens to share them, so the label is the entire scope — that is what keeps unrelated containers and images on a shared server safe. The currently-running image is never deleted, and nothing is ever removed with `--force`, so an image still in use is skipped with a warning and retried on the next run.
+
+Install (the script lives with your stack so its default `STACK_DIR` resolves; the units go to `/etc/systemd/system`):
+
+```bash
+# from a checkout, onto the server's stack directory:
+mkdir -p /path/to/your/comsats/deploy/systemd      # replace /path/to/your/comsats
+cp deploy/systemd/comsats-tracker-update.sh /path/to/your/comsats/deploy/systemd/
+sudo cp deploy/systemd/comsats-tracker-update.service \
+        deploy/systemd/comsats-tracker-update.timer /etc/systemd/system/
+sudo systemctl edit --full comsats-tracker-update.service   # set WorkingDirectory + ExecStart
+sudo systemctl daemon-reload
+sudo systemctl enable --now comsats-tracker-update.timer
+```
+
+The two lines to change are `WorkingDirectory=` and `ExecStart=`; both must point at the directory holding your `docker-compose.yml`. The units are templates shipping `/path/to/COMSATS-Portal-Tracker`, so no real host path is committed. If you would rather keep the script anywhere else, set `STACK_DIR=` explicitly in the unit and the script will use it instead of `../..` from its own location.
+
+Check on it:
+
+```bash
+systemctl list-timers comsats-tracker-update.timer   # when the next check runs
+journalctl -u comsats-tracker-update -f              # watch updates live
+journalctl -u comsats-tracker-update -n 50           # last 50 lines
+sudo systemctl start comsats-tracker-update.service  # run one check right now
+```
+
+A no-op run logs `unchanged: comsats-portal-tracker already runs sha256:...`. A real update logs the old and new IDs, then `removed superseded image sha256:...`. Run the script by hand at any time with `--dry-run` to see what it *would* remove without pulling, recreating or deleting anything:
+
+```bash
+STACK_DIR=/path/to/your/comsats bash deploy/systemd/comsats-tracker-update.sh --dry-run
+```
+
+### Rolling back to an earlier image
+
+Every publish is also tagged `sha-<7>`, the first seven characters of the commit that passed CI. To pin a known-good commit, edit `docker-compose.yml` on the server:
+
+```yaml
+    image: ghcr.io/fe4rlesscloak/comsats-portal-tracker:sha-1a2b3c4
+```
+
+then `docker compose pull && docker compose up -d`. Disable the timer while you are pinned (`sudo systemctl disable --now comsats-tracker-update.timer`), or the next check will pull `latest` and move you forward again. Revert the line and re-enable the timer to resume automatic updates.
+
+### Local development builds
+
+The default file is pull-only. To build from a checkout, layer the override:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+```
+
+`docker-compose.local.yml` adds only `build: .`, so the image it produces is tagged with the same `ghcr.io/fe4rlesscloak/comsats-portal-tracker:latest` reference the server pulls — no separate tag to keep in sync. Everything else (container name, restart policy, environment, mounts) still comes from `docker-compose.yml`, so a local container is shaped exactly like a server one. Do not use the override on a server: it has no checkout to build from.
+
+The session-renewal page (below) builds the same way — add its profile to the same command:
+
+```bash
+docker compose --profile session-ui -f docker-compose.yml -f docker-compose.local.yml up -d --build
+```
+
+### Optional: session-renewal web page
+
+The tracker normally recovers from an expired `ASP.NET_SessionId` by waiting for you to edit `.env`. That is awkward from a phone. The optional **session-renewal page** shows the tracker's current status and gives you one input box for a fresh cookie: it tests the paste against the portal first, and only writes the `SIS_SESSION_ID` line of `.env` if the portal accepts it. The running tracker notices the change and resumes — no restart, no SSH.
+
+It is **off by default**. A plain `docker compose up -d` starts only the `tracker` service and does not even create the page's container; the `session-ui` Compose profile is what turns it on:
+
+```bash
+docker compose --profile session-ui up -d
+```
+
+That starts a second container, `comsats-session-ui`, from the same `ghcr.io/fe4rlesscloak/comsats-portal-tracker:latest` image — so the auto-updater below keeps it current too — and publishes it on the host's loopback only (`127.0.0.1:8765`). It cannot reach the Docker daemon, cannot restart anything, mounts `./data` **read-only** (it only reads `heartbeat.json`), and is the only container allowed to write `./` (`/app/config`), because rewriting `.env` is its whole job. The tracker keeps its read-only mount.
+
+Set the page's settings in `.env` beside `docker-compose.yml` (all five are listed in [`.env.example`](.env.example)):
+
+```env
+# Only this Tailscale account may load the page or submit a cookie.
+# Exact match, case-insensitive. Strongly recommended on a shared server.
+SESSION_UI_ALLOWED_USER=you@example.com
+
+# Optional: change the port the page is published on.
+SESSION_UI_PORT=8765
+```
+
+Compose reads that same `.env` to fill in the service's environment and port mapping, so the container's listener, the published host port, and the settings the page itself enforces all come from one place — and a bare `python3 session_ui.py` run reads the same keys from `.env`, with the process environment winning where both are set. Only the page's own settings are passed through — `SIS_SESSION_ID` and your notifier tokens stay in the mounted file and never enter the container's environment.
+
+With `SESSION_UI_ALLOWED_USER` set, every request without a matching `Tailscale-User-Login` header gets `403 Forbidden` — including one that reaches the loopback port by some other route, which is why it must be paired with the loopback-only publish below rather than trusted on its own.
+
+To stop and remove only the page (returning the host to tracker-only updates), run `docker compose rm -sf session-ui`. Avoid `docker compose --profile session-ui down` — that stops and removes `tracker` too — and note that plain `docker compose stop session-ui` leaves the container in place, so the auto-updater will recreate and start it again on the next image update. While the `comsats-session-ui` container exists, the auto-updater includes the profile automatically and keeps both containers on the latest image.
+
+#### Publishing it privately with Tailscale Serve
+
+The page listens on the server's loopback, so nothing off the machine can reach it yet. [`tailscale serve`](https://tailscale.com/kb/1242/tailscale-serve) puts it on your tailnet over HTTPS — no ports opened, no certificates to manage, and no exposure to the LAN or the public internet.
+
+1. **Install and log in to Tailscale on the server** (once):
+
+   ```bash
+   curl -fsSL https://tailscale.com/install.sh | sh
+   sudo tailscale up
+   ```
+
+2. **Confirm the page is up locally first.** From the server itself:
+
+   ```bash
+   curl -sS http://127.0.0.1:8765/ | head -n 5
+   ```
+
+   A `403` here is expected when `SESSION_UI_ALLOWED_USER` is set — you are not arriving through `tailscale serve`, so there is no `Tailscale-User-Login` header. HTML (or that `403`) means the container is serving; connection refused means it is not running.
+
+3. **Serve it on your tailnet.** This proxies HTTPS on port 443 of your tailnet name to the loopback port, and keeps running across reboots once you enable the service:
+
+   ```bash
+   sudo tailscale serve --bg 8765
+   sudo tailscale serve status          # prints the https://<machine>.<tailnet>.ts.net URL
+   ```
+
+   Open that printed `https://<machine>.<tailnet>.ts.net` URL on any device signed in to your tailnet. Requests arriving this way carry `Tailscale-User-Login`, so the allowlist can do its job.
+
+4. **Restrict it to your own devices if the tailnet is shared.** `tailscale serve` exposes the page to every member of the tailnet by default. Either keep `SESSION_UI_ALLOWED_USER` set (the page then refuses everyone else), and/or put an ACL rule on the tailnet so only your devices may reach that port — see [Tailscale's ACL docs](https://tailscale.com/kb/1018/acls).
+
+5. **Turn it off** with `sudo tailscale serve --https=443 off`, or `sudo tailscale serve reset` to clear every serve mapping on the host.
+
+Two caveats worth knowing before you rely on it:
+
+- `tailscale serve` is the *only* supported exposure for this page. Do not forward the port on your router, and do not change the Compose mapping to `8765:8765` — that publishes on every interface and hands the page to the whole network.
+- Header delivery through `tailscale serve` has not been verified against a live tailnet in this repository. If `SESSION_UI_ALLOWED_USER` rejects you despite arriving over the `*.ts.net` URL, check `tailscale serve status` and the page's logs (`docker compose logs session-ui`) before assuming the allowlist is wrong.
 
 ---
 
