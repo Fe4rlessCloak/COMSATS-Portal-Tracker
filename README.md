@@ -248,7 +248,12 @@ The page listens on the server's loopback, so nothing off the machine can reach 
 Two caveats worth knowing before you rely on it:
 
 - `tailscale serve` is the *only* supported exposure for this page. Do not forward the port on your router, and do not change the Compose mapping to `8765:8765` — that publishes on every interface and hands the page to the whole network.
-- Header delivery through `tailscale serve` has not been verified against a live tailnet in this repository. If `SESSION_UI_ALLOWED_USER` rejects you despite arriving over the `*.ts.net` URL, check `tailscale serve status` and the page's logs (`docker compose logs session-ui`) before assuming the allowlist is wrong.
+- **Header delivery through `tailscale serve` is verified against a live tailnet**, on a server shared with other Tailscale users. Confirmed end to end through the `*.ts.net` URL: `Tailscale-User-Login` reaches the page on both `GET /` and `POST /`, the proxy forwards the browser's `Host` unchanged rather than rewriting it to the loopback backend (so the same-origin `Origin`/`Host` comparison in `guard_request` matches), and a real cookie submitted from a browser is verified against the portal and saved — the page logs `POST / -> 200`. If the allowlist ever rejects you over the `*.ts.net` URL, check `tailscale serve status` and the page's logs (`docker compose logs session-ui`) before assuming the allowlist is wrong.
+
+If `SESSION_UI_ALLOWED_USER` rejects you after an image update, reload the page
+rather than resubmitting an already-open tab. The page's `Referrer-Policy` is
+fixed when the document is parsed, so a tab loaded before the update keeps
+submitting under the old policy until it is reloaded.
 
 ---
 
