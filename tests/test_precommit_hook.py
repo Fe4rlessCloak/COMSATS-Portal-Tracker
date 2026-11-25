@@ -28,18 +28,26 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Union
 
 ROOT = Path(__file__).resolve().parent.parent
+HERE = Path(__file__).resolve().parent
+for entry in (str(ROOT), str(HERE)):
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
+#: No ``scripts/check.py`` at all, standing in for a checkout that predates it.
+NO_CHECKER = object()
+
 HOOK = ROOT / ".githooks" / "pre-commit"
 CHECKS_WORKFLOW = ROOT / ".github" / "workflows" / "checks.yml"
 
 
-def _run(args, cwd, env=None, timeout=120):
+def _run(args, cwd, timeout=120):
     """Run a command, capturing both streams as text, never raising."""
     return subprocess.run(
         args,
         cwd=str(cwd),
-        env=env,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -89,12 +97,35 @@ class HookFileTests(unittest.TestCase):
         )
 
     def test_the_hook_delegates_to_the_same_command_ci_runs(self) -> None:
-        """The hook and the CI workflow must not test different things."""
-        workflow = CHECKS_WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("python3 scripts/check.py", workflow)
+        """The hook and the CI workflow must not test different things.
+
+        Parsed from the workflow's ``run`` steps rather than matched as free
+        text: `checks.yml` warns that this repo has been bitten by hardcoded
+        lists going stale, and a plain `assertIn` would also be satisfied by the
+        hook's own comment, so it could never fail for the drift it claims to pin.
+        """
+        import support_workflow_yaml
+
+        document = support_workflow_yaml.loads(
+            CHECKS_WORKFLOW.read_text(encoding="utf-8")
+        )
+        runs = [
+            step.get("run", "")
+            for job in document["jobs"].values()
+            for step in job.get("steps", [])
+        ]
+        self.assertTrue(
+            any("scripts/check.py" in run for run in runs),
+            "the checks workflow no longer runs scripts/check.py",
+        )
 
         hook = HOOK.read_text(encoding="utf-8")
-        self.assertIn("python3 scripts/check.py", hook)
+        # The invocation the hook actually executes, not a mention in a comment.
+        self.assertRegex(
+            hook,
+            r"python3\s+\"?\$?[{\w]*\}?/?scripts/check\.py\"?\s+--root",
+            "the hook does not invoke scripts/check.py with --root on the staged tree",
+        )
 
     def test_the_hook_is_documented_as_opt_in(self) -> None:
         """`core.hooksPath` is local, so the enable command has to be written down."""
@@ -110,21 +141,36 @@ class HookFileTests(unittest.TestCase):
 class HookBehaviourTests(unittest.TestCase):
     """Run the hook for real, in a throwaway repo, and read its exit code."""
 
-    def _make_repo(self, check_body: str) -> Path:
-        """A temp git repo with the real hook and a fake scripts/check.py.
+    def _make_repo(self, check_body: Union[str, object] = None) -> Path:
+        """A temp git repo with the real hook and a ``scripts/check.py``.
 
-        The fake ``check.py`` is what makes this a test of the *hook* rather than
+        The stub ``check.py`` is what makes this a test of the *hook* rather than
         a second test of the checker: it exits with whatever the case needs, so
         the hook's pass and fail paths are both reachable in milliseconds.
+
+        ``check_body`` selects the checker: a source string writes that stub,
+        ``None`` copies the repo's real checker for the cases that must exercise
+        the real filesystem walk, and ``NO_CHECKER`` writes none at all to stand
+        in for a checkout that predates it.
+
+        The checker is written before the initial stage in `_init_repo`, so the
+        index the hook exports is the one these tests intend.
         """
         root = Path(tempfile.mkdtemp(prefix="precommit-"))
         self.addCleanup(shutil.rmtree, root, True)
 
         (root / "scripts").mkdir()
-        (root / "scripts" / "check.py").write_text(check_body, encoding="utf-8")
+        if check_body is NO_CHECKER:
+            pass
+        elif check_body is None:
+            shutil.copy2(ROOT / "scripts" / "check.py", root / "scripts" / "check.py")
+        else:
+            (root / "scripts" / "check.py").write_text(str(check_body), encoding="utf-8")
 
         hooks = root / ".githooks"
         hooks.mkdir()
+        # copy2 carries the repo's committed mode; chmod keeps the test honest
+        # even if the working tree's mode drifts from the index.
         shutil.copy2(HOOK, hooks / "pre-commit")
         os.chmod(hooks / "pre-commit", 0o755)
 
@@ -133,10 +179,13 @@ class HookBehaviourTests(unittest.TestCase):
         return root
 
     def _init_repo(self, root: Path) -> None:
-        """`git init` plus a local identity and the hook path.
+        """`git init`, a local identity, the hook path, and an initial stage.
 
         Both settings are local to the throwaway repo, so the developer's own
-        config is never touched.
+        config is never touched. Staging here rather than in `_commit` is
+        deliberate: `git add -A` at commit time would sweep a test's carefully
+        partial index into a fully-staged one and hide the very distinction the
+        partial-stage test exists to check.
         """
         self.assertEqual(_run(["git", "init"], cwd=root).returncode, 0)
         for key, value in (
@@ -147,10 +196,11 @@ class HookBehaviourTests(unittest.TestCase):
         ):
             result = _run(["git", "config", key, value], cwd=root)
             self.assertEqual(result.returncode, 0, result.stderr)
+        staged = _run(["git", "add", "-A"], cwd=root)
+        self.assertEqual(staged.returncode, 0, staged.stderr)
 
     def _commit(self, root: Path):
-        added = _run(["git", "add", "-A"], cwd=root)
-        self.assertEqual(added.returncode, 0, added.stderr)
+        """Commit whatever is already staged, letting the hook decide."""
         return _run(["git", "commit", "-m", "test commit"], cwd=root)
 
     def test_a_clean_tree_commits(self) -> None:
@@ -187,16 +237,78 @@ class HookBehaviourTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--no-verify", result.stderr)
 
+    def test_a_partially_staged_file_is_checked_as_staged(self) -> None:
+        """The hook must check the index, not the working tree.
+
+        Stage a broken file, then fix the working-tree copy without staging it.
+        A working-tree check passes and the broken content is committed anyway --
+        the exact false confidence a guardrail must not give. The hook exports
+        the index, so the staged (and therefore committed) content is what gets
+        checked.
+        """
+        broken = (
+            "#!/usr/bin/env python3\n"
+            '"""Clean module."""\n'
+            "from __future__ import annotations\n"
+            "\n"
+            "import sys\n"
+            "import requests\n"
+        )
+        clean = (
+            "#!/usr/bin/env python3\n"
+            '"""Clean module."""\n'
+            "from __future__ import annotations\n"
+            "\n"
+            "import sys\n"
+        )
+        root = self._make_repo()
+
+        (root / "staged.py").write_text(broken, encoding="utf-8")
+        self.assertEqual(_run(["git", "add", "staged.py"], cwd=root).returncode, 0)
+        # Fix the working tree only. The index still holds the broken content.
+        (root / "staged.py").write_text(clean, encoding="utf-8")
+
+        result = self._commit(root)
+
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            "the hook passed a commit whose staged content imports 'requests'",
+        )
+        self.assertIn("requests", result.stderr)
+        head = _run(["git", "rev-list", "--count", "HEAD"], cwd=root)
+        self.assertNotEqual(head.stdout.strip(), "1", "a commit was created anyway")
+
+    def test_an_unrelated_untracked_file_is_not_checked(self) -> None:
+        """A scratch file outside the index must not block an unrelated commit.
+
+        The inverse of the partial-stage case, and the nuisance risk: a broken
+        untracked file is not part of this commit, so it must not stop it.
+        """
+        root = self._make_repo("import sys\nsys.exit(0)\n")
+        (root / "clean.py").write_text(
+            "#!/usr/bin/env python3\n"
+            '"""Clean module."""\n'
+            "from __future__ import annotations\n"
+            "\n"
+            "import sys\n",
+            encoding="utf-8",
+        )
+        # Deliberately broken, and deliberately left untracked.
+        (root / "scratch_notes.py").write_text("import requests\n", encoding="utf-8")
+
+        self.assertEqual(_run(["git", "add", "clean.py"], cwd=root).returncode, 0)
+        result = _run(["git", "commit", "-m", "clean only"], cwd=root)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            "an untracked scratch file blocked an unrelated commit",
+        )
+
     def test_the_hook_does_not_block_a_repo_without_check_py(self) -> None:
         """An unrelated or very old checkout must not become uncommittable."""
-        root = Path(tempfile.mkdtemp(prefix="precommit-bare-"))
-        self.addCleanup(shutil.rmtree, root, True)
-        hooks = root / ".githooks"
-        hooks.mkdir()
-        shutil.copy2(HOOK, hooks / "pre-commit")
-        os.chmod(hooks / "pre-commit", 0o755)
-        (root / "file.txt").write_text("content\n", encoding="utf-8")
-        self._init_repo(root)
+        root = self._make_repo(check_body=NO_CHECKER)
 
         result = self._commit(root)
 

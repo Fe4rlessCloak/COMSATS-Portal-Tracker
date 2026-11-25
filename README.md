@@ -322,7 +322,8 @@ Events: `baseline_saved`, `semester_rollover`, `marks_updated`, `marks_removed`,
 
 ## Development
 
-Three commands, all stdlib-only, all run by CI on every push and pull request:
+Three commands, all stdlib-only. CI runs them on every pull request and on every
+push to `main`:
 
 ```bash
 python3 scripts/check.py                      # static guardrails
@@ -341,12 +342,25 @@ git config core.hooksPath .githooks
 ```
 
 That setting is local to your clone, which is why the hook is opt-in rather than
-automatic: git will not run a hook you have not pointed it at. The hook does not
-run the test suite (too slow to sit on every commit); CI still runs the full
-suite on every push.
+automatic: git will not run a hook you have not pointed it at.
+
+Two things worth knowing:
+
+- **It checks the index, not your working tree.** The staged content is what
+  gets committed, so the hook exports it to a temporary directory and checks
+  that. A partially-staged file is judged as staged, and unrelated edits you have
+  not staged are left alone.
+- **It takes over the whole hooks directory.** While `core.hooksPath` points at
+  `.githooks`, anything in `.git/hooks` — `pre-push`, `commit-msg`, a husky
+  install — stops running. Point `core.hooksPath` back at `.git/hooks` if you
+  need those.
+
+The hook does not run the test suite (too slow to sit on every commit); CI still
+runs the full suite.
 
 To skip the hook for one deliberate work-in-progress commit, use
-`git commit --no-verify`. CI catches it anyway.
+`git commit --no-verify`. Note this is only caught by CI once the branch is in a
+pull request — a push to a branch with no PR runs no CI at all.
 
 ---
 
