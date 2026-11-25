@@ -1,0 +1,77 @@
+#!/bin/sh
+#
+# Pre-commit guardrail: run the repo's static checks on what is about to be
+# committed, before the commit lands.
+#
+# `scripts/check.py` is the same command CI runs in `.github/workflows/checks.yml`.
+# Catching it here costs about a second; catching it in CI costs a push and a
+# round trip, and leaves a red commit in the branch history.
+#
+# What gets checked: the *index*, not the working tree. A hook that ran the
+# checker against the files on disk would pass a partially-staged file
+# (`git add -p`, or stage a fix then keep editing) and would fail on unrelated
+# work-in-progress edits that are not part of this commit. Neither is correct:
+# the only content that matters is what the commit will contain. So the index is
+# exported with `git checkout-index` into a temporary directory and the checker
+# is pointed at that copy with `--root`.
+#
+# This hook deliberately does NOT run the test suite. The suite takes over a
+# minute, and a hook that slow gets bypassed with `--no-verify`, which would take
+# the fast check down with it.
+#
+# Enable it once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# That setting is local, so this is opt-in rather than automatic. Note it also
+# takes over the whole hooks directory: anything in `.git/hooks` (pre-push,
+# commit-msg, husky) stops running once `core.hooksPath` points elsewhere.
+
+set -eu
+
+# Resolve the repo root from git, not from $PWD: a hook can be invoked from a
+# subdirectory, so the paths below must not depend on where the commit ran.
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "pre-commit: python3 not found on PATH; the guardrail did nothing." >&2
+    echo "pre-commit: install Python 3.9+ to have commits checked locally." >&2
+    exit 0
+fi
+
+if [ ! -f scripts/check.py ]; then
+    # Not a checkout of this project (or a very old one). Do not block.
+    echo "pre-commit: scripts/check.py not found; skipping the guardrail." >&2
+    exit 0
+fi
+
+# Export the index into a throwaway directory. The trap clears it on every exit
+# path, including Ctrl-C.
+staging=$(mktemp -d "${TMPDIR:-/tmp}/precommit-index.XXXXXX")
+trap 'rm -rf "$staging"' EXIT HUP INT TERM
+
+if ! git checkout-index -a --prefix="$staging/"; then
+    echo "pre-commit: could not export the git index; skipping the guardrail." >&2
+    exit 0
+fi
+
+echo "pre-commit: running scripts/check.py on the staged tree ..."
+if ! python3 "$staging/scripts/check.py" --root "$staging"; then
+    cat >&2 <<'EOF'
+
+pre-commit: scripts/check.py failed on the staged content, so this commit was
+not made.
+
+Fix the findings, `git add` the fixes, and commit again. To commit anyway
+(a deliberate work-in-progress commit), use:
+
+    git commit --no-verify
+
+A push to a branch with no pull request runs no CI at all, so a bypassed
+failure is not caught until a PR is opened.
+EOF
+    exit 1
+fi
+
+exit 0
