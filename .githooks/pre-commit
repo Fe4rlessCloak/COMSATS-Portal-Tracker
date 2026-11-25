@@ -1,0 +1,58 @@
+#!/bin/sh
+#
+# Pre-commit guardrail: run the repo's static checks before a commit lands.
+#
+# `scripts/check.py` is the same command CI runs in `.github/workflows/checks.yml`.
+# Catching it here costs about a second; catching it in CI costs a push and a
+# round trip, and leaves a red commit in the branch history.
+#
+# This hook deliberately does NOT run the test suite. The suite takes over a
+# minute, and a hook that slow gets bypassed with `--no-verify`, which would
+# take the fast check down with it. CI still runs the full suite on every push.
+#
+# Enable it once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# That setting is local, so this is opt-in rather than automatic. Say so in the
+# commit message if you are adding the hook, so reviewers enable it too.
+
+set -eu
+
+# Resolve the repo root from git, not from $PWD: a hook can be invoked from a
+# subdirectory, and `scripts/check.py` resolves its own paths from there.
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+# The project is stdlib-only on a 3.9 floor, but any local python3 runs it.
+# Prefer the interpreter on PATH; fall back to a clear message rather than a
+# bare "command not found".
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "pre-commit: python3 not found on PATH; skipping the guardrail." >&2
+    echo "pre-commit: install Python 3.9+ or commit with --no-verify." >&2
+    exit 0
+fi
+
+if [ ! -f scripts/check.py ]; then
+    # Not a checkout of this project (or a very old one). Do not block.
+    echo "pre-commit: scripts/check.py not found; skipping the guardrail." >&2
+    exit 0
+fi
+
+echo "pre-commit: running scripts/check.py ..."
+if ! python3 scripts/check.py; then
+    cat >&2 <<'EOF'
+
+pre-commit: scripts/check.py failed, so this commit was not made.
+
+Fix the findings above and try again. If you must commit anyway (a work in
+progress commit you intend to fix later), use:
+
+    git commit --no-verify
+
+CI runs the same check on every push, so a bypass is caught there instead.
+EOF
+    exit 1
+fi
+
+exit 0

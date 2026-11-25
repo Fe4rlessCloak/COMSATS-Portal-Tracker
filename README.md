@@ -320,6 +320,36 @@ Events: `baseline_saved`, `semester_rollover`, `marks_updated`, `marks_removed`,
 
 ---
 
+## Development
+
+Three commands, all stdlib-only, all run by CI on every push and pull request:
+
+```bash
+python3 scripts/check.py                      # static guardrails
+python3 scripts/probe_guardrails.py           # proves check.py fails when it should
+python3 -m unittest discover -s tests -v      # the test suite
+```
+
+### Run the guardrails before every commit
+
+The repo ships an opt-in `pre-commit` hook that runs `scripts/check.py` — the
+same check CI runs — so a broken commit fails in about a second instead of after
+a push. Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+That setting is local to your clone, which is why the hook is opt-in rather than
+automatic: git will not run a hook you have not pointed it at. The hook does not
+run the test suite (too slow to sit on every commit); CI still runs the full
+suite on every push.
+
+To skip the hook for one deliberate work-in-progress commit, use
+`git commit --no-verify`. CI catches it anyway.
+
+---
+
 ## Security & Privacy
 
 - `.env`, `state.json`, and `snapshots/` are excluded via `.gitignore`.
