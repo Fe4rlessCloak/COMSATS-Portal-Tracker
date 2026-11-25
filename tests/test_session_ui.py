@@ -1006,7 +1006,12 @@ class CrossSitePostTests(_ServerTestCase):
         self.assertEqual(status, 200)
 
     def test_null_origin_is_refused(self) -> None:
-        """`Origin: null` is an opaque origin (sandboxed frame, file://) — never us."""
+        """`Origin: null` is an opaque origin (sandboxed frame, file://) — never us.
+
+        This stays refused. The page's own form must therefore never *produce*
+        a `null` origin, which is why it must not be served with
+        `Referrer-Policy: no-referrer` (see `test_page_does_not_suppress_its_own_origin`).
+        """
         status, _ = self.post(
             "null_origin_cookie",
             headers={
@@ -1017,6 +1022,27 @@ class CrossSitePostTests(_ServerTestCase):
         )
 
         self.assertEqual(status, 403)
+
+    def test_page_does_not_suppress_its_own_origin(self) -> None:
+        """The page must not serve a policy that nulls its own form's `Origin`.
+
+        Under ``Referrer-Policy: no-referrer`` the Fetch spec serializes a form
+        POST's `Origin` as the literal string ``null`` even for a same-origin
+        submission, so the page's own form would fail its own gate with a 403
+        that no browser could avoid. This is a regression test for exactly that.
+        """
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        self.addCleanup(conn.close)
+
+        conn.request("GET", "/")
+        response = conn.getresponse()
+        response.read()
+
+        policy = (response.getheader("Referrer-Policy") or "").strip().lower()
+        self.assertEqual(policy, "same-origin")
+        self.assertNotEqual(policy, "no-referrer")
 
     def test_origin_with_userinfo_does_not_match(self) -> None:
         status, _ = self.post(
