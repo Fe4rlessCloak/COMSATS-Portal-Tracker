@@ -52,6 +52,39 @@ CSRF_INPUT_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Referrer policies that make a browser serialize a same-origin form POST's
+#: `Origin` as the literal string `null` (Fetch §3.2, the "no-referrer" rule),
+#: which the page's own gate then refuses. `no-referrer-when-downgrade`,
+#: `strict-origin` and `strict-origin-when-cross-origin` only null it for an
+#: https->http downgrade, which cannot happen on this page's own https POST.
+NULLING_REFERRER_POLICIES = frozenset({"no-referrer"})
+
+#: A `<meta>` tag, so its attributes can be inspected in any order. Browsers
+#: accept `content` before `name` as readily as after, and HTML attribute order
+#: carries no meaning, so a regex tied to one order would miss real markup.
+META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+
+#: One attribute inside a tag, either quoting style.
+_ATTR_TMPL = r"""\b{name}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"""
+
+
+def meta_referrer_policy(body: str) -> Optional[str]:
+    """Return a document's ``<meta name="referrer">`` content, or ``None``.
+
+    Attribute order and quoting style do not matter, because the tag is matched
+    first and its attributes read out of it. A meta referrer policy overrides the
+    ``Referrer-Policy`` response header, which is why it must be checked too.
+    """
+    for tag in META_TAG_RE.findall(body):
+        name = re.search(_ATTR_TMPL.format(name="name"), tag, re.IGNORECASE)
+        if not name or (name.group(1) or name.group(2) or name.group(3) or "").strip().lower() != "referrer":
+            continue
+        content = re.search(_ATTR_TMPL.format(name="content"), tag, re.IGNORECASE)
+        if not content:
+            return ""  # the tag exists but sets no policy, which is not nulling
+        return (content.group(1) or content.group(2) or content.group(3) or "").strip().lower()
+    return None
+
 ENV_TEXT = (
     "# Tracker configuration — keep this comment\n"
     "\n"
@@ -1017,6 +1050,67 @@ class CrossSitePostTests(_ServerTestCase):
         )
 
         self.assertEqual(status, 403)
+
+    def test_page_does_not_suppress_its_own_origin(self) -> None:
+        """The page must not suppress the `Origin` its own form will send.
+
+        Under ``Referrer-Policy: no-referrer`` the Fetch spec serializes a form
+        POST's `Origin` as the literal string ``null`` even for a same-origin
+        submission, so the page's own form would fail its own gate with a 403
+        that no browser could avoid. This is a regression test for exactly that.
+
+        Both channels that can set a document's referrer policy are covered: the
+        response header and a ``<meta name="referrer">`` tag. Only the header is
+        set today, but a meta tag added later would override the header and
+        re-null `Origin` while a header-only assertion still passed.
+        """
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        self.addCleanup(conn.close)
+
+        conn.request("GET", "/")
+        response = conn.getresponse()
+        body = response.read().decode("utf-8", errors="replace")
+
+        # Neither channel may name a policy that nulls a same-origin form POST's
+        # Origin. The meta channel is read from the markup, not just asserted
+        # absent, so a tag added later is caught wherever its attributes sit.
+        policy = (response.getheader("Referrer-Policy") or "").strip().lower()
+        self.assertNotIn(policy, NULLING_REFERRER_POLICIES)
+        self.assertNotIn(meta_referrer_policy(body), NULLING_REFERRER_POLICIES)
+
+    def test_the_meta_referrer_guard_can_actually_fire(self) -> None:
+        """The meta-tag half of the check above must not be vacuous.
+
+        The page sets no ``<meta name="referrer">`` today, so that half passes
+        for free. Prove the reader rejects a tag that would override the header,
+        in either attribute order and either quoting style, and that it does not
+        fire on a safe policy.
+        """
+        for markup in (
+            '<meta name="referrer" content="no-referrer">',
+            "<meta name='referrer' content='no-referrer'>",
+            '<meta content="no-referrer" name="referrer">',
+            "<meta content='no-referrer' name='referrer'>",
+            '<META NAME="Referrer" CONTENT="NO-REFERRER">',
+        ):
+            with self.subTest(markup=markup):
+                self.assertIn(meta_referrer_policy(markup), NULLING_REFERRER_POLICIES)
+
+        # A safe policy must not be reported as nulling.
+        self.assertNotIn(
+            meta_referrer_policy('<meta name="referrer" content="same-origin">'),
+            NULLING_REFERRER_POLICIES,
+        )
+        # No tag at all, and a meta tag unrelated to referrers.
+        self.assertNotIn(meta_referrer_policy("<p>no head</p>"), NULLING_REFERRER_POLICIES)
+        self.assertNotIn(
+            meta_referrer_policy(
+                '<meta name="viewport" content="width=device-width">'
+            ),
+            NULLING_REFERRER_POLICIES,
+        )
 
     def test_origin_with_userinfo_does_not_match(self) -> None:
         status, _ = self.post(

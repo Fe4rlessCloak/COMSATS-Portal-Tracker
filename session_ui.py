@@ -896,7 +896,13 @@ def _make_handler_class(app: SessionUiApp, log_stream: Optional[Any] = None) -> 
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "no-referrer")
+            # Must not be `no-referrer`: the Fetch spec serializes a form POST's
+            # `Origin` as the literal string `null` when its initiator page
+            # carries that policy, so this page's own form would fail its own
+            # same-origin gate. `same-origin` sends nothing at all to other
+            # sites and a real `Origin` to this one, which is what the gate
+            # reads.
+            self.send_header("Referrer-Policy", "same-origin")
             if response.close_connection:
                 self.send_header("Connection", "close")
                 self.close_connection = True
