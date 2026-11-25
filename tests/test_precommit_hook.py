@@ -57,7 +57,35 @@ class HookFileTests(unittest.TestCase):
         mode = HOOK.stat().st_mode
         self.assertTrue(
             mode & stat.S_IXUSR,
-            "pre-commit is not executable; git would skip it without a word",
+            "pre-commit is not executable on disk; git would skip it without a word",
+        )
+
+    def test_git_records_the_hook_as_executable(self) -> None:
+        """The mode *git* records is what other clones get, not this disk's mode.
+
+        With ``core.fileMode=false`` a ``chmod`` is invisible to git, so a hook
+        can be executable here and still ship as ``100644`` -- which git then
+        refuses to run in every other clone. Assert the recorded mode, and the
+        shipped one, rather than trusting the working tree.
+        """
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+
+        recorded = subprocess.run(
+            ["git", "ls-files", "-s", ".githooks/pre-commit"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        entry = recorded.stdout.strip()
+        self.assertTrue(entry, ".githooks/pre-commit is not tracked by git")
+        self.assertTrue(
+            entry.startswith("100755"),
+            f"git records the hook as {entry.split()[0]}, so a fresh clone gets a "
+            "non-executable hook that git silently skips. Fix with: "
+            "git update-index --chmod=+x .githooks/pre-commit",
         )
 
     def test_the_hook_delegates_to_the_same_command_ci_runs(self) -> None:
