@@ -8,6 +8,18 @@ python3 scripts/probe_guardrails.py           # proves check.py fails in every d
 python3 -m unittest discover -s tests -v      # the test suite
 ```
 
+Run the guardrails before every commit, not just in CI. The repo ships an opt-in
+`.githooks/pre-commit` that runs `scripts/check.py` on the **staged index** (not the
+working tree), in about a second:
+
+```bash
+git config core.hooksPath .githooks           # once per clone; local, so opt-in
+```
+
+Catching a mechanical failure here costs a second; catching it in CI costs a push and a
+round trip. Note `core.hooksPath` displaces anything in `.git/hooks` while it is set, and a
+push to a branch with no pull request runs no CI at all.
+
 `scripts/check.py` reads each file once and reports every problem it finds; a file that does
 not parse is reported as a `[FAIL]` line, never a traceback. It also fails the run when a
 shipped module has no row in this file's module map or in `ARCHITECTURE.md`, so adding a
